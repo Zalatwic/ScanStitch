@@ -52,38 +52,65 @@ pub fn bradford_cat(source_white: &[f64; 3]) -> Matrix3<f64> {
     m_to_xyz * diag * m_to_lms
 }
 
-/// Estimate source white point using gray-world assumption.
-/// Returns `[mean_r/max_mean, 1.0, mean_b/max_mean]`.
-fn estimate_source_white(img: &Array3<f64>) -> [f64; 3] {
+/// Maximum channel deviation relative to pixel mean for a pixel to be
+/// considered "neutral". Pixels whose `max(|ch - mu|) / mu` exceeds this
+/// threshold are excluded from the gray-world average.
+const NEUTRAL_THRESHOLD: f64 = 0.15;
+
+/// Minimum fraction of total pixels that must pass the neutrality test.
+/// If fewer than this fraction are neutral, we fall back to [1, 1, 1].
+const MIN_NEUTRAL_FRACTION: f64 = 0.005;
+
+/// Selective Gray World: average only near-neutral pixels to estimate the
+/// scene illuminant. Falls back to `[1.0, 1.0, 1.0]` when the image lacks
+/// enough neutral data (e.g. a solid-blue sky).
+fn estimate_neutral_means(img: &Array3<f64>) -> [f64; 3] {
     let (h, w, _) = img.dim();
-    let n = (h * w) as f64;
+    let total = (h * w) as f64;
     let mut sums = [0.0f64; 3];
+    let mut count = 0u64;
+
     for y in 0..h {
         for x in 0..w {
-            sums[0] += img[[y, x, 0]];
-            sums[1] += img[[y, x, 1]];
-            sums[2] += img[[y, x, 2]];
+            let r = img[[y, x, 0]];
+            let g = img[[y, x, 1]];
+            let b = img[[y, x, 2]];
+
+            let mu = (r + g + b) / 3.0;
+            if mu < 1e-12 {
+                continue; // skip near-black pixels
+            }
+
+            let max_dev = (r - mu).abs().max((g - mu).abs()).max((b - mu).abs());
+            if max_dev / mu < NEUTRAL_THRESHOLD {
+                sums[0] += r;
+                sums[1] += g;
+                sums[2] += b;
+                count += 1;
+            }
         }
     }
-    let means = [sums[0] / n, sums[1] / n, sums[2] / n];
+
+    if (count as f64) < total * MIN_NEUTRAL_FRACTION {
+        return [1.0, 1.0, 1.0];
+    }
+
+    let n = count as f64;
+    [sums[0] / n, sums[1] / n, sums[2] / n]
+}
+
+/// Estimate source white point using selective gray-world assumption.
+/// Returns `[mean_r/max_mean, 1.0, mean_b/max_mean]`.
+fn estimate_source_white(img: &Array3<f64>) -> [f64; 3] {
+    let means = estimate_neutral_means(img);
     let max_mean = means[0].max(means[1]).max(means[2]).max(1e-12);
     [means[0] / max_mean, 1.0, means[2] / max_mean]
 }
 
-/// Estimate a diagonal work-RGB-to-XYZ matrix using gray-world assumption.
+/// Estimate a diagonal work-RGB-to-XYZ matrix using selective gray-world.
 /// `scale[c] = D50_WHITE[c] / (mean[c] / max_mean)`
 fn estimate_work_to_xyz(img: &Array3<f64>) -> Matrix3<f64> {
-    let (h, w, _) = img.dim();
-    let n = (h * w) as f64;
-    let mut sums = [0.0f64; 3];
-    for y in 0..h {
-        for x in 0..w {
-            sums[0] += img[[y, x, 0]];
-            sums[1] += img[[y, x, 1]];
-            sums[2] += img[[y, x, 2]];
-        }
-    }
-    let means = [sums[0] / n, sums[1] / n, sums[2] / n];
+    let means = estimate_neutral_means(img);
     let max_mean = means[0].max(means[1]).max(means[2]).max(1e-12);
 
     Matrix3::new(

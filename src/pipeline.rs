@@ -72,13 +72,11 @@ pub fn run(cli: &Cli) -> Result<PipelineReport, Box<dyn std::error::Error>> {
 
     // ── Phase 2: Base detection, classification, conditional stitch ──
     log::info!("Phase 2: Base detection + classification");
+
+    // Step 1: Classify components to decide whether to stitch.
+    // det1/det2 base_color may be [0,0,0] for split frames — used only for classification.
     let det1 = base_detect::detect_film_base(&comp1_cropped);
     let det2 = base_detect::detect_film_base(&comp2_cropped);
-    let base_color = det1.base_color;
-    log::info!(
-        "  Base color: [{:.0}, {:.0}, {:.0}]",
-        base_color[0], base_color[1], base_color[2]
-    );
 
     let class1 = frame_classify::classify(&det1);
     let class2 = frame_classify::classify(&det2);
@@ -91,6 +89,7 @@ pub fn run(cli: &Cli) -> Result<PipelineReport, Box<dyn std::error::Error>> {
         cli.force_no_stitch,
     );
 
+    // Step 2: Produce working_image via conditional stitch.
     let working_image = if should_stitch {
         log::info!("  Attempting stitch...");
         let stitch_result = stitch::stitch_components(
@@ -103,8 +102,8 @@ pub fn run(cli: &Cli) -> Result<PipelineReport, Box<dyn std::error::Error>> {
         match stitch_result.result {
             Some(ref stitched) => {
                 log::info!(
-                    "  Stitch succeeded: {}x{}, NCC={:.3}",
-                    stitched.shape()[1], stitched.shape()[0], stitch_result.ncc_score
+                    "  Stitch succeeded: {}x{}, NCC={:.3}, y_offset={}",
+                    stitched.shape()[1], stitched.shape()[0], stitch_result.ncc_score, stitch_result.y_offset
                 );
                 if cli.debug {
                     tiff_io::save_tiff_u16(stitched, &cli.output_dir.join("stitched.tiff"))?;
@@ -126,9 +125,19 @@ pub fn run(cli: &Cli) -> Result<PipelineReport, Box<dyn std::error::Error>> {
         comp1_cropped.clone()
     };
 
+    // Step 3: Re-evaluate base color on the final working_image.
+    // After stitching, the full frame has rebate edges visible, so detection succeeds
+    // even when both components were candidate-split frames with no visible film base.
+    let det_final = base_detect::detect_film_base(&working_image);
+    let base_color = det_final.base_color;
+    log::info!(
+        "  Base color (from working_image): [{:.0}, {:.0}, {:.0}]",
+        base_color[0], base_color[1], base_color[2]
+    );
+
     report.add_phase(PhaseReport::ok(
         "base_detect_classify",
-        (det1.left_confidence + det1.right_confidence) / 2.0,
+        (det_final.left_confidence + det_final.right_confidence) / 2.0,
         serde_json::json!({
             "base_color": base_color,
             "class1": format!("{:?}", class1),

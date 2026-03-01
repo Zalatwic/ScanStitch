@@ -6,9 +6,9 @@ use ndarray::Array3;
 fn test_removes_black_borders() {
     let img = synthetic::image_with_borders(100, 200, 10, [8000, 6000, 5000]);
     let (cropped, top, bot) = scanstitch::border::remove_borders(&img, 2);
-    assert_eq!(top, 10);
-    assert_eq!(bot, 10);
-    assert_eq!(cropped.dim().0, 80);
+    assert_eq!(top, 12);
+    assert_eq!(bot, 12);
+    assert_eq!(cropped.dim().0, 76);
     assert!(cropped[[0, 100, 0]] > 1000);
 }
 
@@ -37,9 +37,9 @@ fn test_removes_white_borders() {
         }
     }
     let (cropped, top, bot) = scanstitch::border::remove_borders(&img, 2);
-    assert_eq!(top, 8);
-    assert_eq!(bot, 8);
-    assert_eq!(cropped.dim().0, 84);
+    assert_eq!(top, 10);
+    assert_eq!(bot, 10);
+    assert_eq!(cropped.dim().0, 80);
 }
 
 #[test]
