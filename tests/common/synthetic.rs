@@ -65,12 +65,7 @@ pub fn film_negative_image(
 }
 
 /// Create a horizontal gradient image from `left_rgb` to `right_rgb`.
-pub fn gradient_image(
-    h: usize,
-    w: usize,
-    left_rgb: [u16; 3],
-    right_rgb: [u16; 3],
-) -> Array3<u16> {
+pub fn gradient_image(h: usize, w: usize, left_rgb: [u16; 3], right_rgb: [u16; 3]) -> Array3<u16> {
     let mut arr = Array3::<u16>::zeros((h, w, 3));
     for y in 0..h {
         for x in 0..w {
@@ -95,7 +90,9 @@ pub fn add_noise(arr: &mut Array3<u16>, seed: u64, amplitude: u16) {
         for x in 0..shape[1] {
             for c in 0..shape[2] {
                 // LCG: state = (a * state + c) mod m
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 // Extract a noise value in [-amplitude, +amplitude]
                 let raw = ((state >> 33) as i32) % (2 * amp + 1) - amp;
                 let val = arr[[y, x, c]] as i32 + raw;

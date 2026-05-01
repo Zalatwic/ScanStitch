@@ -68,3 +68,42 @@ fn test_safety_margin_never_eats_content() {
     assert!(bot <= 7, "bot cropped too much: {}", bot);
     assert!(cropped[[0, 100, 0]] > 5000, "first row should be content");
 }
+
+#[test]
+fn test_border_diagnostics_warn_when_nothing_removed() {
+    let img = synthetic::constant_image(100, 200, [8000, 6000, 5000]);
+    let result = scanstitch::border::remove_borders_with_diagnostics(&img, 2);
+    assert_eq!(result.diagnostics.top_removed, 0);
+    assert_eq!(result.diagnostics.bottom_removed, 0);
+    assert!(!result.diagnostics.dead_zone_detected);
+    assert!(
+        result
+            .diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("dead-zone")),
+        "expected explicit warning when border detector no-ops"
+    );
+}
+
+#[test]
+fn test_gradual_top_ramp_is_not_treated_as_dead_zone() {
+    let mut img = synthetic::constant_image(120, 200, [8000, 6000, 5000]);
+    for y in 0..30 {
+        let t = y as f64 / 29.0;
+        let scale = 0.78 + 0.18 * t;
+        for x in 0..200 {
+            img[[y, x, 0]] = (8000.0 * scale).round() as u16;
+            img[[y, x, 1]] = (6000.0 * scale).round() as u16;
+            img[[y, x, 2]] = (5000.0 * scale).round() as u16;
+        }
+    }
+
+    let result = scanstitch::border::remove_borders_with_diagnostics(&img, 2);
+
+    assert_eq!(result.diagnostics.top_removed, 0);
+    assert!(
+        !result.diagnostics.dead_zone_detected,
+        "a gradual edge falloff should not be treated as removable dead-zone rows"
+    );
+}
