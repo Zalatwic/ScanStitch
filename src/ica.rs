@@ -1,7 +1,11 @@
-use nalgebra::{Matrix3, Vector3, SymmetricEigen};
+use nalgebra::{Matrix3, SymmetricEigen, Vector3};
 use ndarray::Array3;
 
 use crate::streaming;
+
+const HISTOGRAM_BINS: usize = 4096;
+const ICA_LOW_PERCENTILE: f64 = 0.01;
+const ICA_HIGH_PERCENTILE: f64 = 0.995;
 
 /// Result of running FastICA on a 3-channel image.
 pub struct IcaResult {
@@ -17,6 +21,24 @@ pub struct IcaResult {
     pub permutation: [usize; 3],
     /// Sign flips applied per output channel.
     pub signs: [f64; 3],
+}
+
+#[derive(Debug, Clone)]
+pub struct IcaChannelNormalization {
+    pub min_value: f64,
+    pub max_value: f64,
+    pub low_percentile_value: f64,
+    pub high_percentile_value: f64,
+    pub clipped_low: u64,
+    pub clipped_high: u64,
+}
+
+pub struct IcaDensityNormalization {
+    pub normalized_density: Array3<f64>,
+    pub channel_stats: [IcaChannelNormalization; 3],
+    pub low_percentile: f64,
+    pub high_percentile: f64,
+    pub histogram_bins: usize,
 }
 
 /// Compute the per-channel mean and 3x3 covariance matrix over all pixels,
@@ -86,35 +108,20 @@ pub fn compute_whitening_matrix(cov: &Matrix3<f64>) -> Matrix3<f64> {
 }
 
 /// Apply whitening in-place: for each pixel, x = whitening * (x - mean).
-/// Adds small regularization noise (matching WHITEN_REG) for numerical stability
-/// with rank-deficient data.
+///
+/// The covariance already includes `WHITEN_REG`, so no pixel noise is added
+/// here. Injecting random image-space noise would be amplified by the whitening
+/// transform and would permanently contaminate the separated dye channels.
 pub fn apply_whitening(img: &mut Array3<f64>, mean: &Vector3<f64>, whitening: &Matrix3<f64>) {
     let (h, w, _) = img.dim();
     let tiles = streaming::tile_ranges(h, streaming::DEFAULT_TILE_ROWS);
-    // Noise scale: uniform in [-a, a] has variance a^2/3.
-    // We want variance = WHITEN_REG, so a = sqrt(3 * WHITEN_REG).
-    let noise_amp = (3.0 * WHITEN_REG).sqrt();
-    // Three independent LCG states, one per channel
-    let mut lcg_state: [u64; 3] = [
-        0xDEAD_BEEF_CAFE_BABE,
-        0x1234_5678_9ABC_DEF0,
-        0xFEDC_BA98_7654_3210,
-    ];
     for &(r0, r1) in &tiles {
         for r in r0..r1 {
             for c in 0..w {
-                let mut noise = [0.0f64; 3];
-                for ch in 0..3 {
-                    lcg_state[ch] = lcg_state[ch]
-                        .wrapping_mul(6364136223846793005)
-                        .wrapping_add(1442695040888963407);
-                    let u = (lcg_state[ch] >> 33) as f64 / (1u64 << 31) as f64;
-                    noise[ch] = (u * 2.0 - 1.0) * noise_amp;
-                }
                 let d = Vector3::new(
-                    img[[r, c, 0]] - mean[0] + noise[0],
-                    img[[r, c, 1]] - mean[1] + noise[1],
-                    img[[r, c, 2]] - mean[2] + noise[2],
+                    img[[r, c, 0]] - mean[0],
+                    img[[r, c, 1]] - mean[1],
+                    img[[r, c, 2]] - mean[2],
                 );
                 let wh = whitening * d;
                 img[[r, c, 0]] = wh[0];
@@ -163,11 +170,7 @@ pub fn run_fastica(img: &Array3<f64>, max_iter: usize, tol: f64) -> IcaResult {
     apply_whitening(&mut whitened, &mean, &whitening);
 
     // Step 4: initialize W deterministically and orthogonalize
-    let mut w_mat = Matrix3::new(
-        0.7, 0.5, 0.3,
-        0.3, 0.8, 0.4,
-        0.2, 0.3, 0.9,
-    );
+    let mut w_mat = Matrix3::new(0.7, 0.5, 0.3, 0.3, 0.8, 0.4, 0.2, 0.3, 0.9);
     symmetric_orthogonalize(&mut w_mat);
 
     // Step 5: iterate
@@ -234,8 +237,10 @@ pub fn run_fastica(img: &Array3<f64>, max_iter: usize, tol: f64) -> IcaResult {
         }
     }
 
-    // Step 6: compute separated signals: S = W^T * whitened_pixel
-    // which is equivalent to S = W^T * whitening * (original - mean)
+    // Step 6: compute separated signals (raw independent components).
+    // s = W^T * whitened_pixel gives the separated sources directly.
+    // Do NOT apply whitening_inv here — it is a dense 3x3 matrix that would
+    // remix the independent components, defeating the entire ICA separation.
     let mut separated = Array3::<f64>::zeros((h, w, 3));
     for &(r0, r1) in &tiles {
         for r in r0..r1 {
@@ -256,30 +261,80 @@ pub fn run_fastica(img: &Array3<f64>, max_iter: usize, tol: f64) -> IcaResult {
     // Step 7: resolve permutation and sign
     let perm = resolve_permutation(img, &separated);
 
-    // Apply permutation
+    // Apply permutation (streaming)
     let mut permuted = Array3::<f64>::zeros((h, w, 3));
-    for r in 0..h {
-        for x_pos in 0..w {
-            for ch in 0..3 {
-                permuted[[r, x_pos, ch]] = separated[[r, x_pos, perm[ch]]];
+    for &(r0, r1) in &tiles {
+        for r in r0..r1 {
+            for x_pos in 0..w {
+                for ch in 0..3 {
+                    permuted[[r, x_pos, ch]] = separated[[r, x_pos, perm[ch]]];
+                }
             }
         }
     }
 
-    // Resolve signs: if mean of assigned separated component is negative, flip
-    let mut signs = [1.0f64; 3];
-    for ch in 0..3 {
-        let mut channel_sum = 0.0;
-        for r in 0..h {
-            for x_pos in 0..w {
-                channel_sum += permuted[[r, x_pos, ch]];
+    // Resolve signs using skewness: physical dye density should be right-skewed
+    // (most pixels near low-density film base, fewer at high-density image areas).
+    // A negative skewness indicates the channel is inverted.
+
+    // Streaming pass 1: per-channel sum
+    let mut ch_sum = [0.0f64; 3];
+    for &(r0, r1) in &tiles {
+        let tile = streaming::tile_view(&permuted, r0, r1);
+        let (th, tw, _) = tile.dim();
+        for r in 0..th {
+            for x_pos in 0..tw {
+                for ch in 0..3 {
+                    ch_sum[ch] += tile[[r, x_pos, ch]];
+                }
             }
         }
-        if channel_sum < 0.0 {
-            signs[ch] = -1.0;
-            for r in 0..h {
-                for x_pos in 0..w {
-                    permuted[[r, x_pos, ch]] *= -1.0;
+    }
+    let mut ch_mean = [0.0f64; 3];
+    for ch in 0..3 {
+        ch_mean[ch] = ch_sum[ch] / n;
+    }
+
+    // Streaming pass 2: second and third central moments for skewness
+    let mut m2 = [0.0f64; 3];
+    let mut m3 = [0.0f64; 3];
+    for &(r0, r1) in &tiles {
+        let tile = streaming::tile_view(&permuted, r0, r1);
+        let (th, tw, _) = tile.dim();
+        for r in 0..th {
+            for x_pos in 0..tw {
+                for ch in 0..3 {
+                    let d = tile[[r, x_pos, ch]] - ch_mean[ch];
+                    let d2 = d * d;
+                    m2[ch] += d2;
+                    m3[ch] += d2 * d;
+                }
+            }
+        }
+    }
+
+    // Compute skewness and determine sign flips
+    let mut signs = [1.0f64; 3];
+    for ch in 0..3 {
+        let variance = m2[ch] / n;
+        let std_dev = variance.sqrt();
+        if std_dev > 1e-15 {
+            let skewness = (m3[ch] / n) / (std_dev * std_dev * std_dev);
+            if skewness < 0.0 {
+                signs[ch] = -1.0;
+            }
+        }
+    }
+
+    // Streaming pass 3: apply sign flips in zero-mean ICA space.
+    // The separated components are centered, so a sign correction is simply
+    // multiplication by -1. Any additive re-anchoring would introduce a large
+    // channel-dependent bias and break the later global normalization.
+    for &(r0, r1) in &tiles {
+        for r in r0..r1 {
+            for x_pos in 0..w {
+                for ch in 0..3 {
+                    permuted[[r, x_pos, ch]] *= signs[ch];
                 }
             }
         }
@@ -356,8 +411,12 @@ pub fn resolve_permutation(original: &Array3<f64>, separated: &Array3<f64>) -> [
 
     // Brute-force all 6 permutations
     let perms: [[usize; 3]; 6] = [
-        [0, 1, 2], [0, 2, 1], [1, 0, 2],
-        [1, 2, 0], [2, 0, 1], [2, 1, 0],
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
     ];
 
     let mut best_perm = [0usize; 3];
@@ -374,4 +433,129 @@ pub fn resolve_permutation(original: &Array3<f64>, separated: &Array3<f64>) -> [
     }
 
     best_perm
+}
+
+fn histogram_bin(value: f64, min_value: f64, max_value: f64) -> usize {
+    let span = (max_value - min_value).max(1e-12);
+    let t = ((value - min_value) / span).clamp(0.0, 1.0);
+    ((t * (HISTOGRAM_BINS - 1) as f64).round() as usize).min(HISTOGRAM_BINS - 1)
+}
+
+fn percentile_from_histogram(hist: &[u64], min_value: f64, max_value: f64, percentile: f64) -> f64 {
+    let total: u64 = hist.iter().sum();
+    if total == 0 {
+        return min_value;
+    }
+
+    let target = ((total as f64 - 1.0) * percentile.clamp(0.0, 1.0)).round() as u64;
+    let mut cumulative = 0u64;
+    for (idx, count) in hist.iter().enumerate() {
+        cumulative += *count;
+        if cumulative > target {
+            let span = (max_value - min_value).max(1e-12);
+            let t = idx as f64 / (HISTOGRAM_BINS - 1) as f64;
+            return min_value + t * span;
+        }
+    }
+
+    max_value
+}
+
+/// Normalize separated ICA channels independently using robust full-image
+/// percentiles so each dye channel remains in a density-like domain.
+pub fn normalize_separated_density_channels(img: &Array3<f64>) -> IcaDensityNormalization {
+    let (h, w, c) = img.dim();
+    assert_eq!(c, 3, "Expected three ICA channels");
+
+    let mut min_value = [f64::INFINITY; 3];
+    let mut max_value = [f64::NEG_INFINITY; 3];
+    for &(r0, r1) in &streaming::tile_ranges(h, streaming::DEFAULT_TILE_ROWS) {
+        let tile = streaming::tile_view(img, r0, r1);
+        let (th, tw, _) = tile.dim();
+        for r in 0..th {
+            for x in 0..tw {
+                for ch in 0..3 {
+                    let v = tile[[r, x, ch]];
+                    min_value[ch] = min_value[ch].min(v);
+                    max_value[ch] = max_value[ch].max(v);
+                }
+            }
+        }
+    }
+
+    for ch in 0..3 {
+        if !min_value[ch].is_finite() || !max_value[ch].is_finite() {
+            min_value[ch] = 0.0;
+            max_value[ch] = 0.0;
+        }
+    }
+
+    let mut histograms = vec![vec![0u64; HISTOGRAM_BINS]; 3];
+    for &(r0, r1) in &streaming::tile_ranges(h, streaming::DEFAULT_TILE_ROWS) {
+        let tile = streaming::tile_view(img, r0, r1);
+        let (th, tw, _) = tile.dim();
+        for r in 0..th {
+            for x in 0..tw {
+                for ch in 0..3 {
+                    let v = tile[[r, x, ch]];
+                    histograms[ch][histogram_bin(v, min_value[ch], max_value[ch])] += 1;
+                }
+            }
+        }
+    }
+
+    let low_value: [f64; 3] = std::array::from_fn(|ch| {
+        percentile_from_histogram(
+            &histograms[ch],
+            min_value[ch],
+            max_value[ch],
+            ICA_LOW_PERCENTILE,
+        )
+    });
+    let high_value: [f64; 3] = std::array::from_fn(|ch| {
+        percentile_from_histogram(
+            &histograms[ch],
+            min_value[ch],
+            max_value[ch],
+            ICA_HIGH_PERCENTILE,
+        )
+    });
+
+    let mut normalized_density = Array3::<f64>::zeros((h, w, 3));
+    let mut clipped_low = [0u64; 3];
+    let mut clipped_high = [0u64; 3];
+    for &(r0, r1) in &streaming::tile_ranges(h, streaming::DEFAULT_TILE_ROWS) {
+        for r in r0..r1 {
+            for x in 0..w {
+                for ch in 0..3 {
+                    let lo = low_value[ch];
+                    let hi = high_value[ch];
+                    let span = (hi - lo).max(1e-12);
+                    let v = img[[r, x, ch]];
+                    if v <= lo {
+                        clipped_low[ch] += 1;
+                    }
+                    if v >= hi {
+                        clipped_high[ch] += 1;
+                    }
+                    normalized_density[[r, x, ch]] = ((v - lo) / span).clamp(0.0, 1.0);
+                }
+            }
+        }
+    }
+
+    IcaDensityNormalization {
+        normalized_density,
+        channel_stats: std::array::from_fn(|ch| IcaChannelNormalization {
+            min_value: min_value[ch],
+            max_value: max_value[ch],
+            low_percentile_value: low_value[ch],
+            high_percentile_value: high_value[ch],
+            clipped_low: clipped_low[ch],
+            clipped_high: clipped_high[ch],
+        }),
+        low_percentile: ICA_LOW_PERCENTILE,
+        high_percentile: ICA_HIGH_PERCENTILE,
+        histogram_bins: HISTOGRAM_BINS,
+    }
 }

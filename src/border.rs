@@ -1,11 +1,46 @@
 use ndarray::{s, Array3};
 
+#[derive(Debug, Clone, Copy)]
+struct RowStats {
+    median_lum: f64,
+    mad_lum: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EdgeRunDiagnostics {
+    crop_rows: usize,
+    strong_rows: usize,
+    peak_lum_gap: f64,
+    peak_row_delta: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BorderRemovalDiagnostics {
+    pub top_removed: usize,
+    pub bottom_removed: usize,
+    pub content_lum: f64,
+    pub content_mad: f64,
+    pub top_strong_rows: usize,
+    pub bottom_strong_rows: usize,
+    pub top_peak_lum_gap: f64,
+    pub bottom_peak_lum_gap: f64,
+    pub top_peak_row_delta: f64,
+    pub bottom_peak_row_delta: f64,
+    pub dead_zone_detected: bool,
+    pub warnings: Vec<String>,
+}
+
+pub struct BorderRemovalResult {
+    pub cropped: Array3<u16>,
+    pub diagnostics: BorderRemovalDiagnostics,
+}
+
 /// Compute the median of a slice of f64 values. The input is modified (sorted).
 fn median_f64(vals: &mut [f64]) -> f64 {
     if vals.is_empty() {
         return 0.0;
     }
-    vals.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    vals.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = vals.len();
     if n % 2 == 0 {
         (vals[n / 2 - 1] + vals[n / 2]) / 2.0
@@ -14,108 +49,350 @@ fn median_f64(vals: &mut [f64]) -> f64 {
     }
 }
 
-/// Compute the median luminance for each row of an (H, W, 3) u16 image.
-fn compute_row_luminance(img: &Array3<u16>) -> Vec<f64> {
+/// Compute robust per-row statistics used for border detection.
+fn compute_row_stats(img: &Array3<u16>) -> Vec<RowStats> {
     let (h, w, _) = img.dim();
-    let mut lum = Vec::with_capacity(h);
+    let mut stats = Vec::with_capacity(h);
+
     for y in 0..h {
-        let mut row_vals: Vec<f64> = Vec::with_capacity(w);
+        let mut lum_vals = Vec::<f64>::with_capacity(w);
         for x in 0..w {
             let r = img[[y, x, 0]] as f64;
             let g = img[[y, x, 1]] as f64;
             let b = img[[y, x, 2]] as f64;
-            row_vals.push((r + g + b) / 3.0);
+            lum_vals.push((r + g + b) / 3.0);
         }
-        lum.push(median_f64(&mut row_vals));
+
+        let median_lum = median_f64(&mut lum_vals);
+        let mut abs_dev: Vec<f64> = lum_vals
+            .into_iter()
+            .map(|v| (v - median_lum).abs())
+            .collect();
+        let mad_lum = median_f64(&mut abs_dev);
+
+        stats.push(RowStats {
+            median_lum,
+            mad_lum,
+        });
     }
-    lum
+
+    stats
 }
 
-/// Detect and remove scanner dead-zone borders from a 16-bit RGB image
-/// using a discrete derivative (edge detection) approach on row-by-row
-/// median luminance.
+/// Compute a robust median MAD over a slice of rows.
+fn median_mad(stats: &[RowStats]) -> f64 {
+    let mut vals: Vec<f64> = stats.iter().map(|s| s.mad_lum).collect();
+    median_f64(&mut vals)
+}
+
+/// Detect the contiguous dead-zone run on one edge using low-variance row
+/// statistics plus hysteresis/run-length logic.
+fn detect_edge_run(
+    stats: &[RowStats],
+    content_lum: f64,
+    content_mad: f64,
+    from_top: bool,
+    safety_margin: usize,
+) -> EdgeRunDiagnostics {
+    let len = stats.len();
+    if len < 4 {
+        return EdgeRunDiagnostics {
+            crop_rows: 0,
+            strong_rows: 0,
+            peak_lum_gap: 0.0,
+            peak_row_delta: 0.0,
+        };
+    }
+
+    let strong_mad_threshold = (content_mad * 0.35).clamp(40.0, 500.0);
+    let weak_mad_threshold = (content_mad * 0.60).clamp(80.0, 900.0);
+    let strong_lum_gap = (content_lum * 0.12).max(600.0);
+    let weak_lum_gap = strong_lum_gap * 0.55;
+    let derivative_threshold = (content_lum * 0.10).max(400.0);
+    let max_search = (len / 3).max(1);
+
+    let mut last_candidate = None;
+    let mut strong_rows = 0usize;
+    let mut weak_bridge = 0usize;
+    let mut peak_lum_gap = 0.0f64;
+    let mut peak_row_delta = 0.0f64;
+
+    for step in 0..max_search {
+        let idx = if from_top { step } else { len - 1 - step };
+        let row = stats[idx];
+        let lum_gap = (row.median_lum - content_lum).abs();
+        peak_lum_gap = peak_lum_gap.max(lum_gap);
+        let strong = row.mad_lum <= strong_mad_threshold && lum_gap >= strong_lum_gap;
+        let weak = row.mad_lum <= weak_mad_threshold && lum_gap >= weak_lum_gap;
+
+        if strong {
+            strong_rows += 1;
+            weak_bridge = 0;
+            last_candidate = Some(idx);
+            continue;
+        }
+
+        if weak && strong_rows > 0 && weak_bridge < 2 {
+            weak_bridge += 1;
+            last_candidate = Some(idx);
+            continue;
+        }
+
+        if strong_rows >= 2 {
+            let next_delta = if from_top {
+                if idx + 1 < len {
+                    (stats[idx + 1].median_lum - row.median_lum).abs()
+                } else {
+                    0.0
+                }
+            } else if idx > 0 {
+                (stats[idx - 1].median_lum - row.median_lum).abs()
+            } else {
+                0.0
+            };
+            peak_row_delta = peak_row_delta.max(next_delta);
+
+            if row.mad_lum > weak_mad_threshold
+                || lum_gap < weak_lum_gap
+                || next_delta >= derivative_threshold
+            {
+                break;
+            }
+        } else if lum_gap < weak_lum_gap {
+            break;
+        }
+    }
+
+    if strong_rows < 2 {
+        return EdgeRunDiagnostics {
+            crop_rows: 0,
+            strong_rows,
+            peak_lum_gap,
+            peak_row_delta,
+        };
+    }
+
+    let Some(last_idx) = last_candidate else {
+        return EdgeRunDiagnostics {
+            crop_rows: 0,
+            strong_rows,
+            peak_lum_gap,
+            peak_row_delta,
+        };
+    };
+
+    let boundary_delta = if from_top {
+        if last_idx + 1 < len {
+            (stats[last_idx + 1].median_lum - stats[last_idx].median_lum).abs()
+        } else {
+            0.0
+        }
+    } else if last_idx > 0 {
+        (stats[last_idx - 1].median_lum - stats[last_idx].median_lum).abs()
+    } else {
+        0.0
+    };
+    peak_row_delta = peak_row_delta.max(boundary_delta);
+
+    if boundary_delta < derivative_threshold * 0.25 {
+        return EdgeRunDiagnostics {
+            crop_rows: 0,
+            strong_rows,
+            peak_lum_gap,
+            peak_row_delta,
+        };
+    }
+
+    let mut crop = if from_top {
+        last_idx + 1
+    } else {
+        len - last_idx
+    };
+
+    // Safety margin inward, but stop if variance rises sharply into real content.
+    for _ in 0..safety_margin {
+        let next_idx = if from_top {
+            crop
+        } else {
+            match len.checked_sub(crop + 1) {
+                Some(idx) => idx,
+                None => break,
+            }
+        };
+
+        if next_idx >= len {
+            break;
+        }
+
+        let next = stats[next_idx];
+        let lum_gap = (next.median_lum - content_lum).abs();
+        let next_delta = if from_top {
+            if next_idx > 0 {
+                (next.median_lum - stats[next_idx - 1].median_lum).abs()
+            } else {
+                0.0
+            }
+        } else if next_idx + 1 < len {
+            (stats[next_idx + 1].median_lum - next.median_lum).abs()
+        } else {
+            0.0
+        };
+        peak_row_delta = peak_row_delta.max(next_delta);
+
+        let sharp_rise = next.mad_lum > content_mad.max(weak_mad_threshold * 0.8)
+            && lum_gap < strong_lum_gap
+            && next_delta < derivative_threshold * 0.5;
+
+        if sharp_rise {
+            break;
+        }
+
+        crop += 1;
+    }
+
+    EdgeRunDiagnostics {
+        crop_rows: crop,
+        strong_rows,
+        peak_lum_gap,
+        peak_row_delta,
+    }
+}
+
+/// Detect and remove scanner dead-zone borders from a 16-bit RGB image using
+/// robust row statistics and contiguous-region logic.
 ///
 /// Returns `(cropped_image, top_rows_removed, bottom_rows_removed)`.
-///
-/// The algorithm:
-/// 1. Compute median luminance for every row.
-/// 2. Scan from the outside in, computing the discrete derivative
-///    (absolute difference between adjacent rows).
-/// 3. The scanner mask boundary produces a massive luminance spike.
-/// 4. Apply safety margin inward from the spike.
-/// 5. If no spike is found, assume no border is present.
-pub fn remove_borders(
+pub fn remove_borders_with_diagnostics(
     img: &Array3<u16>,
     safety_margin: usize,
-) -> (Array3<u16>, usize, usize) {
+) -> BorderRemovalResult {
     let (h, w, _) = img.dim();
     if h < 4 {
-        return (img.clone(), 0, 0);
+        return BorderRemovalResult {
+            cropped: img.clone(),
+            diagnostics: BorderRemovalDiagnostics {
+                top_removed: 0,
+                bottom_removed: 0,
+                content_lum: 0.0,
+                content_mad: 0.0,
+                top_strong_rows: 0,
+                bottom_strong_rows: 0,
+                top_peak_lum_gap: 0.0,
+                bottom_peak_lum_gap: 0.0,
+                top_peak_row_delta: 0.0,
+                bottom_peak_row_delta: 0.0,
+                dead_zone_detected: false,
+                warnings: vec![
+                    "image too short for border detection; leaving borders unchanged".to_string(),
+                ],
+            },
+        };
     }
 
-    // Step 1: Compute median luminance for every row
-    let row_lum = compute_row_luminance(img);
-
-    // Content reference: median luminance of the central 50% of rows
+    let row_stats = compute_row_stats(img);
     let q1 = h / 4;
     let q3 = 3 * h / 4;
-    let mut center_lums: Vec<f64> = row_lum[q1..q3].to_vec();
+    let center = &row_stats[q1..q3.max(q1 + 1)];
+
+    let mut center_lums: Vec<f64> = center.iter().map(|s| s.median_lum).collect();
     let content_lum = median_f64(&mut center_lums);
+    let content_mad = median_mad(center);
 
-    // Spike threshold: 20% of content luminance, floor of 500
-    let spike_threshold = (content_lum * 0.2).max(500.0);
+    let top = detect_edge_run(&row_stats, content_lum, content_mad, true, safety_margin);
+    let bottom = detect_edge_run(&row_stats, content_lum, content_mad, false, safety_margin);
+    let mut warnings = Vec::<String>::new();
 
-    log::debug!(
-        "Border detection: image {}x{}, content_lum = {:.1}, spike_threshold = {:.1}",
-        h, w, content_lum, spike_threshold
-    );
-
-    // Step 2 & 3: Scan from outside in using discrete derivative
-    let max_top = (h / 3).min(h - 1);
-    let min_bottom = 2 * h / 3;
-
-    // Top border: scan from y=0 downward, find first spike
-    let mut top_crop: usize = 0;
-    for y in 0..max_top {
-        let delta = (row_lum[y + 1] - row_lum[y]).abs();
-        if delta > spike_threshold {
-            top_crop = y + 1 + safety_margin;
-            break;
-        }
+    if top.crop_rows == 0 && bottom.crop_rows == 0 {
+        warnings.push(
+            "no convincing scanner dead-zone rows were detected; borders were left unchanged"
+                .to_string(),
+        );
+        log::info!("Border detection: no dead-zone regions detected. No cropping.");
+        return BorderRemovalResult {
+            cropped: img.clone(),
+            diagnostics: BorderRemovalDiagnostics {
+                top_removed: 0,
+                bottom_removed: 0,
+                content_lum,
+                content_mad,
+                top_strong_rows: top.strong_rows,
+                bottom_strong_rows: bottom.strong_rows,
+                top_peak_lum_gap: top.peak_lum_gap,
+                bottom_peak_lum_gap: bottom.peak_lum_gap,
+                top_peak_row_delta: top.peak_row_delta,
+                bottom_peak_row_delta: bottom.peak_row_delta,
+                dead_zone_detected: false,
+                warnings,
+            },
+        };
     }
 
-    // Bottom border: scan from y=h-1 upward, find first spike
-    let mut bottom_crop: usize = 0;
-    for y in (min_bottom..h).rev() {
-        if y == 0 {
-            break;
-        }
-        let delta = (row_lum[y - 1] - row_lum[y]).abs();
-        if delta > spike_threshold {
-            bottom_crop = (h - y) + safety_margin;
-            break;
-        }
-    }
-
-    // No borders detected
-    if top_crop == 0 && bottom_crop == 0 {
-        log::info!("Border detection: no border spikes detected. No cropping.");
-        return (img.clone(), 0, 0);
-    }
-
-    // Safety: don't consume entire image
-    if top_crop + bottom_crop >= h {
-        log::info!("Border detection: borders would consume entire image. No cropping.");
-        return (img.clone(), 0, 0);
+    if top.crop_rows + bottom.crop_rows >= h {
+        warnings.push(format!(
+            "border crop rejected because it would consume the full image ({} top, {} bottom of {})",
+            top.crop_rows, bottom.crop_rows, h
+        ));
+        log::warn!(
+            "Border detection rejected crop because it would consume the full image ({} top, {} bottom of {}).",
+            top.crop_rows,
+            bottom.crop_rows,
+            h
+        );
+        return BorderRemovalResult {
+            cropped: img.clone(),
+            diagnostics: BorderRemovalDiagnostics {
+                top_removed: 0,
+                bottom_removed: 0,
+                content_lum,
+                content_mad,
+                top_strong_rows: top.strong_rows,
+                bottom_strong_rows: bottom.strong_rows,
+                top_peak_lum_gap: top.peak_lum_gap,
+                bottom_peak_lum_gap: bottom.peak_lum_gap,
+                top_peak_row_delta: top.peak_row_delta,
+                bottom_peak_row_delta: bottom.peak_row_delta,
+                dead_zone_detected: false,
+                warnings,
+            },
+        };
     }
 
     log::info!(
-        "Border detection: removing {} top rows, {} bottom rows (from {}x{} image)",
-        top_crop, bottom_crop, h, w
+        "Border detection: removing {} top rows, {} bottom rows (content_lum={:.1}, content_mad={:.1}) from {}x{} image",
+        top.crop_rows,
+        bottom.crop_rows,
+        content_lum,
+        content_mad,
+        h,
+        w
     );
 
-    let end_row = h - bottom_crop;
-    let cropped = img.slice(s![top_crop..end_row, .., ..]).to_owned();
+    let end_row = h - bottom.crop_rows;
+    let cropped = img.slice(s![top.crop_rows..end_row, .., ..]).to_owned();
+    BorderRemovalResult {
+        cropped,
+        diagnostics: BorderRemovalDiagnostics {
+            top_removed: top.crop_rows,
+            bottom_removed: bottom.crop_rows,
+            content_lum,
+            content_mad,
+            top_strong_rows: top.strong_rows,
+            bottom_strong_rows: bottom.strong_rows,
+            top_peak_lum_gap: top.peak_lum_gap,
+            bottom_peak_lum_gap: bottom.peak_lum_gap,
+            top_peak_row_delta: top.peak_row_delta,
+            bottom_peak_row_delta: bottom.peak_row_delta,
+            dead_zone_detected: true,
+            warnings,
+        },
+    }
+}
 
-    (cropped, top_crop, bottom_crop)
+pub fn remove_borders(img: &Array3<u16>, safety_margin: usize) -> (Array3<u16>, usize, usize) {
+    let result = remove_borders_with_diagnostics(img, safety_margin);
+    (
+        result.cropped,
+        result.diagnostics.top_removed,
+        result.diagnostics.bottom_removed,
+    )
 }

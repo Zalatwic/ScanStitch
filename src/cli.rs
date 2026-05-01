@@ -27,7 +27,7 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub force_no_stitch: bool,
 
-    /// Transform mode: "auto", "affine", or "homography".
+    /// Transform mode: "auto", "translation", "affine", or "homography".
     #[arg(long, default_value = "auto")]
     pub transform: String,
 

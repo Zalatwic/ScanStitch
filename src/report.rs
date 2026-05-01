@@ -13,6 +13,7 @@ pub struct PhaseReport {
     pub name: String,
     pub success: bool,
     pub confidence: f64,
+    pub duration_ms: u64,
     pub metrics: serde_json::Value,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
@@ -50,6 +51,7 @@ impl PhaseReport {
             name: name.to_string(),
             success: true,
             confidence,
+            duration_ms: 0,
             metrics,
             warnings: Vec::new(),
             errors: Vec::new(),
@@ -62,9 +64,16 @@ impl PhaseReport {
             name: name.to_string(),
             success: false,
             confidence: 0.0,
+            duration_ms: 0,
             metrics: serde_json::Value::Null,
             warnings: Vec::new(),
             errors: vec![error.to_string()],
         }
+    }
+
+    /// Annotate a phase report with wall-clock runtime.
+    pub fn with_duration_ms(mut self, duration_ms: u64) -> Self {
+        self.duration_ms = duration_ms;
+        self
     }
 }

@@ -1,4 +1,4 @@
-use ndarray::{ArrayView3, s};
+use ndarray::{s, ArrayView3};
 
 /// Default number of rows per processing tile.
 pub const DEFAULT_TILE_ROWS: usize = 512;
