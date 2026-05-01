@@ -1,0 +1,17 @@
+/target/
+/output/
+/audit-renders/
+/local-audit/
+/validation-output/
+/docs/plans/
+
+# Local real-image fixtures and generated renders are intentionally not versioned.
+/*.tif
+/*.tiff
+
+# Temporary full-source dumps.
+/fullcode.txt
+/fullcode-*.txt
+
+*.exe
+*.pdb
