@@ -41,6 +41,34 @@ fn make_textured_split_pair(
     (comp1, comp2)
 }
 
+fn scale_image_channels(img: &mut Array3<u16>, gain: [f64; 3]) {
+    let (h, w, _) = img.dim();
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..3 {
+                img[[y, x, c]] = (img[[y, x, c]] as f64 * gain[c])
+                    .round()
+                    .clamp(0.0, 16383.0) as u16;
+            }
+        }
+    }
+}
+
+fn seam_correction(metrics: &serde_json::Value) -> &serde_json::Value {
+    metrics
+        .get("seam_exposure_correction")
+        .expect("seam exposure correction diagnostics")
+}
+
+fn sum_json_array(value: &serde_json::Value) -> f64 {
+    value
+        .as_array()
+        .expect("numeric array")
+        .iter()
+        .map(|entry| entry.as_f64().expect("array value"))
+        .sum()
+}
+
 /// Create a 2D gradient image that varies both horizontally and vertically.
 /// This is essential for drift tests — a purely horizontal gradient has identical
 /// rows and can't distinguish vertical offsets.
@@ -239,6 +267,9 @@ fn test_stitch_report_contains_both_hypotheses() {
     assert!(result.report.metrics["chosen_hypothesis"].is_string());
     assert!(result.report.metrics["acceptance_thresholds"].is_object());
     assert!(result.report.metrics["transform_model_used"].is_string());
+    assert!(result.report.metrics["runtime"]["total_ms"].is_number());
+    assert!(result.report.metrics["runtime"]["translation_evaluation_ms"].is_number());
+    assert!(result.report.metrics["runtime"]["homography_attempted"].is_boolean());
     assert!(hypotheses
         .iter()
         .all(|hyp| hyp["objective_score"].is_number()));
@@ -276,6 +307,112 @@ fn test_stitch_report_contains_both_hypotheses() {
                     && candidate["prior_weight"].is_number()
             })
     }));
+}
+
+#[test]
+fn test_seam_exposure_report_present_and_skips_matched_exposure() {
+    let (comp1, comp2) = make_textured_split_pair(180, 900, 140);
+    let result = scanstitch::stitch::stitch_components(
+        &comp1,
+        &comp2,
+        &scanstitch::stitch::StitchConfig::default(),
+    );
+
+    assert!(result.result.is_some(), "stitch should succeed");
+    let correction = seam_correction(&result.report.metrics);
+    assert_eq!(correction["mode"], "auto");
+    assert_eq!(correction["applied"], false);
+    assert!(correction["reason"].as_str().is_some());
+    assert!(correction["sample_count"].as_u64().expect("sample count") > 0);
+    assert_eq!(
+        correction["gain_rgb"]
+            .as_array()
+            .expect("gain rgb")
+            .iter()
+            .map(|v| v.as_f64().expect("gain"))
+            .collect::<Vec<_>>(),
+        vec![1.0, 1.0, 1.0]
+    );
+    assert!(
+        correction["seam_score_after"]
+            .as_f64()
+            .expect("score after")
+            <= correction["seam_score_before"]
+                .as_f64()
+                .expect("score before")
+                + 1e-9
+    );
+}
+
+#[test]
+fn test_seam_exposure_applies_for_global_exposure_mismatch() {
+    let (comp1, mut comp2) = make_textured_split_pair(180, 900, 140);
+    scale_image_channels(&mut comp2, [1.14, 1.14, 1.14]);
+
+    let result = scanstitch::stitch::stitch_components(
+        &comp1,
+        &comp2,
+        &scanstitch::stitch::StitchConfig::default(),
+    );
+
+    assert!(result.result.is_some(), "stitch should succeed");
+    let correction = seam_correction(&result.report.metrics);
+    assert_eq!(correction["applied"], true, "{}", correction);
+    let gains = correction["gain_rgb"].as_array().expect("gain rgb");
+    for gain in gains {
+        let gain = gain.as_f64().expect("gain");
+        assert!(
+            (0.84..0.92).contains(&gain),
+            "expected inverse gain near 1/1.14, got {} in {}",
+            gain,
+            correction
+        );
+    }
+    assert!(
+        correction["seam_score_after"]
+            .as_f64()
+            .expect("score after")
+            < correction["seam_score_before"]
+                .as_f64()
+                .expect("score before")
+    );
+    assert!(
+        sum_json_array(&correction["clipped_high_after"])
+            <= sum_json_array(&correction["clipped_high_before"]) + 1e-9
+    );
+}
+
+#[test]
+fn test_seam_exposure_uses_per_channel_gain_when_stable() {
+    let (comp1, mut comp2) = make_textured_split_pair(180, 900, 140);
+    scale_image_channels(&mut comp2, [1.16, 0.90, 1.04]);
+
+    let result = scanstitch::stitch::stitch_components(
+        &comp1,
+        &comp2,
+        &scanstitch::stitch::StitchConfig::default(),
+    );
+
+    assert!(result.result.is_some(), "stitch should succeed");
+    let correction = seam_correction(&result.report.metrics);
+    assert_eq!(correction["applied"], true, "{}", correction);
+    assert_eq!(correction["per_channel_gain_used"], true, "{}", correction);
+    let gains = correction["gain_rgb"].as_array().expect("gain rgb");
+    assert!(
+        gains[0].as_f64().expect("red gain") < gains[2].as_f64().expect("blue gain")
+            && gains[2].as_f64().expect("blue gain") < gains[1].as_f64().expect("green gain"),
+        "expected channel-specific inverse gains, got {}",
+        correction
+    );
+    assert!(
+        correction["seam_score_after"]
+            .as_f64()
+            .expect("score after")
+            < correction["seam_score_before"]
+                .as_f64()
+                .expect("score before")
+                * 0.5
+    );
 }
 
 #[test]
@@ -318,6 +455,7 @@ fn test_stitch_report_tracks_validation_vs_search_ranking() {
 }
 
 #[test]
+#[ignore = "requires local LOGAN TIFFs and runs the full real-image stitch path"]
 fn test_real_sample_pair_uses_rgba8_load_path_and_accepts_narrow_overlap_stitch() {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let path1 = repo_root.join("LOGAN043.tif");

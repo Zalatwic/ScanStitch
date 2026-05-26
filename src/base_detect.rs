@@ -1,13 +1,43 @@
 use ndarray::Array3;
+use std::collections::BTreeMap;
+
+const BASE_FALLBACK_HISTOGRAM_BINS: usize = 4096;
+const BASE_FALLBACK_PERCENTILE: f64 = 0.995;
+const BASE_FALLBACK_JOINT_COLOR_PERCENTILE: f64 = 0.75;
+const BASE_FALLBACK_SUPPORT_LOW: f64 = 0.0005;
+const BASE_FALLBACK_SUPPORT_HIGH: f64 = 0.0100;
+const BASE_FALLBACK_MAX_CONFIDENCE: f64 = 0.12;
+const BASE_FALLBACK_SUPPORT_TOLERANCE: f64 = 0.98;
+const MIN_BASE_REGION_LUMINANCE: f64 = 512.0;
+const MIN_BASE_REGION_REFERENCE_RATIO: f64 = 0.20;
+const DARK_REGION_HIGH_TRANSMITTANCE_LUMA_RATIO: f64 = 0.72;
+const DARK_REGION_HIGH_TRANSMITTANCE_CHANNEL_RATIO: f64 = 0.70;
+const ROLL_BASE_CLUSTER_CHROMA_THRESHOLD: f64 = 0.055;
+const ROLL_BASE_CLUSTER_LUMA_THRESHOLD: f64 = 0.30;
+const ROLL_BASE_MIN_SUPPORT_RATIO: f64 = 0.30;
+const ROLL_BASE_RUNNER_UP_MARGIN: usize = 2;
 
 /// Result of film base (rebate) detection on left/right edges.
+#[derive(Debug, Clone)]
 pub struct BaseDetection {
     /// Confidence that the left edge contains film base [0, 1].
     pub left_confidence: f64,
     /// Confidence that the right edge contains film base [0, 1].
     pub right_confidence: f64,
+    /// Confidence that the top edge contains film base [0, 1].
+    pub top_confidence: f64,
+    /// Confidence that the bottom edge contains film base [0, 1].
+    pub bottom_confidence: f64,
     /// Estimated base RGB color as f64 values (in u16 range).
     pub base_color: [f64; 3],
+    /// Source of the selected base RGB estimate.
+    pub base_color_source: &'static str,
+    /// Human-readable reason for the selected base RGB estimate.
+    pub base_color_reason: String,
+    /// Low-confidence proxy confidence for percentile-derived fallback estimates.
+    pub base_color_proxy_confidence: Option<f64>,
+    /// Fraction of pixels simultaneously supporting the percentile-derived fallback estimate.
+    pub base_color_support_fraction: Option<f64>,
     /// Edge strip width used for left/right detection.
     pub strip_width: usize,
     /// Block confidence grid for the left strip (rows x cols of f64 in [0,1]).
@@ -58,6 +88,65 @@ struct BlockStats {
     mad_lum: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HighTransmittanceFallback {
+    color: [f64; 3],
+    confidence: f64,
+    support_fraction: f64,
+    joint_support_fraction: Option<f64>,
+    color_strategy: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JointHighTransmittanceColor {
+    color: [f64; 3],
+    support_fraction: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RollBaseCandidate {
+    pub frame_id: String,
+    pub color: [f64; 3],
+    pub source: String,
+    pub confidence: f64,
+    pub support_fraction: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RollBaseCluster {
+    pub color: [f64; 3],
+    pub frame_count: usize,
+    pub mean_luminance: f64,
+    pub max_relative_luminance_spread: f64,
+    pub source_counts: Vec<(String, usize)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RollBaseConsensus {
+    pub color: [f64; 3],
+    pub source: &'static str,
+    pub confidence: f64,
+    pub frame_count: usize,
+    pub candidate_count: usize,
+    pub selected_cluster_frame_count: usize,
+    pub rejected_dark_candidate_count: usize,
+    pub high_transmittance_envelope: [f64; 3],
+    pub clusters: Vec<RollBaseCluster>,
+    pub reason: String,
+}
+
+impl RollBaseCandidate {
+    pub fn from_detection(frame_id: impl Into<String>, detection: &BaseDetection) -> Self {
+        Self {
+            frame_id: frame_id.into(),
+            color: detection.base_color,
+            source: detection.base_color_source.to_string(),
+            confidence: base_detection_confidence(detection),
+            support_fraction: detection.base_color_support_fraction,
+        }
+    }
+}
+
 /// Detect unexposed film base (rebate) regions on left/right edges.
 ///
 /// Operates on a cropped u16 image (h, w, 3). Returns confidence scores
@@ -77,6 +166,15 @@ pub fn detect_film_base(img: &Array3<u16>) -> BaseDetection {
         process_strip(img, h, 0, strip_w, &interior_median);
     let (mut right_conf, right_mask, mut right_color) =
         process_strip(img, h, w.saturating_sub(strip_w), w, &interior_median);
+    let strip_h = (h as f64 * 0.05).round().max(10.0).min((h / 2) as f64) as usize;
+    let row_interior_start = strip_h;
+    let row_interior_end = h.saturating_sub(strip_h).max(row_interior_start + 1);
+    let row_interior_median =
+        region_median_color_rows(img, w, row_interior_start, row_interior_end);
+    let (mut top_conf, top_color) = process_row_strip(img, w, 0, strip_h, &row_interior_median);
+    let (mut bottom_conf, bottom_color) =
+        process_row_strip(img, w, h.saturating_sub(strip_h), h, &row_interior_median);
+    let high_transmittance_envelope = robust_high_transmittance_estimate(img);
 
     // Cross-check against the full-width vertical scan so split-frame gaps and
     // edge rebates share a consistent base estimate.
@@ -93,25 +191,613 @@ pub fn detect_film_base(img: &Array3<u16>) -> BaseDetection {
             right_color = region.median_rgb;
         }
     }
+    left_conf = demote_dark_base_region_against_envelope(
+        left_conf,
+        &left_color,
+        &high_transmittance_envelope.color,
+    );
+    right_conf = demote_dark_base_region_against_envelope(
+        right_conf,
+        &right_color,
+        &high_transmittance_envelope.color,
+    );
+    top_conf = demote_dark_base_region_against_envelope(
+        top_conf,
+        &top_color,
+        &high_transmittance_envelope.color,
+    );
+    bottom_conf = demote_dark_base_region_against_envelope(
+        bottom_conf,
+        &bottom_color,
+        &high_transmittance_envelope.color,
+    );
 
-    let base_color = if left_conf > 0.3 || right_conf > 0.3 {
+    let (
+        base_color,
+        base_color_source,
+        base_color_reason,
+        base_color_proxy_confidence,
+        base_color_support_fraction,
+    ) = if left_conf > 0.3 || right_conf > 0.3 {
         if left_conf >= right_conf {
-            left_color
+            (
+                left_color,
+                "working_edges",
+                format!("left edge rebate selected with confidence {left_conf:.3}"),
+                None,
+                None,
+            )
         } else {
-            right_color
+            (
+                right_color,
+                "working_edges",
+                format!("right edge rebate selected with confidence {right_conf:.3}"),
+                None,
+                None,
+            )
         }
+    } else if top_conf > 0.3 || bottom_conf > 0.3 {
+        if top_conf >= bottom_conf {
+            (
+                top_color,
+                "horizontal_base_region",
+                format!("top horizontal rebate selected with confidence {top_conf:.3}"),
+                None,
+                None,
+            )
+        } else {
+            (
+                bottom_color,
+                "horizontal_base_region",
+                format!("bottom horizontal rebate selected with confidence {bottom_conf:.3}"),
+                None,
+                None,
+            )
+        }
+    } else if vertical.dominant_color.iter().any(|value| *value > 0.0) {
+        (
+            vertical.dominant_color,
+            "vertical_base_region",
+            "full-width scan found a base-like vertical region after edge confidence was low"
+                .to_string(),
+            None,
+            None,
+        )
     } else {
-        vertical.dominant_color
+        let fallback = high_transmittance_envelope;
+        left_conf = left_conf.max(fallback.confidence);
+        right_conf = right_conf.max(fallback.confidence);
+        top_conf = top_conf.max(fallback.confidence);
+        bottom_conf = bottom_conf.max(fallback.confidence);
+        let joint_detail = fallback
+            .joint_support_fraction
+            .map(|fraction| {
+                format!(
+                    "; selected a joint high-transmittance pixel colour from {:.3}% of pixels because independent channel percentiles did not co-occur",
+                    fraction * 100.0
+                )
+            })
+            .unwrap_or_default();
+        (
+            fallback.color,
+            "high_transmittance_fallback",
+            format!(
+                "no edge, vertical, or horizontal base region was detected; using the {} {:.1}% high-transmittance fallback with low proxy confidence {:.3} from {:.3}% simultaneous high-transmittance support{}",
+                fallback.color_strategy,
+                BASE_FALLBACK_PERCENTILE * 100.0,
+                fallback.confidence,
+                fallback.support_fraction * 100.0,
+                joint_detail
+            ),
+            Some(fallback.confidence),
+            Some(fallback.support_fraction),
+        )
     };
 
     BaseDetection {
         left_confidence: left_conf,
         right_confidence: right_conf,
+        top_confidence: top_conf,
+        bottom_confidence: bottom_conf,
         base_color,
+        base_color_source,
+        base_color_reason,
+        base_color_proxy_confidence,
+        base_color_support_fraction,
         strip_width: strip_w,
         left_base_mask: left_mask,
         right_base_mask: right_mask,
     }
+}
+
+pub fn base_detection_confidence(detection: &BaseDetection) -> f64 {
+    detection
+        .left_confidence
+        .max(detection.right_confidence)
+        .max(detection.top_confidence)
+        .max(detection.bottom_confidence)
+}
+
+fn demote_dark_base_region_against_envelope(
+    confidence: f64,
+    candidate: &[f64; 3],
+    envelope: &[f64; 3],
+) -> f64 {
+    if confidence <= 0.0 || !base_candidate_is_much_darker_than_envelope(candidate, envelope) {
+        confidence
+    } else {
+        0.0
+    }
+}
+
+fn base_candidate_is_much_darker_than_envelope(candidate: &[f64; 3], envelope: &[f64; 3]) -> bool {
+    if !candidate
+        .iter()
+        .all(|value| value.is_finite() && *value > 0.0)
+        || !envelope
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0)
+    {
+        return false;
+    }
+
+    let envelope_lum = luminance(envelope);
+    if envelope_lum <= MIN_BASE_REGION_LUMINANCE {
+        return false;
+    }
+    let candidate_lum = luminance(candidate);
+    let dark_luminance = candidate_lum < envelope_lum * DARK_REGION_HIGH_TRANSMITTANCE_LUMA_RATIO;
+    let dark_channels = (0..3)
+        .filter(|&channel| {
+            candidate[channel] < envelope[channel] * DARK_REGION_HIGH_TRANSMITTANCE_CHANNEL_RATIO
+        })
+        .count();
+    dark_luminance && dark_channels >= 2
+}
+
+fn robust_high_transmittance_estimate(img: &Array3<u16>) -> HighTransmittanceFallback {
+    let (h, w, channels) = img.dim();
+    if h == 0 || w == 0 || channels < 3 {
+        return HighTransmittanceFallback {
+            color: [0.0; 3],
+            confidence: 0.0,
+            support_fraction: 0.0,
+            joint_support_fraction: None,
+            color_strategy: "channel-wise",
+        };
+    }
+
+    let mut histograms: [Vec<u64>; 3] =
+        std::array::from_fn(|_| vec![0; BASE_FALLBACK_HISTOGRAM_BINS]);
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..3 {
+                let bin = ((img[[y, x, c]] as usize * (BASE_FALLBACK_HISTOGRAM_BINS - 1))
+                    / u16::MAX as usize)
+                    .min(BASE_FALLBACK_HISTOGRAM_BINS - 1);
+                histograms[c][bin] += 1;
+            }
+        }
+    }
+
+    let total = (h * w) as u64;
+    let target = ((total.saturating_sub(1)) as f64 * BASE_FALLBACK_PERCENTILE) as u64;
+    let color: [f64; 3] = std::array::from_fn(|c| {
+        let mut cumulative = 0u64;
+        for (bin, count) in histograms[c].iter().enumerate() {
+            cumulative += *count;
+            if cumulative > target {
+                return (bin as f64 / (BASE_FALLBACK_HISTOGRAM_BINS - 1) as f64) * u16::MAX as f64;
+            }
+        }
+        u16::MAX as f64
+    });
+
+    let support_threshold: [f64; 3] =
+        std::array::from_fn(|c| (color[c] * BASE_FALLBACK_SUPPORT_TOLERANCE).max(1.0));
+    let mut support = 0u64;
+    for y in 0..h {
+        for x in 0..w {
+            if (0..3).all(|c| img[[y, x, c]] as f64 >= support_threshold[c]) {
+                support += 1;
+            }
+        }
+    }
+    let support_fraction = support as f64 / total.max(1) as f64;
+    let support_score = ((support_fraction - BASE_FALLBACK_SUPPORT_LOW)
+        / (BASE_FALLBACK_SUPPORT_HIGH - BASE_FALLBACK_SUPPORT_LOW))
+        .clamp(0.0, 1.0);
+
+    let (color, color_strategy, joint_support_fraction) =
+        if support_fraction < BASE_FALLBACK_SUPPORT_LOW {
+            let joint = joint_high_transmittance_color(img, &color);
+            if joint.support_fraction > 0.0 {
+                (joint.color, "joint-pixel", Some(joint.support_fraction))
+            } else {
+                (color, "channel-wise", None)
+            }
+        } else {
+            (color, "channel-wise", None)
+        };
+
+    HighTransmittanceFallback {
+        color,
+        confidence: support_score * BASE_FALLBACK_MAX_CONFIDENCE,
+        support_fraction,
+        joint_support_fraction,
+        color_strategy,
+    }
+}
+
+fn joint_high_transmittance_color(
+    img: &Array3<u16>,
+    independent_color: &[f64; 3],
+) -> JointHighTransmittanceColor {
+    let (h, w, channels) = img.dim();
+    if h == 0 || w == 0 || channels < 3 {
+        return JointHighTransmittanceColor {
+            color: [0.0; 3],
+            support_fraction: 0.0,
+        };
+    }
+
+    let mut score_histogram = vec![0u64; BASE_FALLBACK_HISTOGRAM_BINS];
+    for y in 0..h {
+        for x in 0..w {
+            let score = joint_support_score(img, y, x, independent_color);
+            let bin = (score * (BASE_FALLBACK_HISTOGRAM_BINS - 1) as f64)
+                .round()
+                .clamp(0.0, (BASE_FALLBACK_HISTOGRAM_BINS - 1) as f64)
+                as usize;
+            score_histogram[bin] += 1;
+        }
+    }
+
+    let total = (h * w) as u64;
+    let target = ((total.saturating_sub(1)) as f64 * BASE_FALLBACK_PERCENTILE) as u64;
+    let mut cumulative = 0u64;
+    let mut threshold_bin = BASE_FALLBACK_HISTOGRAM_BINS - 1;
+    for (bin, count) in score_histogram.iter().enumerate() {
+        cumulative += *count;
+        if cumulative > target {
+            threshold_bin = bin;
+            break;
+        }
+    }
+    let threshold_score = threshold_bin as f64 / (BASE_FALLBACK_HISTOGRAM_BINS - 1) as f64;
+
+    let mut selected_histograms: [Vec<u64>; 3] =
+        std::array::from_fn(|_| vec![0; BASE_FALLBACK_HISTOGRAM_BINS]);
+    let mut selected = 0u64;
+    for y in 0..h {
+        for x in 0..w {
+            if joint_support_score(img, y, x, independent_color) < threshold_score {
+                continue;
+            }
+            selected += 1;
+            for c in 0..3 {
+                let bin = ((img[[y, x, c]] as usize * (BASE_FALLBACK_HISTOGRAM_BINS - 1))
+                    / u16::MAX as usize)
+                    .min(BASE_FALLBACK_HISTOGRAM_BINS - 1);
+                selected_histograms[c][bin] += 1;
+            }
+        }
+    }
+
+    if selected == 0 {
+        return JointHighTransmittanceColor {
+            color: [0.0; 3],
+            support_fraction: 0.0,
+        };
+    }
+
+    let selected_target =
+        ((selected.saturating_sub(1)) as f64 * BASE_FALLBACK_JOINT_COLOR_PERCENTILE) as u64;
+    let color = std::array::from_fn(|c| {
+        let mut cumulative = 0u64;
+        for (bin, count) in selected_histograms[c].iter().enumerate() {
+            cumulative += *count;
+            if cumulative > selected_target {
+                return (bin as f64 / (BASE_FALLBACK_HISTOGRAM_BINS - 1) as f64) * u16::MAX as f64;
+            }
+        }
+        u16::MAX as f64
+    });
+
+    JointHighTransmittanceColor {
+        color,
+        support_fraction: selected as f64 / total.max(1) as f64,
+    }
+}
+
+fn joint_support_score(img: &Array3<u16>, y: usize, x: usize, independent_color: &[f64; 3]) -> f64 {
+    (0..3)
+        .map(|c| img[[y, x, c]] as f64 / independent_color[c].max(1.0))
+        .fold(f64::INFINITY, f64::min)
+        .clamp(0.0, 1.0)
+}
+
+pub fn roll_consensus_base(candidates: &[RollBaseCandidate]) -> Option<RollBaseConsensus> {
+    let valid = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .color
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if valid.len() < min_roll_base_consensus_frames(valid.len()) {
+        return None;
+    }
+
+    let high_transmittance_envelope = roll_high_transmittance_envelope(&valid);
+    let mut rejected_dark_candidate_count = 0usize;
+    let mut retained = Vec::<RollBaseCandidate>::new();
+    for candidate in valid {
+        if base_candidate_is_much_darker_than_envelope(
+            &candidate.color,
+            &high_transmittance_envelope,
+        ) {
+            rejected_dark_candidate_count += 1;
+        } else {
+            retained.push(candidate);
+        }
+    }
+
+    if retained.len() < min_roll_base_consensus_frames(candidates.len()) {
+        return None;
+    }
+
+    retained.sort_by(|a, b| {
+        luminance(&b.color)
+            .partial_cmp(&luminance(&a.color))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut clusters = Vec::<RollClusterWork>::new();
+    for candidate in retained {
+        let best_idx = clusters
+            .iter()
+            .enumerate()
+            .filter(|(_, cluster)| roll_candidate_matches_cluster(&candidate.color, cluster))
+            .min_by(|(_, left), (_, right)| {
+                roll_cluster_distance(&candidate.color, left)
+                    .partial_cmp(&roll_cluster_distance(&candidate.color, right))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(idx, _)| idx);
+
+        if let Some(idx) = best_idx {
+            clusters[idx].push(candidate);
+        } else {
+            clusters.push(RollClusterWork::new(candidate));
+        }
+    }
+
+    if clusters.is_empty() {
+        return None;
+    }
+
+    clusters.sort_by(compare_roll_clusters);
+    let min_support = min_roll_base_consensus_frames(candidates.len());
+    let selected = &clusters[0];
+    let selected_count = selected.candidates.len();
+    let support_ratio = selected_count as f64 / candidates.len().max(1) as f64;
+    if selected_count < min_support || support_ratio < ROLL_BASE_MIN_SUPPORT_RATIO {
+        return None;
+    }
+
+    if let Some(runner_up) = clusters.get(1) {
+        let runner_up_count = runner_up.candidates.len();
+        let selected_is_brighter =
+            luminance(&selected.color()) >= luminance(&runner_up.color()) * 1.08;
+        if selected_count <= runner_up_count
+            || (selected_count < runner_up_count + ROLL_BASE_RUNNER_UP_MARGIN
+                && !selected_is_brighter)
+        {
+            return None;
+        }
+    }
+
+    let cluster_summaries = clusters
+        .iter()
+        .map(RollClusterWork::to_summary)
+        .collect::<Vec<_>>();
+    let selected_summary = cluster_summaries
+        .first()
+        .expect("selected cluster summary should exist");
+    let confidence = roll_consensus_confidence(
+        selected_count,
+        candidates.len(),
+        selected_summary.max_relative_luminance_spread,
+        selected.has_strong_single_frame_sources(),
+    );
+
+    Some(RollBaseConsensus {
+        color: selected_summary.color,
+        source: "roll_consensus_base",
+        confidence,
+        frame_count: candidates.len(),
+        candidate_count: candidates.len(),
+        selected_cluster_frame_count: selected_count,
+        rejected_dark_candidate_count,
+        high_transmittance_envelope,
+        clusters: cluster_summaries,
+        reason: format!(
+            "selected stable roll base cluster from {selected_count}/{} frame candidates; rejected {} darker candidate(s) against the roll high-transmittance envelope",
+            candidates.len(),
+            rejected_dark_candidate_count
+        ),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct RollClusterWork {
+    candidates: Vec<RollBaseCandidate>,
+}
+
+impl RollClusterWork {
+    fn new(candidate: RollBaseCandidate) -> Self {
+        Self {
+            candidates: vec![candidate],
+        }
+    }
+
+    fn push(&mut self, candidate: RollBaseCandidate) {
+        self.candidates.push(candidate);
+    }
+
+    fn color(&self) -> [f64; 3] {
+        median_color(
+            &self
+                .candidates
+                .iter()
+                .map(|candidate| candidate.color)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn max_relative_luminance_spread(&self) -> f64 {
+        let luminances = self
+            .candidates
+            .iter()
+            .map(|candidate| luminance(&candidate.color))
+            .collect::<Vec<_>>();
+        let min_lum = luminances.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_lum = luminances.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        if !min_lum.is_finite() || !max_lum.is_finite() || max_lum <= 1.0 {
+            1.0
+        } else {
+            (max_lum - min_lum) / max_lum
+        }
+    }
+
+    fn has_strong_single_frame_sources(&self) -> bool {
+        self.candidates.iter().any(|candidate| {
+            candidate.confidence >= 0.50 && candidate.source != "high_transmittance_fallback"
+        })
+    }
+
+    fn to_summary(&self) -> RollBaseCluster {
+        let color = self.color();
+        let mut source_counts = BTreeMap::<String, usize>::new();
+        for candidate in &self.candidates {
+            *source_counts.entry(candidate.source.clone()).or_insert(0) += 1;
+        }
+        RollBaseCluster {
+            color,
+            frame_count: self.candidates.len(),
+            mean_luminance: self
+                .candidates
+                .iter()
+                .map(|candidate| luminance(&candidate.color))
+                .sum::<f64>()
+                / self.candidates.len().max(1) as f64,
+            max_relative_luminance_spread: self.max_relative_luminance_spread(),
+            source_counts: source_counts.into_iter().collect(),
+        }
+    }
+}
+
+fn roll_high_transmittance_envelope(candidates: &[RollBaseCandidate]) -> [f64; 3] {
+    std::array::from_fn(|channel| {
+        let mut values = candidates
+            .iter()
+            .map(|candidate| candidate.color[channel])
+            .collect::<Vec<_>>();
+        percentile(&mut values, 0.85)
+    })
+}
+
+fn roll_candidate_matches_cluster(color: &[f64; 3], cluster: &RollClusterWork) -> bool {
+    let cluster_color = cluster.color();
+    chroma_distance(block_chroma(color), block_chroma(&cluster_color))
+        <= ROLL_BASE_CLUSTER_CHROMA_THRESHOLD
+        && relative_luminance_delta(color, &cluster_color) <= ROLL_BASE_CLUSTER_LUMA_THRESHOLD
+}
+
+fn roll_cluster_distance(color: &[f64; 3], cluster: &RollClusterWork) -> f64 {
+    let cluster_color = cluster.color();
+    chroma_distance(block_chroma(color), block_chroma(&cluster_color))
+        + relative_luminance_delta(color, &cluster_color)
+}
+
+fn compare_roll_clusters(left: &RollClusterWork, right: &RollClusterWork) -> std::cmp::Ordering {
+    let left_count = left.candidates.len();
+    let right_count = right.candidates.len();
+    right_count
+        .cmp(&left_count)
+        .then_with(|| {
+            luminance(&right.color())
+                .partial_cmp(&luminance(&left.color()))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| {
+            left.max_relative_luminance_spread()
+                .partial_cmp(&right.max_relative_luminance_spread())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+fn min_roll_base_consensus_frames(candidate_count: usize) -> usize {
+    if candidate_count >= 20 {
+        5
+    } else if candidate_count >= 8 {
+        3
+    } else {
+        2
+    }
+}
+
+fn roll_consensus_confidence(
+    selected_count: usize,
+    candidate_count: usize,
+    luminance_spread: f64,
+    has_strong_single_frame_sources: bool,
+) -> f64 {
+    let support_ratio = selected_count as f64 / candidate_count.max(1) as f64;
+    let consistency = (1.0 - luminance_spread).clamp(0.0, 1.0);
+    let source_floor = if has_strong_single_frame_sources {
+        0.70
+    } else {
+        0.55
+    };
+    (source_floor + support_ratio * 0.30 + consistency * 0.15).clamp(0.35, 0.98)
+}
+
+fn median_color(colors: &[[f64; 3]]) -> [f64; 3] {
+    std::array::from_fn(|channel| {
+        let mut values = colors
+            .iter()
+            .map(|color| color[channel])
+            .collect::<Vec<_>>();
+        median(&mut values)
+    })
+}
+
+fn median(values: &mut [f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        (values[mid - 1] + values[mid]) * 0.5
+    } else {
+        values[mid]
+    }
+}
+
+fn percentile(values: &mut [f64], percentile: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx =
+        ((values.len().saturating_sub(1)) as f64 * percentile.clamp(0.0, 1.0)).round() as usize;
+    values[idx.min(values.len() - 1)]
 }
 
 /// Reconcile a stitched working-image base estimate against the component-base
@@ -120,8 +806,15 @@ pub fn reconcile_stitched_base_estimate(
     working: &BaseDetection,
     component_bases: &[[f64; 3]],
 ) -> BaseReconciliation {
-    let raw_working_confidence = working.left_confidence.max(working.right_confidence);
-    let stronger_edge = raw_working_confidence.max(1e-6);
+    let raw_working_confidence = working
+        .left_confidence
+        .max(working.right_confidence)
+        .max(working.top_confidence)
+        .max(working.bottom_confidence);
+    let stronger_edge = working
+        .left_confidence
+        .max(working.right_confidence)
+        .max(1e-6);
     let edge_balance_ratio = if stronger_edge <= 1e-6 {
         1.0
     } else {
@@ -164,7 +857,7 @@ pub fn reconcile_stitched_base_estimate(
         return BaseReconciliation {
             base_color: working.base_color,
             confidence: raw_working_confidence,
-            source: "working_edges",
+            source: working.base_color_source,
             reason: format!(
                 "stitched working-image edge estimate stayed close to the component consensus (max delta {:.1}%, mean delta {:.1}%)",
                 max_delta * 100.0,
@@ -183,8 +876,11 @@ pub fn reconcile_stitched_base_estimate(
     BaseReconciliation {
         base_color: working.base_color,
         confidence: raw_working_confidence,
-        source: "working_edges",
-        reason: "no stable component-base consensus was available; keeping the stitched working-image edge estimate".to_string(),
+        source: working.base_color_source,
+        reason: format!(
+            "no stable component-base consensus was available; keeping the working-image base estimate: {}",
+            working.base_color_reason
+        ),
         raw_working_base_color: working.base_color,
         raw_working_confidence,
         component_consensus_base_color: None,
@@ -234,6 +930,11 @@ pub fn detect_vertical_base_regions(img: &Array3<u16>) -> VerticalBaseScan {
 
     let mut mad_vals: Vec<f64> = blocks.iter().map(|b| b.mad_lum).collect();
     let median_block_mad = fast_median(&mut mad_vals);
+    let mut lum_vals: Vec<f64> = blocks
+        .iter()
+        .map(|block| luminance(&block.median_rgb))
+        .collect();
+    let reference_lum = fast_median(&mut lum_vals);
     let low_texture_threshold = (median_block_mad * 0.60).clamp(80.0, 600.0);
     let grow_texture_threshold = (low_texture_threshold * 1.2).clamp(100.0, 750.0);
     let seed_chroma_threshold = 0.020;
@@ -313,17 +1014,14 @@ pub fn detect_vertical_base_regions(img: &Array3<u16>) -> VerticalBaseScan {
         let x_start = spans[start_idx].0;
         let x_end = spans[end_idx].1;
         let width_fraction = (x_end - x_start) as f64 / w as f64;
-        if width_fraction < 0.01 || width_fraction > 0.85 {
+        if !(0.01..=0.85).contains(&width_fraction) {
             i = end_idx + 1;
             continue;
         }
 
         let members: Vec<(usize, usize)> = (start_idx..=end_idx).map(|idx| (0, idx)).collect();
-        let mut region_conf = 0.0f64;
-        for idx in start_idx..=end_idx {
-            region_conf += region_strength[idx];
-        }
-        region_conf /= (end_idx - start_idx + 1) as f64;
+        let mut region_conf = region_strength[start_idx..=end_idx].iter().sum::<f64>()
+            / (end_idx - start_idx + 1) as f64;
 
         let contrast = region_neighbor_contrast(&blocks, start_idx, end_idx);
         region_conf = (region_conf * 0.7 + contrast * 0.3).clamp(0.0, 1.0);
@@ -333,6 +1031,10 @@ pub fn detect_vertical_base_regions(img: &Array3<u16>) -> VerticalBaseScan {
         }
 
         let median_rgb = trimmed_mean_color_line(&blocks, start_idx, end_idx, 0.10);
+        if !plausible_base_luminance(&median_rgb, reference_lum) {
+            i = end_idx + 1;
+            continue;
+        }
         let mad_lum = blocks[start_idx..=end_idx]
             .iter()
             .map(|b| b.mad_lum)
@@ -399,6 +1101,27 @@ fn region_median_color(img: &Array3<u16>, h: usize, x_start: usize, x_end: usize
     result
 }
 
+fn region_median_color_rows(img: &Array3<u16>, w: usize, y_start: usize, y_end: usize) -> [f64; 3] {
+    let n = (y_end - y_start) * w;
+    let mut channels: [Vec<f64>; 3] = [
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+    ];
+    for y in y_start..y_end {
+        for x in 0..w {
+            for c in 0..3 {
+                channels[c].push(img[[y, x, c]] as f64);
+            }
+        }
+    }
+    let mut result = [0.0; 3];
+    for c in 0..3 {
+        result[c] = fast_median(&mut channels[c]);
+    }
+    result
+}
+
 /// Process one edge strip and return (confidence, block_mask, base_color).
 fn process_strip(
     img: &Array3<u16>,
@@ -440,9 +1163,9 @@ fn process_strip(
     let total_blocks = grid_rows * grid_cols;
     let mad_threshold = 300.0;
     let mut low_texture: Vec<(usize, usize)> = Vec::new();
-    for r in 0..grid_rows {
-        for c_idx in 0..grid_cols {
-            if blocks[r][c_idx].mad_lum < mad_threshold {
+    for (r, row) in blocks.iter().enumerate().take(grid_rows) {
+        for (c_idx, block) in row.iter().enumerate().take(grid_cols) {
+            if block.mad_lum < mad_threshold {
                 low_texture.push((r, c_idx));
             }
         }
@@ -484,6 +1207,9 @@ fn process_strip(
 
     let strip_lum = luminance(&strip_base_color);
     let interior_lum = luminance(interior_median);
+    if !plausible_base_luminance(&strip_base_color, interior_lum) {
+        return (0.0, vec![vec![0.0; grid_cols]; grid_rows], strip_base_color);
+    }
     let lum_ratio = if strip_lum.max(interior_lum) > 0.0 {
         (strip_lum - interior_lum).abs() / strip_lum.max(interior_lum)
     } else {
@@ -504,6 +1230,112 @@ fn process_strip(
     (confidence, mask, strip_base_color)
 }
 
+fn process_row_strip(
+    img: &Array3<u16>,
+    w: usize,
+    y_start: usize,
+    y_end: usize,
+    interior_median: &[f64; 3],
+) -> (f64, [f64; 3]) {
+    let strip_h = y_end - y_start;
+    if strip_h == 0 || w == 0 {
+        return (0.0, [0.0; 3]);
+    }
+
+    let grid_rows = 7;
+    let grid_cols = 7;
+    let block_h = strip_h / grid_rows;
+    let block_w = w / grid_cols;
+    if block_h == 0 || block_w == 0 {
+        return (0.0, [0.0; 3]);
+    }
+
+    let mut blocks: Vec<Vec<BlockStats>> = Vec::with_capacity(grid_rows);
+    for r in 0..grid_rows {
+        let mut row_blocks = Vec::with_capacity(grid_cols);
+        let y0 = y_start + r * block_h;
+        let y1 = if r == grid_rows - 1 {
+            y_end
+        } else {
+            y0 + block_h
+        };
+        for c_idx in 0..grid_cols {
+            let bx0 = c_idx * block_w;
+            let bx1 = if c_idx == grid_cols - 1 {
+                w
+            } else {
+                bx0 + block_w
+            };
+            row_blocks.push(compute_block_stats(img, y0, y1, bx0, bx1));
+        }
+        blocks.push(row_blocks);
+    }
+
+    let total_blocks = grid_rows * grid_cols;
+    let mad_threshold = 300.0;
+    let mut low_texture: Vec<(usize, usize)> = Vec::new();
+    for (r, row) in blocks.iter().enumerate().take(grid_rows) {
+        for (c_idx, block) in row.iter().enumerate().take(grid_cols) {
+            if block.mad_lum < mad_threshold {
+                low_texture.push((r, c_idx));
+            }
+        }
+    }
+
+    if low_texture.is_empty() {
+        return (0.0, [0.0; 3]);
+    }
+
+    let chromas: Vec<[f64; 2]> = low_texture
+        .iter()
+        .map(|&(r, c_idx)| block_chroma(&blocks[r][c_idx].median_rgb))
+        .collect();
+
+    let mut c0s: Vec<f64> = chromas.iter().map(|c| c[0]).collect();
+    let mut c1s: Vec<f64> = chromas.iter().map(|c| c[1]).collect();
+    let center = [fast_median(&mut c0s), fast_median(&mut c1s)];
+
+    let chroma_threshold = 0.05;
+    let mut base_blocks: Vec<(usize, usize)> = Vec::new();
+    for (i, &(r, c_idx)) in low_texture.iter().enumerate() {
+        let dist = chroma_distance(chromas[i], center);
+        if dist < chroma_threshold {
+            base_blocks.push((r, c_idx));
+        }
+    }
+
+    if base_blocks.is_empty() {
+        return (0.0, [0.0; 3]);
+    }
+
+    let base_fraction = base_blocks.len() as f64 / total_blocks as f64;
+    let mut confidence = (base_fraction / 0.4).min(1.0);
+    let strip_base_color = trimmed_mean_color(&blocks, &base_blocks, 0.10);
+
+    let strip_chroma = block_chroma(&strip_base_color);
+    let interior_chroma = block_chroma(interior_median);
+    let chroma_dist = chroma_distance(strip_chroma, interior_chroma);
+
+    let strip_lum = luminance(&strip_base_color);
+    let interior_lum = luminance(interior_median);
+    if !plausible_base_luminance(&strip_base_color, interior_lum) {
+        return (0.0, strip_base_color);
+    }
+    let lum_ratio = if strip_lum.max(interior_lum) > 0.0 {
+        (strip_lum - interior_lum).abs() / strip_lum.max(interior_lum)
+    } else {
+        0.0
+    };
+
+    if chroma_dist < 0.03 && lum_ratio < 0.15 {
+        confidence *= 0.1;
+    } else if chroma_dist < 0.05 && lum_ratio < 0.25 {
+        confidence *= 0.3;
+    }
+
+    (confidence, strip_base_color)
+}
+
 /// Compute chroma coordinates for an RGB triplet.
 fn block_chroma(rgb: &[f64; 3]) -> [f64; 2] {
     let sum = rgb[0] + rgb[1] + rgb[2];
@@ -520,6 +1352,13 @@ fn chroma_distance(a: [f64; 2], b: [f64; 2]) -> f64 {
 
 fn luminance(rgb: &[f64; 3]) -> f64 {
     rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722
+}
+
+fn plausible_base_luminance(rgb: &[f64; 3], reference_lum: f64) -> bool {
+    let candidate_lum = luminance(rgb);
+    candidate_lum >= MIN_BASE_REGION_LUMINANCE
+        && (reference_lum <= MIN_BASE_REGION_LUMINANCE
+            || candidate_lum >= reference_lum * MIN_BASE_REGION_REFERENCE_RATIO)
 }
 
 fn relative_luminance_delta(a: &[f64; 3], b: &[f64; 3]) -> f64 {
@@ -658,7 +1497,7 @@ fn trimmed_mean_color_line(
     }
 
     let mut result = [0.0; 3];
-    for c in 0..3 {
+    for (c, channel_result) in result.iter_mut().enumerate() {
         let mut vals: Vec<f64> = blocks[start_idx..=end_idx]
             .iter()
             .map(|b| b.median_rgb[c])
@@ -669,7 +1508,7 @@ fn trimmed_mean_color_line(
         let start = trim_count.min(n - 1);
         let end = n.saturating_sub(trim_count).max(start + 1);
         let sum: f64 = vals[start..end].iter().sum();
-        result[c] = sum / (end - start) as f64;
+        *channel_result = sum / (end - start) as f64;
     }
     result
 }
@@ -685,7 +1524,7 @@ fn trimmed_mean_color(
     }
 
     let mut result = [0.0; 3];
-    for c in 0..3 {
+    for (c, channel_result) in result.iter_mut().enumerate() {
         let mut vals: Vec<f64> = base_blocks
             .iter()
             .map(|&(r, ci)| blocks[r][ci].median_rgb[c])
@@ -696,13 +1535,13 @@ fn trimmed_mean_color(
         let start = trim_count.min(n - 1);
         let end = n.saturating_sub(trim_count).max(start + 1);
         let sum: f64 = vals[start..end].iter().sum();
-        result[c] = sum / (end - start) as f64;
+        *channel_result = sum / (end - start) as f64;
     }
     result
 }
 
 /// In-place median via partial sort.
-fn fast_median(vals: &mut Vec<f64>) -> f64 {
+fn fast_median(vals: &mut [f64]) -> f64 {
     if vals.is_empty() {
         return 0.0;
     }

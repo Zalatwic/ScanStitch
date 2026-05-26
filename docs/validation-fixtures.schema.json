@@ -1,0 +1,356 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/scanstitch/validation-fixtures.schema.json",
+  "title": "ScanStitch Validation Fixture Registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["fixtures"],
+  "properties": {
+    "coverage_requirements": { "$ref": "#/$defs/coverageRequirements" },
+    "fixtures": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "$ref": "#/$defs/fixtureEntry" }
+    }
+  },
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "pathString": {
+      "$ref": "#/$defs/nonEmptyString"
+    },
+    "sha256Hex": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$"
+    },
+    "tagList": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/nonEmptyString" }
+    },
+    "pairLabel": {
+      "type": "string",
+      "pattern": "^[^|]+\\|[^|]+$"
+    },
+    "debugArtifactKind": {
+      "enum": [
+        "candidate_comparison",
+        "gamut_clipping_map",
+        "scene_referred_prophoto_float"
+      ]
+    },
+    "coverageRequirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "min_fixtures": { "type": "integer", "minimum": 0 },
+        "min_component_pairs": { "type": "integer", "minimum": 0 },
+        "min_component_sha256_pairs": { "type": "integer", "minimum": 0 },
+        "min_readable_tiff_pairs": { "type": "integer", "minimum": 0 },
+        "min_tiff_layout_consistent_pairs": { "type": "integer", "minimum": 0 },
+        "min_tiff_dimension_matched_pairs": { "type": "integer", "minimum": 0 },
+        "min_tiff_bits_per_sample": { "type": "integer", "minimum": 0, "maximum": 16 },
+        "min_summary_baselines": { "type": "integer", "minimum": 0 },
+        "min_summary_baseline_sha256_fixtures": { "type": "integer", "minimum": 0 },
+        "min_calibrated_fixtures": { "type": "integer", "minimum": 0 },
+        "min_calibration_sha256_fixtures": { "type": "integer", "minimum": 0 },
+        "min_uncalibrated_fixtures": { "type": "integer", "minimum": 0 },
+        "min_unique_scanner_profiles": { "type": "integer", "minimum": 0 },
+        "min_unique_roll_profiles": { "type": "integer", "minimum": 0 },
+        "min_unique_film_stocks": { "type": "integer", "minimum": 0 },
+        "min_scene_tags": { "type": "integer", "minimum": 0 },
+        "min_exposure_tags": { "type": "integer", "minimum": 0 },
+        "min_calibration_cases": { "type": "integer", "minimum": 0 },
+        "min_film_stock_calibration_pairs": { "type": "integer", "minimum": 0 },
+        "min_scene_exposure_pairs": { "type": "integer", "minimum": 0 },
+        "min_reference_fixtures": { "type": "integer", "minimum": 0 },
+        "min_reference_evidence_types": { "type": "integer", "minimum": 0 },
+        "min_reference_patch_fixtures": { "type": "integer", "minimum": 0 },
+        "min_reference_patch_count": { "type": "integer", "minimum": 0 },
+        "min_debug_artifact_expectation_fixtures": { "type": "integer", "minimum": 0 },
+        "required_film_stocks": { "$ref": "#/$defs/tagList" },
+        "required_scene_tags": { "$ref": "#/$defs/tagList" },
+        "required_exposure_tags": { "$ref": "#/$defs/tagList" },
+        "required_calibration_cases": { "$ref": "#/$defs/tagList" },
+        "required_scanner_profiles": { "$ref": "#/$defs/tagList" },
+        "required_roll_profiles": { "$ref": "#/$defs/tagList" },
+        "required_reference_evidence": { "$ref": "#/$defs/tagList" },
+        "required_film_stock_calibration_pairs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/pairLabel" }
+        },
+        "required_scene_exposure_pairs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/pairLabel" }
+        },
+        "required_debug_artifact_kinds": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/debugArtifactKind" }
+        }
+      }
+    },
+    "fixtureEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component1", "component2"],
+      "properties": {
+        "component1": { "$ref": "#/$defs/pathString" },
+        "component2": { "$ref": "#/$defs/pathString" },
+        "component1_sha256": { "$ref": "#/$defs/sha256Hex" },
+        "component2_sha256": { "$ref": "#/$defs/sha256Hex" },
+        "output_dir": { "$ref": "#/$defs/pathString" },
+        "summary_baseline": { "$ref": "#/$defs/pathString" },
+        "summary_baseline_sha256": { "$ref": "#/$defs/sha256Hex" },
+        "calibration_profile": { "$ref": "#/$defs/pathString" },
+        "calibration_profile_sha256": { "$ref": "#/$defs/sha256Hex" },
+        "calibration_library": { "$ref": "#/$defs/pathString" },
+        "calibration_library_sha256": { "$ref": "#/$defs/sha256Hex" },
+        "scanner_profile": { "$ref": "#/$defs/nonEmptyString" },
+        "roll_profile": { "$ref": "#/$defs/nonEmptyString" },
+        "film_stock": { "$ref": "#/$defs/nonEmptyString" },
+        "scene_tags": { "$ref": "#/$defs/tagList" },
+        "exposure_tags": { "$ref": "#/$defs/tagList" },
+        "reference_evidence": { "$ref": "#/$defs/tagList" },
+        "calibration_case": { "$ref": "#/$defs/nonEmptyString" },
+        "expectations": { "$ref": "#/$defs/fixtureExpectations" },
+        "description": { "$ref": "#/$defs/nonEmptyString" }
+      },
+      "allOf": [
+        {
+          "not": {
+            "required": ["calibration_profile", "calibration_library"]
+          }
+        },
+        {
+          "if": { "required": ["summary_baseline_sha256"] },
+          "then": { "required": ["summary_baseline"] }
+        },
+        {
+          "if": { "required": ["calibration_profile_sha256"] },
+          "then": { "required": ["calibration_profile"] }
+        },
+        {
+          "if": { "required": ["calibration_library_sha256"] },
+          "then": { "required": ["calibration_library"] }
+        },
+        {
+          "if": {
+            "anyOf": [
+              { "required": ["component1_sha256"] },
+              { "required": ["component2_sha256"] }
+            ]
+          },
+          "then": {
+            "required": ["component1_sha256", "component2_sha256"]
+          }
+        },
+        {
+          "if": {
+            "anyOf": [
+              { "required": ["scanner_profile"] },
+              { "required": ["roll_profile"] }
+            ]
+          },
+          "then": {
+            "required": ["calibration_library"]
+          }
+        },
+        {
+          "if": { "required": ["roll_profile"] },
+          "then": { "required": ["scanner_profile"] }
+        },
+        {
+          "if": {
+            "properties": { "calibration_case": { "const": "scanner-roll-library" } },
+            "required": ["calibration_case"]
+          },
+          "then": {
+            "required": ["calibration_library", "scanner_profile"]
+          }
+        },
+        {
+          "if": {
+            "properties": { "calibration_case": { "const": "external-profile" } },
+            "required": ["calibration_case"]
+          },
+          "then": {
+            "required": ["calibration_profile"]
+          }
+        },
+        {
+          "if": {
+            "properties": { "calibration_case": { "const": "uncalibrated-image-derived" } },
+            "required": ["calibration_case"]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["calibration_profile"] },
+                { "required": ["calibration_library"] },
+                { "required": ["scanner_profile"] },
+                { "required": ["roll_profile"] }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "fixtureExpectations": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "stitch_decision": { "$ref": "#/$defs/nonEmptyString" },
+        "base_estimate_source": { "$ref": "#/$defs/nonEmptyString" },
+        "output_color_space": { "$ref": "#/$defs/nonEmptyString" },
+        "render_input_source": { "$ref": "#/$defs/nonEmptyString" },
+        "render_input_reason_contains": { "$ref": "#/$defs/nonEmptyString" },
+        "mapping_strategy": { "$ref": "#/$defs/nonEmptyString" },
+        "selected_mapping_reason_contains": { "$ref": "#/$defs/nonEmptyString" },
+        "selected_candidate": { "$ref": "#/$defs/nonEmptyString" },
+        "selected_candidate_rank": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "calibration_acceptance_status": { "$ref": "#/$defs/nonEmptyString" },
+        "calibration_confidence_min": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "calibration_matrix_condition_number_max": {
+          "type": "number",
+          "minimum": 0
+        },
+        "calibration_rejection_details_required": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nonEmptyString" },
+          "uniqueItems": true
+        },
+        "candidate_risk": { "$ref": "#/$defs/nonEmptyString" },
+        "tone_color_trust_state": { "$ref": "#/$defs/nonEmptyString" },
+        "highlight_chroma_compressed_ratio_min": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "highlight_chroma_compressed_ratio_max": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "highlight_neutral_chroma_compressed_ratio_max": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "shadow_chroma_compressed_ratio_max": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "selected_quality_score_max": {
+          "type": "number",
+          "minimum": 0
+        },
+        "technical_safety_score_max": {
+          "type": "number",
+          "minimum": 0
+        },
+        "color_fidelity_score_max": {
+          "type": "number",
+          "minimum": 0
+        },
+        "memory_color_penalty_max": {
+          "type": "number",
+          "minimum": 0
+        },
+        "spatial_consistency_penalty_max": {
+          "type": "number",
+          "minimum": 0
+        },
+        "selected_runner_up_quality_delta_min": {
+          "type": "number",
+          "minimum": 0
+        },
+        "density_monotonicity_score_min": {
+          "type": "number",
+          "minimum": 0
+        },
+        "hue_linearity_score_min": {
+          "type": "number",
+          "minimum": 0
+        },
+        "saturation_preservation_median_ratio_min": {
+          "type": "number",
+          "minimum": 0
+        },
+        "spatial_neutral_delta_p95_max": {
+          "type": "number",
+          "minimum": 0
+        },
+        "post_scale_preserved_ratio_min": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "reference_patch_evaluation_required": { "type": "boolean" },
+        "reference_patch_count_min": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reference_patch_hue_family_regression_count_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reference_patch_selected_regresses_image_derived": {
+          "type": "boolean"
+        },
+        "reference_patch_delta_e2000_delta_vs_image_derived_max": {
+          "type": "number"
+        },
+        "reference_patch_max_delta_vs_image_derived_max": {
+          "type": "number"
+        },
+        "reference_patch_delta_e_max_delta_vs_image_derived_max": {
+          "type": "number"
+        },
+        "reference_patch_delta_e2000_max_delta_vs_image_derived_max": {
+          "type": "number"
+        },
+        "reference_patch_rms_delta_e_max": {
+          "type": "number",
+          "minimum": 0
+        },
+        "reference_patch_rms_delta_e2000_max": {
+          "type": "number",
+          "minimum": 0
+        },
+        "debug_artifacts_required": { "type": "boolean" },
+        "debug_artifact_kinds_required": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/debugArtifactKind" },
+          "uniqueItems": true
+        },
+        "candidate_acceptance_signatures_required": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nonEmptyString" },
+          "uniqueItems": true
+        },
+        "selection_rejections_required": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nonEmptyString" },
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}

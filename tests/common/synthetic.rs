@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use ndarray::Array3;
 
 /// Create a constant-color image of shape (h, w, 3).

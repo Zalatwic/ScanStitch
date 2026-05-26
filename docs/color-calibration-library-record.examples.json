@@ -1,0 +1,98 @@
+{
+  "scanner_profile": {
+    "schema_version": 1,
+    "record_type": "scanner_profile",
+    "profile_id": "example-coolscan-vuescan-raw",
+    "source_space": {
+      "name": "linear scanner RGB",
+      "encoding": "linear"
+    },
+    "scanner": {
+      "make": "Nikon",
+      "model": "CoolScan 4000"
+    },
+    "settings": {
+      "software": "VueScan",
+      "mode": "raw",
+      "bit_depth": 14
+    },
+    "target": {
+      "type": "transmissive_target",
+      "illuminant": "D50"
+    },
+    "reference": {
+      "dataset": "target-reference"
+    },
+    "whitepoint": [0.9642, 1.0, 0.8251],
+    "scanner_rgb_to_xyz": [
+      [0.7977, 0.1352, 0.0313],
+      [0.2880, 0.7119, 0.0001],
+      [0.0000, 0.0000, 0.8251]
+    ],
+    "fit": {
+      "method": "least_squares_rgb_to_xyz",
+      "patch_count": 24,
+      "target_residual_rms": 0.006,
+      "target_residual_max": 0.018,
+      "per_hue_residuals": [
+        {
+          "hue_family": "red",
+          "patch_count": 3,
+          "residual_rms": 0.009,
+          "residual_max": 0.018
+        }
+      ],
+      "worst_patches": [
+        {
+          "patch_id": "A03",
+          "hue_family": "red",
+          "source_rgb": [0.75, 0.15, 0.12],
+          "reference_xyz": [0.619, 0.323, 0.099],
+          "fitted_xyz": [0.617, 0.326, 0.101],
+          "residual_xyz": [-0.002, 0.003, 0.002],
+          "residual_error": 0.0044,
+          "max_channel_error": 0.0032
+        }
+      ]
+    },
+    "confidence": 0.95,
+    "scanner_settings_fingerprint": "fnv1a64:8dd3282dc8a98ba4",
+    "auto_match": false
+  },
+  "roll_profile": {
+    "schema_version": 1,
+    "record_type": "roll_profile",
+    "profile_id": "example-logan-roll",
+    "scanner_profile_id": "example-coolscan-vuescan-raw",
+    "film": {
+      "stock": "Kodak Gold 200",
+      "process": "C-41"
+    },
+    "development": {
+      "developer": "manual tank"
+    },
+    "base_color": [12000.0, 7000.0, 3000.0],
+    "correction_domain": "xyz_post_scanner",
+    "correction_matrix": [
+      [1.0, 0.0, 0.0],
+      [0.0, 1.0, 0.0],
+      [0.0, 0.0, 1.0]
+    ],
+    "fit": {
+      "method": "least_squares_xyz_post_scanner_correction",
+      "patch_count": 12,
+      "target_residual_rms": 0.012,
+      "target_residual_max": 0.031
+    },
+    "scanner_settings_fingerprint": "fnv1a64:8dd3282dc8a98ba4",
+    "confidence": 0.85
+  },
+  "film_hint": {
+    "schema_version": 1,
+    "record_type": "film_hint",
+    "film_id": "kodak-gold-200",
+    "stock": "Kodak Gold 200",
+    "aliases": ["Gold 200"],
+    "similarity_tags": ["c41", "consumer"]
+  }
+}

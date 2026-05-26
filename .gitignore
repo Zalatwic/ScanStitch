@@ -6,8 +6,17 @@
 /docs/plans/
 
 # Local real-image fixtures and generated renders are intentionally not versioned.
+/local-fixtures/
+/calibration/
+/TESTROLL/
+/OLD_TESTROLL/
+/OLD_SLIDE_TESTROLL/
 /*.tif
 /*.tiff
+/*.dng
+**/*.tif
+**/*.tiff
+**/*.dng
 
 # Temporary full-source dumps.
 /fullcode.txt

@@ -5,8 +5,8 @@ use crate::constants::{EPSILON_T, MAX_14BIT, MAX_16BIT};
 use crate::streaming;
 
 const HISTOGRAM_BINS: usize = 4096;
-const DENSITY_DMAX_PERCENTILE: f64 = 0.998;
-const LINEAR_DIVISION_PERCENTILE: f64 = 0.998;
+const DENSITY_DMAX_PERCENTILE: f64 = 0.995;
+const LINEAR_DIVISION_PERCENTILE: f64 = 0.995;
 
 #[derive(Debug, Clone)]
 pub struct ChannelPercentileSummary {
@@ -27,6 +27,7 @@ pub struct DensityDiagnostics {
     pub base_transmittance: [f64; 3],
     pub base_density: [f64; 3],
     pub robust_d_max: [f64; 3],
+    pub shared_robust_d_max: f64,
     pub exact_d_max: [f64; 3],
     pub d_max_percentile: f64,
     pub histogram_bins: usize,
@@ -47,17 +48,46 @@ pub fn normalize_to_float(img: &Array3<u16>, bit_depth: u8) -> Array3<f64> {
         14 => MAX_14BIT,
         _ => MAX_16BIT,
     };
-    img.mapv(|v| (v as f64 / max_val).max(EPSILON_T))
+    img.mapv(|v| normalize_sample(v, max_val))
+}
+
+/// Convert an already-positive RGB scan to linear [0, 1] without density inversion.
+pub fn normalize_positive_scan_to_linear_rgb(img: &Array3<u16>, bit_depth: u8) -> Array3<f64> {
+    let (height, width, channels) = img.dim();
+    assert_eq!(channels, 3, "Expected 3-channel image");
+
+    let max_val = bit_depth_max(bit_depth);
+    let mut out = Array3::<f64>::zeros((height, width, channels));
+    out.axis_chunks_iter_mut(Axis(0), streaming::DEFAULT_TILE_ROWS)
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(chunk_idx, mut out_chunk)| {
+            let row_start = chunk_idx * streaming::DEFAULT_TILE_ROWS;
+            let chunk_h = out_chunk.dim().0;
+            for local_y in 0..chunk_h {
+                let y = row_start + local_y;
+                for x in 0..width {
+                    for c in 0..3 {
+                        out_chunk[[local_y, x, c]] =
+                            (img[[y, x, c]] as f64 / max_val).clamp(0.0, 1.0);
+                    }
+                }
+            }
+        });
+    out
 }
 
 /// Convert transmittance to optical density: D = -log10(T).
 pub fn transmittance_to_density(t: f64) -> f64 {
-    -(t.max(EPSILON_T)).log10()
+    -normalize_transmittance(t).log10()
 }
 
 /// Convert optical density back to transmittance: T = 10^(-D).
 pub fn density_to_transmittance(d: f64) -> f64 {
-    10.0f64.powf(-d)
+    if !d.is_finite() {
+        return EPSILON_T;
+    }
+    normalize_transmittance(10.0f64.powf(-d.max(0.0)))
 }
 
 /// Convert a density-domain image to linear transmittance.
@@ -76,6 +106,41 @@ pub fn density_image_to_transmittance(img: &Array3<f64>) -> Array3<f64> {
                 for x in 0..w {
                     for ch in 0..c {
                         out_chunk[[local_y, x, ch]] = density_to_transmittance(img[[y, x, ch]]);
+                    }
+                }
+            }
+        });
+
+    out
+}
+
+/// Convert an optical-density image to render-space transmittance after normalizing
+/// the roll/frame density range.
+///
+/// Phase 3 stores direct-density data in scanner optical-density units, whose
+/// useful range can be several density stops on sparse high-key negatives. ICA
+/// output is already normalized before transmittance conversion; this helper
+/// gives the direct-density render path the same bounded density domain.
+pub fn density_image_to_normalized_transmittance(
+    img: &Array3<f64>,
+    density_scale: f64,
+) -> Array3<f64> {
+    let (h, w, c) = img.dim();
+    let mut out = Array3::<f64>::zeros((h, w, c));
+    let density_scale = density_scale.max(1e-6);
+
+    out.axis_chunks_iter_mut(Axis(0), streaming::DEFAULT_TILE_ROWS)
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(chunk_idx, mut out_chunk)| {
+            let row_start = chunk_idx * streaming::DEFAULT_TILE_ROWS;
+            let chunk_h = out_chunk.dim().0;
+            for local_y in 0..chunk_h {
+                let y = row_start + local_y;
+                for x in 0..w {
+                    for ch in 0..c {
+                        let normalized_density = (img[[y, x, ch]] / density_scale).max(0.0);
+                        out_chunk[[local_y, x, ch]] = density_to_transmittance(normalized_density);
                     }
                 }
             }
@@ -117,13 +182,29 @@ fn bit_depth_max(bit_depth: u8) -> f64 {
     }
 }
 
+fn normalize_transmittance(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(EPSILON_T, 1.0)
+    } else {
+        EPSILON_T
+    }
+}
+
+fn normalize_sample(pixel: u16, max_val: f64) -> f64 {
+    normalize_transmittance(pixel as f64 / max_val)
+}
+
+fn normalize_base_sample(value: f64, max_val: f64) -> f64 {
+    normalize_transmittance(value / max_val)
+}
+
 fn density_after_base(pixel: u16, max_val: f64, base_density: f64) -> f64 {
-    let t = (pixel as f64 / max_val).max(EPSILON_T);
+    let t = normalize_sample(pixel, max_val);
     transmittance_to_density(t) - base_density
 }
 
 fn linear_division_value(pixel: u16, max_val: f64, base_transmittance: f64) -> f64 {
-    let t = (pixel as f64 / max_val).max(EPSILON_T);
+    let t = normalize_sample(pixel, max_val);
     base_transmittance / t
 }
 
@@ -142,7 +223,7 @@ pub fn phase3_invert_with_diagnostics(
 
     let max_val = bit_depth_max(bit_depth);
     let base_transmittance: [f64; 3] =
-        std::array::from_fn(|c| (base_color[c] / max_val).max(EPSILON_T));
+        std::array::from_fn(|c| normalize_base_sample(base_color[c], max_val));
     let base_density: [f64; 3] =
         std::array::from_fn(|c| transmittance_to_density(base_transmittance[c]));
 
@@ -205,6 +286,12 @@ pub fn phase3_invert_with_diagnostics(
             DENSITY_DMAX_PERCENTILE,
         )
     });
+    let shared_robust_d_max = robust_d_max
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(f64::NEG_INFINITY, f64::max)
+        .max(0.0);
     let robust_linear_high: [f64; 3] = std::array::from_fn(|c| {
         percentile_from_histogram(
             &linear_hist[c],
@@ -221,7 +308,7 @@ pub fn phase3_invert_with_diagnostics(
             for x in 0..width {
                 for c in 0..3 {
                     let d = density_after_base(img[[y, x, c]], max_val, base_density[c]);
-                    let inverted = robust_d_max[c] - d;
+                    let inverted = shared_robust_d_max - d;
                     if inverted <= 0.0 {
                         clamped_to_zero[c] += 1;
                         positive_density[[y, x, c]] = 0.0;
@@ -250,6 +337,7 @@ pub fn phase3_invert_with_diagnostics(
             base_transmittance,
             base_density,
             robust_d_max,
+            shared_robust_d_max,
             exact_d_max: density_max,
             d_max_percentile: DENSITY_DMAX_PERCENTILE,
             histogram_bins: HISTOGRAM_BINS,
@@ -277,7 +365,7 @@ pub fn linear_division_diagnostic_image(
 
     let max_val = bit_depth_max(bit_depth);
     let base_transmittance: [f64; 3] =
-        std::array::from_fn(|c| (base_color[c] / max_val).max(EPSILON_T));
+        std::array::from_fn(|c| normalize_base_sample(base_color[c], max_val));
     let mut out = Array3::<f64>::zeros((height, width, channels));
 
     out.axis_chunks_iter_mut(Axis(0), streaming::DEFAULT_TILE_ROWS)

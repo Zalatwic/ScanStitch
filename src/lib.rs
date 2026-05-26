@@ -1,6 +1,7 @@
 pub mod base_detect;
 pub mod border;
 pub mod cli;
+pub mod color_calibration;
 pub mod colorspace;
 pub mod constants;
 pub mod cv_adapter;
@@ -8,7 +9,9 @@ pub mod debug;
 pub mod density;
 pub mod frame_classify;
 pub mod ica;
+pub mod interactive;
 pub mod pipeline;
+pub mod positive_input;
 pub mod report;
 pub mod stitch;
 pub mod streaming;

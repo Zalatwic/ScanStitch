@@ -1,0 +1,137 @@
+{
+  "coverage_requirements": {
+    "min_fixtures": 3,
+    "min_component_pairs": 3,
+    "min_readable_tiff_pairs": 3,
+    "min_tiff_layout_consistent_pairs": 3,
+    "min_tiff_dimension_matched_pairs": 3,
+    "min_tiff_bits_per_sample": 14,
+    "min_summary_baselines": 3,
+    "min_calibrated_fixtures": 2,
+    "min_uncalibrated_fixtures": 1,
+    "min_unique_scanner_profiles": 1,
+    "min_unique_roll_profiles": 1,
+    "min_unique_film_stocks": 3,
+    "min_scene_tags": 6,
+    "min_exposure_tags": 5,
+    "min_calibration_cases": 3,
+    "min_film_stock_calibration_pairs": 3,
+    "min_scene_exposure_pairs": 8,
+    "min_reference_fixtures": 2,
+    "min_reference_evidence_types": 2,
+    "min_reference_patch_fixtures": 1,
+    "min_reference_patch_count": 24,
+    "min_debug_artifact_expectation_fixtures": 3,
+    "required_film_stocks": ["Kodak Gold 200", "Fujicolor 200", "Kodak Ultramax 400"],
+    "required_scene_tags": [
+      "skin-tone",
+      "foliage",
+      "high-saturation",
+      "high-key",
+      "deep-shadow",
+      "low-neutral"
+    ],
+    "required_exposure_tags": ["normal-exposure", "overexposed-negative", "underexposed-negative"],
+    "required_calibration_cases": [
+      "scanner-roll-library",
+      "external-profile",
+      "uncalibrated-image-derived"
+    ],
+    "required_scanner_profiles": ["coolscan-4000-vuescan-raw"],
+    "required_roll_profiles": ["logan-roll-2026-05"],
+    "required_reference_evidence": ["colorchecker", "gray-card"],
+    "required_film_stock_calibration_pairs": [
+      "Kodak Gold 200|scanner-roll-library",
+      "Fujicolor 200|external-profile",
+      "Kodak Ultramax 400|uncalibrated-image-derived"
+    ],
+    "required_scene_exposure_pairs": [
+      "skin-tone|normal-exposure",
+      "foliage|overexposed-negative",
+      "high-saturation|overexposed-negative",
+      "high-key|overexposed-negative",
+      "deep-shadow|underexposed-negative",
+      "low-neutral|underexposed-negative"
+    ],
+    "required_debug_artifact_kinds": [
+      "candidate_comparison",
+      "gamut_clipping_map",
+      "scene_referred_prophoto_float"
+    ]
+  },
+  "fixtures": {
+    "logan": {
+      "component1": "LOGAN043.tif",
+      "component2": "LOGAN044.tif",
+      "output_dir": "output/validation/logan",
+      "summary_baseline": "tests/fixtures/baselines/logan_summary_baseline.json",
+      "calibration_library": "calibration",
+      "scanner_profile": "coolscan-4000-vuescan-raw",
+      "roll_profile": "logan-roll-2026-05",
+      "film_stock": "Kodak Gold 200",
+      "scene_tags": ["portrait", "daylight", "skin-tone"],
+      "exposure_tags": ["normal-exposure", "mixed-contrast"],
+      "reference_evidence": ["gray-card"],
+      "calibration_case": "scanner-roll-library",
+      "expectations": {
+        "debug_artifacts_required": true,
+        "debug_artifact_kinds_required": [
+          "candidate_comparison",
+          "gamut_clipping_map",
+          "scene_referred_prophoto_float"
+        ]
+      },
+      "description": "Canonical local split-frame pair"
+    },
+    "my-split-frame": {
+      "component1": "local-fixtures/my-split-left.tif",
+      "component2": "local-fixtures/my-split-right.tif",
+      "output_dir": "output/validation/my-split-frame",
+      "summary_baseline": "local-fixtures/baselines/my-split-frame-summary-baseline.json",
+      "calibration_profile": "local-fixtures/calibration/my-split-frame-profile.json",
+      "film_stock": "Fujicolor 200",
+      "scene_tags": ["landscape", "foliage", "sky", "high-saturation", "high-key"],
+      "exposure_tags": ["overexposed-negative", "high-saturation"],
+      "reference_evidence": ["colorchecker"],
+      "calibration_case": "external-profile",
+      "expectations": {
+        "reference_patch_evaluation_required": true,
+        "reference_patch_count_min": 24,
+        "reference_patch_hue_family_regression_count_max": 0,
+        "reference_patch_selected_regresses_image_derived": false,
+        "reference_patch_delta_e2000_delta_vs_image_derived_max": 0.0,
+        "reference_patch_max_delta_vs_image_derived_max": 0.0,
+        "reference_patch_delta_e_max_delta_vs_image_derived_max": 0.0,
+        "reference_patch_delta_e2000_max_delta_vs_image_derived_max": 0.0,
+        "reference_patch_rms_delta_e_max": 6.0,
+        "reference_patch_rms_delta_e2000_max": 4.0,
+        "debug_artifacts_required": true,
+        "debug_artifact_kinds_required": [
+          "candidate_comparison",
+          "gamut_clipping_map",
+          "scene_referred_prophoto_float"
+        ]
+      },
+      "description": "Example local registry entry; source TIFFs stay untracked"
+    },
+    "uncalibrated-night": {
+      "component1": "local-fixtures/uncalibrated-night-left.tif",
+      "component2": "local-fixtures/uncalibrated-night-right.tif",
+      "output_dir": "output/validation/uncalibrated-night",
+      "summary_baseline": "local-fixtures/baselines/uncalibrated-night-summary-baseline.json",
+      "film_stock": "Kodak Ultramax 400",
+      "scene_tags": ["night", "artificial-light", "deep-shadow", "low-neutral"],
+      "exposure_tags": ["underexposed-negative", "high-grain"],
+      "calibration_case": "uncalibrated-image-derived",
+      "expectations": {
+        "debug_artifacts_required": true,
+        "debug_artifact_kinds_required": [
+          "candidate_comparison",
+          "gamut_clipping_map",
+          "scene_referred_prophoto_float"
+        ]
+      },
+      "description": "Example uncalibrated fallback fixture for sparse or biased scene anchors"
+    }
+  }
+}

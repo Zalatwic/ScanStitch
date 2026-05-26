@@ -1,0 +1,17 @@
+{
+  "phases": [
+    {
+      "name": "stitch",
+      "metrics": {
+        "decision": "accepted"
+      }
+    },
+    {
+      "name": "save",
+      "metrics": {
+        "output_path": "output/output.tiff",
+        "output_shape": [3671, 11841]
+      }
+    }
+  ]
+}

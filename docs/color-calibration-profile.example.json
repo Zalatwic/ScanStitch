@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "profile_id": "synthetic-prophoto-d50-example",
+  "source_space": {
+    "name": "synthetic linear scanner RGB",
+    "encoding": "linear"
+  },
+  "scanner": {
+    "make": "Synthetic",
+    "model": "Documentation Example"
+  },
+  "film": {
+    "stock": "Synthetic negative",
+    "process": "C-41"
+  },
+  "target": {
+    "type": "synthetic_color_checker",
+    "illuminant": "D50"
+  },
+  "reference": {
+    "dataset": "synthetic",
+    "observer": "CIE 1931 2 degree"
+  },
+  "whitepoint": [0.9642, 1.0, 0.8251],
+  "work_to_xyz": [
+    [0.7977, 0.1352, 0.0313],
+    [0.288, 0.7119, 0.0001],
+    [0.0, 0.0, 0.8251]
+  ],
+  "fit": {
+    "method": "least_squares_rgb_to_xyz",
+    "patch_count": 24,
+    "target_residual_rms": 0.006,
+    "target_residual_max": 0.018,
+    "per_hue_residuals": [
+      {
+        "hue_family": "red",
+        "patch_count": 3,
+        "residual_rms": 0.009,
+        "residual_max": 0.018
+      }
+    ],
+    "worst_patches": [
+      {
+        "patch_id": "red",
+        "hue_family": "red",
+        "source_rgb": [0.75, 0.15, 0.12],
+        "reference_xyz": [0.619245, 0.322797, 0.098988],
+        "fitted_xyz": [0.617, 0.326, 0.101],
+        "residual_xyz": [-0.002245, 0.003203, 0.002012],
+        "residual_error": 0.0044,
+        "max_channel_error": 0.003203
+      }
+    ]
+  },
+  "patches": [
+    {
+      "id": "neutral-25",
+      "rgb": [0.25, 0.25, 0.25],
+      "xyz": [0.24105, 0.25, 0.206275]
+    },
+    {
+      "id": "neutral-50",
+      "rgb": [0.5, 0.5, 0.5],
+      "xyz": [0.4821, 0.5, 0.41255]
+    },
+    {
+      "id": "red",
+      "rgb": [0.75, 0.15, 0.12],
+      "xyz": [0.619245, 0.322797, 0.098988]
+    },
+    {
+      "id": "green",
+      "rgb": [0.16, 0.72, 0.14],
+      "xyz": [0.229122, 0.558362, 0.115486]
+    }
+  ],
+  "confidence": 0.95,
+  "gamut_limits": {
+    "min": [0.0, 0.0, 0.0],
+    "max": [1.0, 1.0, 1.0]
+  }
+}

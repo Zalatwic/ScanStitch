@@ -55,9 +55,9 @@ fn test_no_borders() {
 fn test_mixed_border_variance() {
     let mut img = synthetic::image_with_borders(100, 200, 15, [8000, 6000, 5000]);
     synthetic::add_noise(&mut img, 42, 50);
-    let (cropped, top, bot) = scanstitch::border::remove_borders(&img, 2);
-    assert!(top >= 13 && top <= 17, "top={}", top);
-    assert!(bot >= 13 && bot <= 17, "bot={}", bot);
+    let (_cropped, top, bot) = scanstitch::border::remove_borders(&img, 2);
+    assert!((13..=17).contains(&top), "top={}", top);
+    assert!((13..=17).contains(&bot), "bot={}", bot);
 }
 
 #[test]

@@ -1,0 +1,53 @@
+{
+  "metadata": {
+    "report_schema_version": 2,
+    "pipeline_schema_version": 1,
+    "generated_at": "2026-05-02T00:14:20Z",
+    "generated_at_unix_ms": 1777680860621,
+    "package_name": "scanstitch",
+    "package_version": "0.1.0",
+    "binary_name": "scanstitch",
+    "working_directory": "V:\\PERSONAL\\PHOTOGRAPHY\\SCANSTITCH",
+    "cli_args": ["scanstitch", "LOGAN043.tif", "LOGAN044.tif", "-o", "output/fresh"],
+    "output_dir": "V:\\PERSONAL\\PHOTOGRAPHY\\SCANSTITCH\\output\\fresh",
+    "output_path": "V:\\PERSONAL\\PHOTOGRAPHY\\SCANSTITCH\\output\\fresh\\output.tiff"
+  },
+  "phases": [
+    {
+      "name": "stitch",
+      "success": true,
+      "confidence": 0.467434,
+      "duration_ms": 1200,
+      "metrics": {
+        "decision": "accepted",
+        "chosen_hypothesis": "[1|2]",
+        "runtime": {
+          "total_ms": 1200,
+          "translation_evaluation_ms": 1180,
+          "homography_attempted": false,
+          "homography_ms": null
+        }
+      },
+      "warnings": [],
+      "errors": []
+    },
+    {
+      "name": "save",
+      "success": true,
+      "confidence": 1.0,
+      "duration_ms": 500,
+      "metrics": {
+        "output_path": "output/fresh\\output.tiff",
+        "output_shape": [3670, 5959],
+        "output_width": 5959,
+        "output_height": 3670,
+        "output_modified_at": "2026-05-02T00:14:57Z",
+        "overwrote_existing_output": false,
+        "stale_render_artifact_count": 0,
+        "stale_render_artifacts": []
+      },
+      "warnings": [],
+      "errors": []
+    }
+  ]
+}

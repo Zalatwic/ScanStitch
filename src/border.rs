@@ -42,7 +42,7 @@ fn median_f64(vals: &mut [f64]) -> f64 {
     }
     vals.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = vals.len();
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         (vals[n / 2 - 1] + vals[n / 2]) / 2.0
     } else {
         vals[n / 2]

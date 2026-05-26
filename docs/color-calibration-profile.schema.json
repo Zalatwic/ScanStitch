@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/scanstitch/color-calibration-profile.schema.json",
+  "title": "ScanStitch Color Calibration Profile",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "source_space",
+    "scanner",
+    "film",
+    "target",
+    "reference",
+    "whitepoint",
+    "confidence"
+  ],
+  "additionalProperties": true,
+  "oneOf": [
+    { "required": ["work_to_xyz"] },
+    { "required": ["fit_matrix"] }
+  ],
+  "properties": {
+    "schema_version": {
+      "enum": [1, 2]
+    },
+    "profile_id": {
+      "type": "string"
+    },
+    "source_space": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "name": { "type": "string" },
+        "encoding": { "type": "string" }
+      }
+    },
+    "scanner": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "film": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "reference": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "whitepoint": {
+      "$ref": "#/$defs/vector3"
+    },
+    "work_to_xyz": {
+      "$ref": "#/$defs/matrix3x3"
+    },
+    "fit_matrix": {
+      "$ref": "#/$defs/matrix3x3"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "fit": {
+      "$ref": "#/$defs/fitDiagnostics"
+    },
+    "patches": {
+      "type": "array",
+      "minItems": 4,
+      "items": { "$ref": "#/$defs/targetPatch" }
+    },
+    "gamut_limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "min": { "$ref": "#/$defs/vector3" },
+        "max": { "$ref": "#/$defs/vector3" }
+      }
+    }
+  },
+  "$defs": {
+    "vector3": {
+      "type": "array",
+      "prefixItems": [
+        { "type": "number" },
+        { "type": "number" },
+        { "type": "number" }
+      ],
+      "items": false,
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "matrix3x3": {
+      "type": "array",
+      "prefixItems": [
+        { "$ref": "#/$defs/vector3" },
+        { "$ref": "#/$defs/vector3" },
+        { "$ref": "#/$defs/vector3" }
+      ],
+      "items": false,
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "fitDiagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "patch_count",
+        "target_residual_rms",
+        "target_residual_max"
+      ],
+      "properties": {
+        "method": { "type": "string", "minLength": 1 },
+        "patch_count": { "type": "integer", "minimum": 4 },
+        "target_residual_rms": { "type": "number", "minimum": 0 },
+        "target_residual_max": { "type": "number", "minimum": 0 },
+        "per_hue_residuals": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/hueResidual" }
+        },
+        "worst_patches": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/patchFitResidual" }
+        }
+      }
+    },
+    "hueResidual": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hue_family", "patch_count", "residual_rms", "residual_max"],
+      "properties": {
+        "hue_family": { "type": "string", "minLength": 1 },
+        "patch_count": { "type": "integer", "minimum": 1 },
+        "residual_rms": { "type": "number", "minimum": 0 },
+        "residual_max": { "type": "number", "minimum": 0 }
+      }
+    },
+    "patchFitResidual": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hue_family",
+        "source_rgb",
+        "reference_xyz",
+        "fitted_xyz",
+        "residual_xyz",
+        "residual_error",
+        "max_channel_error"
+      ],
+      "properties": {
+        "patch_id": { "type": "string" },
+        "hue_family": { "type": "string", "minLength": 1 },
+        "source_rgb": { "$ref": "#/$defs/vector3" },
+        "reference_xyz": { "$ref": "#/$defs/vector3" },
+        "fitted_xyz": { "$ref": "#/$defs/vector3" },
+        "residual_xyz": { "$ref": "#/$defs/vector3" },
+        "residual_error": { "type": "number", "minimum": 0 },
+        "max_channel_error": { "type": "number", "minimum": 0 }
+      }
+    },
+    "targetPatch": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string" },
+        "patch_id": { "type": "string" },
+        "rgb": { "$ref": "#/$defs/vector3" },
+        "scanner_rgb": { "$ref": "#/$defs/vector3" },
+        "source_rgb": { "$ref": "#/$defs/vector3" },
+        "measured_rgb": { "$ref": "#/$defs/vector3" },
+        "xyz": { "$ref": "#/$defs/vector3" },
+        "reference_xyz": { "$ref": "#/$defs/vector3" },
+        "target_xyz": { "$ref": "#/$defs/vector3" },
+        "lab": { "$ref": "#/$defs/vector3" },
+        "reference_lab": { "$ref": "#/$defs/vector3" },
+        "target_lab": { "$ref": "#/$defs/vector3" }
+      },
+      "allOf": [
+        {
+          "anyOf": [
+            { "required": ["rgb"] },
+            { "required": ["scanner_rgb"] },
+            { "required": ["source_rgb"] },
+            { "required": ["measured_rgb"] }
+          ]
+        },
+        {
+          "anyOf": [
+        { "required": ["xyz"] },
+        { "required": ["reference_xyz"] },
+        { "required": ["target_xyz"] },
+        { "required": ["lab"] },
+        { "required": ["reference_lab"] },
+        { "required": ["target_lab"] }
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,113 @@
+{
+  "fixture": "logan",
+  "stitch": {
+    "decision": "accepted",
+    "confidence": 0.46743358690189807,
+    "chosen_hypothesis": "[1|2]",
+    "seam_exposure_correction_applied": false
+  },
+  "render": {
+    "output_width": 5959,
+    "output_height": 3670,
+    "output_color_space": "linear_prophoto_rgb_d50",
+    "output_file_icc_profile_matches_report": true,
+    "base_estimate_source": "component_consensus",
+    "raw_base_proxy_confidence": null,
+    "raw_base_support_fraction": null,
+    "render_input_source": "fastica_separated_transmittance",
+    "colorspace_mapping_strategy": "gamut_trusted_image_matrix_blend"
+  },
+  "colorspace": {
+    "calibration_status": "not_configured",
+    "calibration_source": "image_derived_neutral_and_dominant_anchors",
+    "calibration_scanner_profile_status": null,
+    "calibration_scanner_profile_id": null,
+    "calibration_roll_profile_status": null,
+    "calibration_roll_profile_id": null,
+    "calibration_confidence": null,
+    "calibration_matrix_condition_number": null,
+    "calibration_requested_film_stock": null,
+    "calibration_film_stock_status": null,
+    "calibration_film_stock_matched_roll_profiles": [],
+    "calibration_rejection_details": [],
+    "selected_candidate": "gamut_trusted_image_matrix_blend",
+    "selected_candidate_rank": 1,
+    "calibration_acceptance_status": "not_applicable",
+    "calibration_acceptance_preferred_candidate": null,
+    "calibration_acceptance_beats_image_derived": null,
+    "candidate_risk": "review_neutral_support",
+    "tone_color_trust_state": "review_required",
+    "selected_quality_score": 1.7943972545917872,
+    "technical_safety_score": 1.2835161201583536,
+    "color_fidelity_score": 0.5108811344334336,
+    "selected_runner_up_quality_delta": 2.869312015537537,
+    "density_monotonicity_score": 1.0,
+    "hue_linearity_score": 0.8350480729286961,
+    "saturation_preservation_median_ratio": 1.1588019126792988,
+    "spatial_neutral_delta_p95": 0.07391728966682196,
+    "memory_color_penalty": 0.0,
+    "spatial_consistency_penalty": 0.0,
+    "post_scale_preserved_ratio": 0.97911363435794,
+    "candidate_acceptance_signatures": [
+      "image_derived_matrix|kind=image_derived|strategy=image_derived_matrix|status=rejected_safety|rank=3|selected=false|eligible=true|rejected=true",
+      "gamut_safe_image_matrix_blend|kind=image_derived|strategy=gamut_safe_image_matrix_blend|status=accepted_runner_up|rank=2|selected=false|eligible=true|rejected=false",
+      "gamut_trusted_image_matrix_blend|kind=image_derived|strategy=gamut_trusted_image_matrix_blend|status=selected|rank=1|selected=true|eligible=true|rejected=false",
+      "neutral_balance_fallback|kind=neutral_fallback|strategy=neutral_balance_fallback|status=available_fallback|rank=4|selected=false|eligible=true|rejected=false"
+    ],
+    "reference_patch_selected_rms_delta_e": null,
+    "reference_patch_selected_rms_delta_e2000": null,
+    "reference_patch_max_error_delta_vs_image_derived": null,
+    "reference_patch_delta_e_rms_delta_vs_image_derived": null,
+    "reference_patch_delta_e_max_delta_vs_image_derived": null,
+    "reference_patch_delta_e2000_rms_delta_vs_image_derived": null,
+    "reference_patch_delta_e2000_max_delta_vs_image_derived": null,
+    "reference_patch_selected_regresses_image_derived": null,
+    "reference_patch_worst_hue_families": [],
+    "reference_patch_hue_family_regressions": [],
+    "reference_patch_regressed_candidates": [],
+    "neutral_estimate_score": 0.8128078336274863,
+    "neutral_estimate_accepted": false,
+    "neutral_estimate_populated_band_count": 3,
+    "neutral_estimate_dominant_band_fraction": 0.9573072212417124,
+    "dominant_anchor_score": 0.8209414570182911,
+    "dominant_anchor_accepted": false,
+    "dominant_anchor_unstable_channel_count": 1,
+    "dominant_anchor_channel_unstable": [
+      false,
+      false,
+      true
+    ],
+    "channel_anchor_min_count": 587336,
+    "channel_anchor_low_support": [
+      false,
+      false,
+      false
+    ],
+    "weak_anchor_fallback_used": false,
+    "gamut_fallback_used": false,
+    "neutral_trim_applied": false
+  },
+  "tolerances": {
+    "confidence_abs": 0.02,
+    "base_support_fraction_abs": 0.00005,
+    "tone_ratio_abs": 0.02,
+    "grain_ratio_abs": 0.02,
+    "colorspace_quality_abs": 0.25,
+    "colorspace_preserved_abs": 0.02,
+    "colorspace_score_abs": 0.05,
+    "color_ratio_abs": 0.25,
+    "spatial_neutral_abs": 0.03,
+    "reference_xyz_abs": 0.005,
+    "reference_delta_e_abs": 1.0
+  },
+  "tone": {
+    "highlight_chroma_compressed_ratio": 0.09163489110191211,
+    "highlight_neutral_chroma_compressed_ratio": 0.02927022208524829,
+    "shadow_chroma_compressed_ratio": 0.17462867286128234
+  },
+  "grain": {
+    "luma_residual_p95": 0.15114309874756723,
+    "chroma_residual_p95": 0.09321254971113946,
+    "chroma_to_luma_p95_ratio": 0.6167172069617224
+  }
+}

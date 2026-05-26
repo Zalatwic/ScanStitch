@@ -1,4 +1,5 @@
 use crate::base_detect;
+use crate::constants::{MAX_14BIT, MAX_16BIT};
 use crate::cv_adapter::opencv_match;
 use crate::report::PhaseReport;
 use crate::tiff_io;
@@ -7,7 +8,8 @@ use ndarray::{s, Array2, Array3, ArrayView2};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 const SIGNATURE_SCREEN_LIMIT: usize = 18;
 const SIGNATURE_SCREEN_NEIGHBORHOOD: usize = 2;
@@ -29,6 +31,18 @@ const MIN_NARROW_SEAM_SEAM_SUPPORT_SCORE: f64 = 0.65;
 const MIN_NARROW_SEAM_ROW_SUPPORT_RATIO: f64 = 0.60;
 const MIN_NARROW_SEAM_COLUMN_SUPPORT_RATIO: f64 = 0.60;
 const NARROW_SEAM_OBJECTIVE_MARGIN: f64 = 0.15;
+const SEAM_EXPOSURE_MIN_VALID_SAMPLES: usize = 512;
+const SEAM_EXPOSURE_MIN_VALID_SAMPLE_RATIO: f64 = 0.02;
+const SEAM_EXPOSURE_MIN_WINDOWS: usize = 4;
+const SEAM_EXPOSURE_MIN_SCORE: f64 = 0.035;
+const SEAM_EXPOSURE_MIN_IMPROVEMENT: f64 = 0.015;
+const SEAM_EXPOSURE_MIN_GAIN: f64 = 0.80;
+const SEAM_EXPOSURE_MAX_GAIN: f64 = 1.25;
+const SEAM_EXPOSURE_SCALAR_RGB_SPREAD: f64 = 1.04;
+const SEAM_EXPOSURE_MAX_RGB_SPREAD: f64 = 1.30;
+const SEAM_EXPOSURE_MIN_CONSISTENT_WINDOW_RATIO: f64 = 0.65;
+const SEAM_EXPOSURE_PER_CHANNEL_MARGIN: f64 = 0.006;
+const SEAM_EXPOSURE_MAX_CLIP_INCREASE: f64 = 0.0015;
 
 /// Runtime transform preference for stitching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +265,58 @@ pub struct StitchSearchDiagnostics {
     pub selection_reason: Option<String>,
     pub top_candidates: Vec<StitchSearchCandidate>,
     pub evaluated_candidates: Vec<StitchEvaluatedCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SeamExposureCorrectionDiagnostics {
+    mode: String,
+    applied: bool,
+    reason: String,
+    sample_count: usize,
+    valid_sample_ratio: f64,
+    gain_rgb: [f64; 3],
+    gain_luma: f64,
+    delta_luma_before: f64,
+    delta_luma_after: f64,
+    delta_rgb_before: [f64; 3],
+    delta_rgb_after: [f64; 3],
+    seam_score_before: f64,
+    seam_score_after: f64,
+    clipped_high_before: [f64; 3],
+    clipped_high_after: [f64; 3],
+    clipped_low_before: [f64; 3],
+    clipped_low_after: [f64; 3],
+    estimated_gain_rgb: [f64; 3],
+    estimated_gain_luma: f64,
+    candidate_gain_rgb: [f64; 3],
+    candidate_gain_luma: f64,
+    candidate_delta_luma_after: f64,
+    candidate_delta_rgb_after: [f64; 3],
+    candidate_seam_score_after: f64,
+    candidate_clipped_high_after: [f64; 3],
+    candidate_clipped_low_after: [f64; 3],
+    window_count: usize,
+    consistent_window_ratio: f64,
+    per_channel_gain_used: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SeamSample {
+    left: [f64; 3],
+    right: [f64; 3],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SeamWindowEstimate {
+    gain_rgb: [f64; 3],
+    gain_luma: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SeamMeasurements {
+    delta_luma: f64,
+    delta_rgb: [f64; 3],
+    seam_score: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1412,8 +1478,8 @@ fn narrow_overlap_seam_acceptance_reason(
     let min_informative_windows = MIN_INFORMATIVE_LOCAL_WINDOWS.max(config.min_validation_windows);
 
     if !validation.plausibility_ok
-        || overlap_fraction < MIN_PLAUSIBLE_OVERLAP_FRACTION
-        || overlap_fraction > NARROW_SEAM_RESCUE_MAX_OVERLAP_FRACTION
+        || !(MIN_PLAUSIBLE_OVERLAP_FRACTION..=NARROW_SEAM_RESCUE_MAX_OVERLAP_FRACTION)
+            .contains(&overlap_fraction)
         || validation.global_ncc_score < narrow_seam_global_ncc_floor(config)
         || validation.signature_score < MIN_NARROW_SEAM_SIGNATURE_SCORE
         || validation.informative_window_count < min_informative_windows
@@ -1933,6 +1999,7 @@ pub fn stitch_components(
     comp2: &Array3<u16>,
     config: &StitchConfig,
 ) -> StitchResult {
+    let stitch_start = Instant::now();
     let opencv_available = opencv_match::is_available();
     let mut report_warnings = Vec::<String>::new();
     if config.use_opencv && !opencv_available {
@@ -1958,10 +2025,12 @@ pub fn stitch_components(
                 .to_string(),
         );
     }
+    let translation_start = Instant::now();
     let mut hypotheses = vec![
         evaluate_translation_hypothesis(comp1, comp2, StitchOrder::LeftRight, config),
         evaluate_translation_hypothesis(comp2, comp1, StitchOrder::RightLeft, config),
     ];
+    let translation_evaluation_duration_ms = elapsed_ms_u64(translation_start);
     if let Some(debug_dir) = &config.debug_dir {
         save_hypothesis_debug_artifacts(comp1, comp2, &hypotheses, debug_dir);
     }
@@ -2026,7 +2095,13 @@ pub fn stitch_components(
             TransformMode::Affine | TransformMode::Homography
         ) || !hypotheses[best_index].accepted);
 
-    if attempt_homography && best_overlap > 0 {
+    let homography_start = if attempt_homography && best_overlap > 0 {
+        Some(Instant::now())
+    } else {
+        None
+    };
+
+    if let Some(homography_start) = homography_start {
         let (h_l, w_l, _) = left.dim();
         let (h_r, w_r, _) = right.dim();
         let strip_l = left.slice(s![.., (w_l - best_overlap).., ..]).to_owned();
@@ -2060,13 +2135,19 @@ pub fn stitch_components(
                                 .unwrap_or_else(|| {
                                     "best stitch hypothesis rejected after scoring".to_string()
                                 });
-                            let report = stitch_failure_report(
+                            let mut report = stitch_failure_report(
                                 config,
                                 opencv_available,
                                 &hypotheses,
                                 best_index,
                                 reason,
                                 report_warnings,
+                            );
+                            attach_stitch_runtime(
+                                &mut report,
+                                stitch_start,
+                                translation_evaluation_duration_ms,
+                                Some(elapsed_ms_u64(homography_start)),
                             );
                             return StitchResult {
                                 result: None,
@@ -2077,7 +2158,7 @@ pub fn stitch_components(
                                 report,
                             };
                         }
-                        return stitch_ncc_fallback(
+                        let mut result = stitch_ncc_fallback(
                             left,
                             right,
                             best_x_offset,
@@ -2089,6 +2170,13 @@ pub fn stitch_components(
                             best_index,
                             report_warnings,
                         );
+                        attach_stitch_runtime(
+                            &mut result.report,
+                            stitch_start,
+                            translation_evaluation_duration_ms,
+                            Some(elapsed_ms_u64(homography_start)),
+                        );
+                        return result;
                     }
                 };
 
@@ -2147,8 +2235,13 @@ pub fn stitch_components(
                 let aligned_strip_r = right
                     .slice(s![gain_r_y0..(gain_r_y0 + cmp_h), 0..best_overlap, ..])
                     .to_owned();
-                let gain = compute_exposure_gain(&aligned_strip_l, &aligned_strip_r);
-                let right_comp = apply_gain(right, &gain);
+                let seam_exposure_correction =
+                    seam_exposure_correction(&aligned_strip_l, &aligned_strip_r, config);
+                let right_comp = apply_gain(
+                    right,
+                    &seam_exposure_correction.gain_rgb,
+                    stitch_sample_max(config),
+                );
 
                 let warped_right =
                     match opencv_match::warp_image(&right_comp, &m_warp, canvas_w, canvas_h) {
@@ -2165,13 +2258,19 @@ pub fn stitch_components(
                                     .unwrap_or_else(|| {
                                         "best stitch hypothesis rejected after scoring".to_string()
                                     });
-                                let report = stitch_failure_report(
+                                let mut report = stitch_failure_report(
                                     config,
                                     opencv_available,
                                     &hypotheses,
                                     best_index,
                                     reason,
                                     report_warnings,
+                                );
+                                attach_stitch_runtime(
+                                    &mut report,
+                                    stitch_start,
+                                    translation_evaluation_duration_ms,
+                                    Some(elapsed_ms_u64(homography_start)),
                                 );
                                 return StitchResult {
                                     result: None,
@@ -2182,7 +2281,7 @@ pub fn stitch_components(
                                     report,
                                 };
                             }
-                            return stitch_ncc_fallback(
+                            let mut result = stitch_ncc_fallback(
                                 left,
                                 right,
                                 best_x_offset,
@@ -2194,6 +2293,13 @@ pub fn stitch_components(
                                 best_index,
                                 report_warnings,
                             );
+                            attach_stitch_runtime(
+                                &mut result.report,
+                                stitch_start,
+                                translation_evaluation_duration_ms,
+                                Some(elapsed_ms_u64(homography_start)),
+                            );
+                            return result;
                         }
                     };
 
@@ -2284,12 +2390,19 @@ pub fn stitch_components(
                         "order_gap": order_gap,
                         "total_width": canvas_w,
                         "canvas_height": canvas_h,
-                        "exposure_gain": gain,
+                        "exposure_gain": seam_exposure_correction.gain_rgb,
+                        "seam_exposure_correction": seam_exposure_correction.clone(),
                         "homography_matrix": mr.transform,
                         "crop": crop_metrics_json(crop_info),
                     }),
                 );
                 report.warnings.extend(report_warnings);
+                attach_stitch_runtime(
+                    &mut report,
+                    stitch_start,
+                    translation_evaluation_duration_ms,
+                    Some(elapsed_ms_u64(homography_start)),
+                );
 
                 return StitchResult {
                     result: Some(stitched),
@@ -2332,13 +2445,19 @@ pub fn stitch_components(
             .rejection_reason
             .clone()
             .unwrap_or_else(|| "best stitch hypothesis rejected after scoring".to_string());
-        let report = stitch_failure_report(
+        let mut report = stitch_failure_report(
             config,
             opencv_available,
             &hypotheses,
             best_index,
             reason,
             report_warnings,
+        );
+        attach_stitch_runtime(
+            &mut report,
+            stitch_start,
+            translation_evaluation_duration_ms,
+            homography_start.map(elapsed_ms_u64),
         );
         return StitchResult {
             result: None,
@@ -2350,7 +2469,7 @@ pub fn stitch_components(
         };
     }
 
-    stitch_ncc_fallback(
+    let mut result = stitch_ncc_fallback(
         left,
         right,
         best_x_offset,
@@ -2361,7 +2480,14 @@ pub fn stitch_components(
         &hypotheses,
         best_index,
         report_warnings,
-    )
+    );
+    attach_stitch_runtime(
+        &mut result.report,
+        stitch_start,
+        translation_evaluation_duration_ms,
+        homography_start.map(elapsed_ms_u64),
+    );
+    result
 }
 
 fn assess_transform_plausibility(
@@ -2402,6 +2528,29 @@ fn assess_transform_plausibility(
     Ok(())
 }
 
+fn elapsed_ms_u64(start: Instant) -> u64 {
+    start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn attach_stitch_runtime(
+    report: &mut PhaseReport,
+    total_start: Instant,
+    translation_evaluation_duration_ms: u64,
+    homography_duration_ms: Option<u64>,
+) {
+    if let serde_json::Value::Object(metrics) = &mut report.metrics {
+        metrics.insert(
+            "runtime".to_string(),
+            serde_json::json!({
+                "total_ms": elapsed_ms_u64(total_start),
+                "translation_evaluation_ms": translation_evaluation_duration_ms,
+                "homography_attempted": homography_duration_ms.is_some(),
+                "homography_ms": homography_duration_ms,
+            }),
+        );
+    }
+}
+
 fn crop_metrics_json(crop_info: Option<CropInfo>) -> serde_json::Value {
     match crop_info {
         Some(crop) => serde_json::json!({
@@ -2421,8 +2570,8 @@ fn aligned_overlap_strips(
     y_offset: i32,
 ) -> Option<(Array3<u16>, Array3<u16>)> {
     let (h_l, w_l, _) = left.dim();
-    let (h_r, _, _) = right.dim();
-    if overlap == 0 || overlap > w_l {
+    let (h_r, w_r, _) = right.dim();
+    if overlap == 0 || overlap > w_l || overlap > w_r {
         return None;
     }
 
@@ -2487,7 +2636,7 @@ fn save_hypothesis_debug_artifacts(
     comp1: &Array3<u16>,
     comp2: &Array3<u16>,
     hypotheses: &[StitchHypothesis],
-    debug_dir: &PathBuf,
+    debug_dir: &Path,
 ) {
     for hypothesis in hypotheses {
         let (left, right, suffix) = match hypothesis.ordering.as_str() {
@@ -2527,7 +2676,7 @@ fn save_final_seam_overlay(
     overlap: usize,
     y_offset: i32,
     _order: StitchOrder,
-    debug_dir: &PathBuf,
+    debug_dir: &Path,
 ) {
     if let Some((left_strip, right_strip)) = aligned_overlap_strips(left, right, overlap, y_offset)
     {
@@ -2727,48 +2876,629 @@ fn range_average(prefix: &[f64], start: usize, end: usize) -> f64 {
     (prefix[end] - prefix[start]) / (end - start) as f64
 }
 
-/// Compute per-channel exposure gain from two overlap strips.
-fn compute_exposure_gain(strip_l: &Array3<u16>, strip_r: &Array3<u16>) -> [f64; 3] {
+fn stitch_sample_max(config: &StitchConfig) -> f64 {
+    match config.input_bit_depth {
+        14 => MAX_14BIT,
+        _ => MAX_16BIT,
+    }
+}
+
+fn rgb_luma(rgb: &[f64; 3]) -> f64 {
+    0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+}
+
+fn sorted_percentile(mut values: Vec<f64>, percentile: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    percentile_from_sorted(&values, percentile)
+}
+
+fn median_ratio(values: &[f64]) -> f64 {
+    let mut bounded = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite() && (0.5..=2.0).contains(value))
+        .collect::<Vec<_>>();
+    if bounded.is_empty() {
+        return 1.0;
+    }
+    bounded.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    percentile_from_sorted(&bounded, 0.5)
+}
+
+fn max_gain_spread(gain: &[f64; 3]) -> f64 {
+    let min_gain = gain.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_gain = gain.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if min_gain <= 0.0 || !min_gain.is_finite() || !max_gain.is_finite() {
+        f64::INFINITY
+    } else {
+        max_gain / min_gain
+    }
+}
+
+fn gain_in_bounds(gain: &[f64; 3]) -> bool {
+    gain.iter()
+        .all(|value| (SEAM_EXPOSURE_MIN_GAIN..=SEAM_EXPOSURE_MAX_GAIN).contains(value))
+}
+
+fn clipping_delta(
+    before_high: &[f64; 3],
+    after_high: &[f64; 3],
+    before_low: &[f64; 3],
+    after_low: &[f64; 3],
+) -> f64 {
+    (0..3)
+        .map(|c| {
+            (after_high[c] - before_high[c]).max(0.0) + (after_low[c] - before_low[c]).max(0.0)
+        })
+        .sum()
+}
+
+fn seam_pixel_is_usable(left: &[f64; 3], right: &[f64; 3], max_value: f64) -> bool {
+    let low_floor = (max_value * 0.015).max(4.0);
+    let high_floor = max_value * 0.985;
+    let left_luma = rgb_luma(left);
+    let right_luma = rgb_luma(right);
+    if left_luma <= low_floor || right_luma <= low_floor {
+        return false;
+    }
+    for c in 0..3 {
+        if left[c] <= 1.0 || right[c] <= 1.0 || left[c] >= high_floor || right[c] >= high_floor {
+            return false;
+        }
+    }
+    true
+}
+
+fn seam_sample_ratios(sample: &SeamSample) -> ([f64; 3], f64) {
+    let rgb = std::array::from_fn(|c| {
+        if sample.right[c] <= 1.0 {
+            1.0
+        } else {
+            sample.left[c] / sample.right[c]
+        }
+    });
+    let left_luma = rgb_luma(&sample.left);
+    let right_luma = rgb_luma(&sample.right);
+    let luma = if right_luma <= 1.0 {
+        1.0
+    } else {
+        left_luma / right_luma
+    };
+    (rgb, luma)
+}
+
+fn seam_measurements(samples: &[SeamSample], gain: &[f64; 3], max_value: f64) -> SeamMeasurements {
+    if samples.is_empty() {
+        return SeamMeasurements {
+            delta_luma: 0.0,
+            delta_rgb: [0.0; 3],
+            seam_score: 0.0,
+        };
+    }
+
+    let mut luma_delta = Vec::<f64>::with_capacity(samples.len());
+    let mut luma_abs_delta = Vec::<f64>::with_capacity(samples.len());
+    let mut rgb_delta = [Vec::<f64>::new(), Vec::<f64>::new(), Vec::<f64>::new()];
+    let mut rgb_abs_delta = [Vec::<f64>::new(), Vec::<f64>::new(), Vec::<f64>::new()];
+
+    for sample in samples {
+        let adjusted = std::array::from_fn(|c| (sample.right[c] * gain[c]).clamp(0.0, max_value));
+        let left_luma = rgb_luma(&sample.left).max(1.0);
+        let adjusted_luma = rgb_luma(&adjusted).max(1.0);
+        let luma_log = (adjusted_luma / left_luma).ln();
+        luma_delta.push(luma_log);
+        luma_abs_delta.push(luma_log.abs());
+        for c in 0..3 {
+            let channel_log = (adjusted[c].max(1.0) / sample.left[c].max(1.0)).ln();
+            rgb_delta[c].push(channel_log);
+            rgb_abs_delta[c].push(channel_log.abs());
+        }
+    }
+
+    let delta_luma = sorted_percentile(luma_delta, 0.5);
+    let luma_score = sorted_percentile(luma_abs_delta, 0.5);
+    let mut delta_rgb = [0.0; 3];
+    let mut rgb_score = 0.0;
+    for c in 0..3 {
+        delta_rgb[c] = sorted_percentile(std::mem::take(&mut rgb_delta[c]), 0.5);
+        rgb_score += sorted_percentile(std::mem::take(&mut rgb_abs_delta[c]), 0.5);
+    }
+    rgb_score /= 3.0;
+
+    SeamMeasurements {
+        delta_luma,
+        delta_rgb,
+        seam_score: (0.55 * luma_score + 0.45 * rgb_score).max(0.0),
+    }
+}
+
+fn strip_clipping_ratios(
+    strip: &Array3<u16>,
+    gain: &[f64; 3],
+    max_value: f64,
+) -> ([f64; 3], [f64; 3]) {
+    let (h, w, _) = strip.dim();
+    let n = (h * w).max(1) as f64;
+    let mut clipped_high = [0usize; 3];
+    let mut clipped_low = [0usize; 3];
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..3 {
+                let adjusted = strip[[y, x, c]] as f64 * gain[c];
+                if adjusted >= max_value {
+                    clipped_high[c] += 1;
+                }
+                if adjusted <= 0.0 {
+                    clipped_low[c] += 1;
+                }
+            }
+        }
+    }
+    (
+        std::array::from_fn(|c| clipped_high[c] as f64 / n),
+        std::array::from_fn(|c| clipped_low[c] as f64 / n),
+    )
+}
+
+fn window_texture_ok(samples: &[SeamSample], max_value: f64) -> bool {
+    if samples.len() < 16 {
+        return false;
+    }
+    let left_luma: Vec<f64> = samples
+        .iter()
+        .map(|sample| rgb_luma(&sample.left))
+        .collect();
+    let right_luma: Vec<f64> = samples
+        .iter()
+        .map(|sample| rgb_luma(&sample.right))
+        .collect();
+    let left_range =
+        sorted_percentile(left_luma.clone(), 0.90) - sorted_percentile(left_luma, 0.10);
+    let right_range =
+        sorted_percentile(right_luma.clone(), 0.90) - sorted_percentile(right_luma, 0.10);
+    left_range.max(right_range) >= max_value * 0.003
+}
+
+fn estimate_window_gain(samples: &[SeamSample]) -> SeamWindowEstimate {
+    let mut ratios_rgb = [Vec::<f64>::new(), Vec::<f64>::new(), Vec::<f64>::new()];
+    let mut ratios_luma = Vec::<f64>::new();
+    for sample in samples {
+        let (rgb, luma) = seam_sample_ratios(sample);
+        for c in 0..3 {
+            ratios_rgb[c].push(rgb[c]);
+        }
+        ratios_luma.push(luma);
+    }
+
+    SeamWindowEstimate {
+        gain_rgb: std::array::from_fn(|c| median_ratio(&ratios_rgb[c])),
+        gain_luma: median_ratio(&ratios_luma),
+    }
+}
+
+fn collect_seam_windows(
+    strip_l: &Array3<u16>,
+    strip_r: &Array3<u16>,
+    max_value: f64,
+) -> (Vec<SeamSample>, Vec<SeamWindowEstimate>, usize) {
     let (h_l, w_l, _) = strip_l.dim();
     let (h_r, w_r, _) = strip_r.dim();
     let h = h_l.min(h_r);
     let w = w_l.min(w_r);
-    let mut sum_l = [0.0f64; 3];
-    let mut sum_r = [0.0f64; 3];
-    let n = (h * w) as f64;
-    if n < 1.0 {
-        return [1.0; 3];
+    if h == 0 || w == 0 {
+        return (Vec::new(), Vec::new(), 0);
     }
-    for y in 0..h {
-        for x in 0..w {
-            for c in 0..3 {
-                sum_l[c] += strip_l[[y, x, c]] as f64;
-                sum_r[c] += strip_r[[y, x, c]] as f64;
+
+    let grid_rows = (h / 96).clamp(2, 8).min(h);
+    let grid_cols = (w / 32).clamp(2, 8).min(w);
+    let mut samples = Vec::<SeamSample>::new();
+    let mut windows = Vec::<SeamWindowEstimate>::new();
+
+    for row in 0..grid_rows {
+        let y0 = row * h / grid_rows;
+        let y1 = ((row + 1) * h / grid_rows).max(y0 + 1).min(h);
+        for col in 0..grid_cols {
+            let x0 = col * w / grid_cols;
+            let x1 = ((col + 1) * w / grid_cols).max(x0 + 1).min(w);
+            let mut window_samples = Vec::<SeamSample>::new();
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let left = [
+                        strip_l[[y, x, 0]] as f64,
+                        strip_l[[y, x, 1]] as f64,
+                        strip_l[[y, x, 2]] as f64,
+                    ];
+                    let right = [
+                        strip_r[[y, x, 0]] as f64,
+                        strip_r[[y, x, 1]] as f64,
+                        strip_r[[y, x, 2]] as f64,
+                    ];
+                    if seam_pixel_is_usable(&left, &right, max_value) {
+                        window_samples.push(SeamSample { left, right });
+                    }
+                }
+            }
+
+            if window_texture_ok(&window_samples, max_value) {
+                windows.push(estimate_window_gain(&window_samples));
+                samples.extend(window_samples);
             }
         }
     }
-    let mut g = [1.0f64; 3];
-    for c in 0..3 {
-        let mean_l = sum_l[c] / n;
-        let mean_r = sum_r[c] / n;
-        g[c] = if mean_r < 1.0 {
-            1.0
-        } else {
-            (mean_l / mean_r).clamp(0.5, 2.0)
-        };
+
+    let total_pixels = h * w;
+    (samples, windows, total_pixels)
+}
+
+fn filter_outlier_seam_samples(
+    samples: Vec<SeamSample>,
+    estimated_gain_luma: f64,
+    estimated_gain_rgb: &[f64; 3],
+) -> Vec<SeamSample> {
+    samples
+        .into_iter()
+        .filter(|sample| {
+            let (rgb, luma) = seam_sample_ratios(sample);
+            if (luma / estimated_gain_luma.max(1e-6)).ln().abs() > 0.22 {
+                return false;
+            }
+            for c in 0..3 {
+                if (rgb[c] / estimated_gain_rgb[c].max(1e-6)).ln().abs() > 0.28 {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect()
+}
+
+fn window_consistency_ratio(windows: &[SeamWindowEstimate], gain_luma: f64) -> f64 {
+    if windows.is_empty() {
+        return 0.0;
     }
-    g
+    let target_log = gain_luma.max(1e-6).ln();
+    let target_direction = if target_log.abs() < SEAM_EXPOSURE_MIN_SCORE {
+        0.0
+    } else {
+        target_log.signum()
+    };
+    let consistent = windows
+        .iter()
+        .filter(|window| {
+            let window_log = window.gain_luma.max(1e-6).ln();
+            let magnitude_ok = (window_log - target_log).abs() <= 0.06;
+            let direction_ok = target_direction == 0.0 || window_log.signum() == target_direction;
+            magnitude_ok && direction_ok
+        })
+        .count();
+    consistent as f64 / windows.len() as f64
+}
+
+fn per_channel_window_consistency(windows: &[SeamWindowEstimate], gain_rgb: &[f64; 3]) -> f64 {
+    if windows.is_empty() {
+        return 0.0;
+    }
+    let mut channel_scores = [0.0f64; 3];
+    for c in 0..3 {
+        let target_log = gain_rgb[c].max(1e-6).ln();
+        let target_direction = if target_log.abs() < SEAM_EXPOSURE_MIN_SCORE {
+            0.0
+        } else {
+            target_log.signum()
+        };
+        let consistent = windows
+            .iter()
+            .filter(|window| {
+                let window_log = window.gain_rgb[c].max(1e-6).ln();
+                let magnitude_ok = (window_log - target_log).abs() <= 0.07;
+                let direction_ok =
+                    target_direction == 0.0 || window_log.signum() == target_direction;
+                magnitude_ok && direction_ok
+            })
+            .count();
+        channel_scores[c] = consistent as f64 / windows.len() as f64;
+    }
+    channel_scores.iter().sum::<f64>() / 3.0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn identity_seam_exposure_diagnostics(
+    reason: String,
+    samples: &[SeamSample],
+    sample_count: usize,
+    valid_sample_ratio: f64,
+    right_strip: &Array3<u16>,
+    max_value: f64,
+    estimated_gain_rgb: [f64; 3],
+    estimated_gain_luma: f64,
+    candidate_gain_rgb: [f64; 3],
+    candidate_gain_luma: f64,
+    candidate_measurements: SeamMeasurements,
+    candidate_clipped_high_after: [f64; 3],
+    candidate_clipped_low_after: [f64; 3],
+    window_count: usize,
+    consistent_window_ratio: f64,
+    per_channel_gain_used: bool,
+) -> SeamExposureCorrectionDiagnostics {
+    let identity_gain = [1.0; 3];
+    let before = seam_measurements(samples, &identity_gain, max_value);
+    let (clipped_high_before, clipped_low_before) =
+        strip_clipping_ratios(right_strip, &identity_gain, max_value);
+    SeamExposureCorrectionDiagnostics {
+        mode: "auto".to_string(),
+        applied: false,
+        reason,
+        sample_count,
+        valid_sample_ratio,
+        gain_rgb: identity_gain,
+        gain_luma: 1.0,
+        delta_luma_before: before.delta_luma,
+        delta_luma_after: before.delta_luma,
+        delta_rgb_before: before.delta_rgb,
+        delta_rgb_after: before.delta_rgb,
+        seam_score_before: before.seam_score,
+        seam_score_after: before.seam_score,
+        clipped_high_before,
+        clipped_high_after: clipped_high_before,
+        clipped_low_before,
+        clipped_low_after: clipped_low_before,
+        estimated_gain_rgb,
+        estimated_gain_luma,
+        candidate_gain_rgb,
+        candidate_gain_luma,
+        candidate_delta_luma_after: candidate_measurements.delta_luma,
+        candidate_delta_rgb_after: candidate_measurements.delta_rgb,
+        candidate_seam_score_after: candidate_measurements.seam_score,
+        candidate_clipped_high_after,
+        candidate_clipped_low_after,
+        window_count,
+        consistent_window_ratio,
+        per_channel_gain_used,
+    }
+}
+
+fn seam_exposure_correction(
+    strip_l: &Array3<u16>,
+    strip_r: &Array3<u16>,
+    config: &StitchConfig,
+) -> SeamExposureCorrectionDiagnostics {
+    let max_value = stitch_sample_max(config);
+    let (samples, windows, total_pixels) = collect_seam_windows(strip_l, strip_r, max_value);
+    let valid_sample_ratio = if total_pixels == 0 {
+        0.0
+    } else {
+        samples.len() as f64 / total_pixels as f64
+    };
+    let identity_gain = [1.0; 3];
+    let empty_measurements = seam_measurements(&samples, &identity_gain, max_value);
+    let (candidate_clipped_high_after, candidate_clipped_low_after) =
+        strip_clipping_ratios(strip_r, &identity_gain, max_value);
+
+    if windows.len() < SEAM_EXPOSURE_MIN_WINDOWS {
+        return identity_seam_exposure_diagnostics(
+            format!(
+                "insufficient reliable overlap windows: {} found, need at least {}",
+                windows.len(),
+                SEAM_EXPOSURE_MIN_WINDOWS
+            ),
+            &samples,
+            samples.len(),
+            valid_sample_ratio,
+            strip_r,
+            max_value,
+            identity_gain,
+            1.0,
+            identity_gain,
+            1.0,
+            empty_measurements,
+            candidate_clipped_high_after,
+            candidate_clipped_low_after,
+            windows.len(),
+            0.0,
+            false,
+        );
+    }
+
+    let estimated_gain_rgb = std::array::from_fn(|c| {
+        median_ratio(
+            &windows
+                .iter()
+                .map(|window| window.gain_rgb[c])
+                .collect::<Vec<_>>(),
+        )
+    });
+    let estimated_gain_luma = median_ratio(
+        &windows
+            .iter()
+            .map(|window| window.gain_luma)
+            .collect::<Vec<_>>(),
+    );
+    let samples = filter_outlier_seam_samples(samples, estimated_gain_luma, &estimated_gain_rgb);
+    let valid_sample_ratio = if total_pixels == 0 {
+        0.0
+    } else {
+        samples.len() as f64 / total_pixels as f64
+    };
+    let sample_count = samples.len();
+    let measurements_before = seam_measurements(&samples, &identity_gain, max_value);
+    let (clipped_high_before, clipped_low_before) =
+        strip_clipping_ratios(strip_r, &identity_gain, max_value);
+
+    let consistent_window_ratio = window_consistency_ratio(&windows, estimated_gain_luma);
+    let channel_consistency = per_channel_window_consistency(&windows, &estimated_gain_rgb);
+    let rgb_spread = max_gain_spread(&estimated_gain_rgb);
+    let scalar_gain = [estimated_gain_luma; 3];
+    let scalar_measurements = seam_measurements(&samples, &scalar_gain, max_value);
+    let channel_measurements = seam_measurements(&samples, &estimated_gain_rgb, max_value);
+    let use_per_channel = rgb_spread > SEAM_EXPOSURE_SCALAR_RGB_SPREAD
+        && rgb_spread <= SEAM_EXPOSURE_MAX_RGB_SPREAD
+        && channel_consistency >= SEAM_EXPOSURE_MIN_CONSISTENT_WINDOW_RATIO
+        && channel_measurements.seam_score + SEAM_EXPOSURE_PER_CHANNEL_MARGIN
+            < scalar_measurements.seam_score;
+    let candidate_gain_rgb = if use_per_channel {
+        estimated_gain_rgb
+    } else {
+        scalar_gain
+    };
+    let candidate_gain_luma = if use_per_channel {
+        estimated_gain_luma
+    } else {
+        candidate_gain_rgb[0]
+    };
+    let candidate_measurements = if use_per_channel {
+        channel_measurements
+    } else {
+        scalar_measurements
+    };
+    let (candidate_clipped_high_after, candidate_clipped_low_after) =
+        strip_clipping_ratios(strip_r, &candidate_gain_rgb, max_value);
+
+    let reject = |reason: String| {
+        identity_seam_exposure_diagnostics(
+            reason,
+            &samples,
+            sample_count,
+            valid_sample_ratio,
+            strip_r,
+            max_value,
+            estimated_gain_rgb,
+            estimated_gain_luma,
+            candidate_gain_rgb,
+            candidate_gain_luma,
+            candidate_measurements,
+            candidate_clipped_high_after,
+            candidate_clipped_low_after,
+            windows.len(),
+            consistent_window_ratio,
+            use_per_channel,
+        )
+    };
+
+    if sample_count < SEAM_EXPOSURE_MIN_VALID_SAMPLES
+        || valid_sample_ratio < SEAM_EXPOSURE_MIN_VALID_SAMPLE_RATIO
+    {
+        return reject(format!(
+            "insufficient reliable overlap samples: {} samples ({:.1}%), need at least {} samples and {:.1}%",
+            sample_count,
+            valid_sample_ratio * 100.0,
+            SEAM_EXPOSURE_MIN_VALID_SAMPLES,
+            SEAM_EXPOSURE_MIN_VALID_SAMPLE_RATIO * 100.0
+        ));
+    }
+
+    if measurements_before.seam_score < SEAM_EXPOSURE_MIN_SCORE {
+        return reject(format!(
+            "seam exposure mismatch below threshold: score {:.3} < {:.3}",
+            measurements_before.seam_score, SEAM_EXPOSURE_MIN_SCORE
+        ));
+    }
+
+    if !gain_in_bounds(&candidate_gain_rgb) {
+        return reject(format!(
+            "candidate gain out of bounds: rgb={:.3}/{:.3}/{:.3}, allowed {:.2}..{:.2}",
+            candidate_gain_rgb[0],
+            candidate_gain_rgb[1],
+            candidate_gain_rgb[2],
+            SEAM_EXPOSURE_MIN_GAIN,
+            SEAM_EXPOSURE_MAX_GAIN
+        ));
+    }
+
+    if rgb_spread > SEAM_EXPOSURE_MAX_RGB_SPREAD
+        && scalar_measurements.seam_score >= measurements_before.seam_score
+    {
+        return reject(format!(
+            "estimated RGB gains diverged suspiciously: spread {:.3} exceeds {:.3}",
+            rgb_spread, SEAM_EXPOSURE_MAX_RGB_SPREAD
+        ));
+    }
+
+    if consistent_window_ratio < SEAM_EXPOSURE_MIN_CONSISTENT_WINDOW_RATIO {
+        return reject(format!(
+            "overlap windows do not agree on exposure correction: {:.1}% consistent, need {:.1}%",
+            consistent_window_ratio * 100.0,
+            SEAM_EXPOSURE_MIN_CONSISTENT_WINDOW_RATIO * 100.0
+        ));
+    }
+
+    let improvement = measurements_before.seam_score - candidate_measurements.seam_score;
+    let required_improvement =
+        SEAM_EXPOSURE_MIN_IMPROVEMENT.max(measurements_before.seam_score * 0.25);
+    if improvement < required_improvement {
+        return reject(format!(
+            "candidate correction did not improve seam enough: improvement {:.3}, need {:.3}",
+            improvement, required_improvement
+        ));
+    }
+
+    let clip_increase = clipping_delta(
+        &clipped_high_before,
+        &candidate_clipped_high_after,
+        &clipped_low_before,
+        &candidate_clipped_low_after,
+    );
+    if clip_increase > SEAM_EXPOSURE_MAX_CLIP_INCREASE {
+        return reject(format!(
+            "candidate correction would increase clipping by {:.4}, limit {:.4}",
+            clip_increase, SEAM_EXPOSURE_MAX_CLIP_INCREASE
+        ));
+    }
+
+    SeamExposureCorrectionDiagnostics {
+        mode: "auto".to_string(),
+        applied: true,
+        reason: if use_per_channel {
+            format!(
+                "applied stable per-channel overlap gain; seam score improved {:.3} -> {:.3}",
+                measurements_before.seam_score, candidate_measurements.seam_score
+            )
+        } else {
+            format!(
+                "applied luma-only overlap gain; seam score improved {:.3} -> {:.3}",
+                measurements_before.seam_score, candidate_measurements.seam_score
+            )
+        },
+        sample_count,
+        valid_sample_ratio,
+        gain_rgb: candidate_gain_rgb,
+        gain_luma: candidate_gain_luma,
+        delta_luma_before: measurements_before.delta_luma,
+        delta_luma_after: candidate_measurements.delta_luma,
+        delta_rgb_before: measurements_before.delta_rgb,
+        delta_rgb_after: candidate_measurements.delta_rgb,
+        seam_score_before: measurements_before.seam_score,
+        seam_score_after: candidate_measurements.seam_score,
+        clipped_high_before,
+        clipped_high_after: candidate_clipped_high_after,
+        clipped_low_before,
+        clipped_low_after: candidate_clipped_low_after,
+        estimated_gain_rgb,
+        estimated_gain_luma,
+        candidate_gain_rgb,
+        candidate_gain_luma,
+        candidate_delta_luma_after: candidate_measurements.delta_luma,
+        candidate_delta_rgb_after: candidate_measurements.delta_rgb,
+        candidate_seam_score_after: candidate_measurements.seam_score,
+        candidate_clipped_high_after,
+        candidate_clipped_low_after,
+        window_count: windows.len(),
+        consistent_window_ratio,
+        per_channel_gain_used: use_per_channel,
+    }
 }
 
 /// Apply per-channel gain to an image, returning a new owned copy.
-fn apply_gain(img: &Array3<u16>, gain: &[f64; 3]) -> Array3<u16> {
+fn apply_gain(img: &Array3<u16>, gain: &[f64; 3], max_value: f64) -> Array3<u16> {
     let mut out = img.clone();
     let (h, w, _) = out.dim();
     for y in 0..h {
         for x in 0..w {
             for c in 0..3 {
                 let val = out[[y, x, c]] as f64 * gain[c];
-                out[[y, x, c]] = val.clamp(0.0, 65535.0) as u16;
+                out[[y, x, c]] = val.clamp(0.0, max_value) as u16;
             }
         }
     }
@@ -2826,6 +3556,7 @@ fn transform_point(m: [[f64; 3]; 3], x: f64, y: f64) -> (f64, f64) {
 }
 
 /// NCC-only translation stitch.
+#[allow(clippy::too_many_arguments)]
 fn stitch_ncc_fallback(
     left: &Array3<u16>,
     right: &Array3<u16>,
@@ -2856,41 +3587,21 @@ fn stitch_ncc_fallback(
     let blend_top = l_y0.max(r_y0);
     let blend_bot = (l_y0 + h_l).min(r_y0 + h_r);
 
-    let mut sum_left = [0.0f64; 3];
-    let mut sum_right = [0.0f64; 3];
-    let mut pixel_count = 0u64;
-    if blend_bot > blend_top {
-        for canvas_y in blend_top..blend_bot {
-            let ly = canvas_y - l_y0;
-            let ry = canvas_y - r_y0;
-            for x in 0..overlap {
-                let abs_x = x_offset + x;
-                for c in 0..3 {
-                    sum_left[c] += left[[ly, abs_x, c]] as f64;
-                    sum_right[c] += right[[ry, x, c]] as f64;
-                }
-                pixel_count += 1;
-            }
-        }
-    }
-
-    let gain = if pixel_count > 0 {
-        let mut g = [1.0f64; 3];
-        for c in 0..3 {
-            let mean_l = sum_left[c] / pixel_count as f64;
-            let mean_r = sum_right[c] / pixel_count as f64;
-            g[c] = if mean_r < 1.0 {
-                1.0
-            } else {
-                (mean_l / mean_r).clamp(0.5, 2.0)
-            };
-        }
-        g
+    let seam_exposure_correction = if let Some((left_strip, right_strip)) =
+        aligned_overlap_strips(left, right, overlap, y_offset)
+    {
+        seam_exposure_correction(&left_strip, &right_strip, config)
     } else {
-        [1.0; 3]
+        let empty = Array3::<u16>::zeros((0, 0, 3));
+        seam_exposure_correction(&empty, &empty, config)
     };
 
-    let right_compensated = apply_gain(right, &gain);
+    let right_compensated = apply_gain(
+        right,
+        &seam_exposure_correction.gain_rgb,
+        stitch_sample_max(config),
+    );
+    let max_value = stitch_sample_max(config);
 
     if blend_bot > blend_top {
         for canvas_y in blend_top..blend_bot {
@@ -2908,7 +3619,7 @@ fn stitch_ncc_fallback(
                     let r_val = right_compensated[[ry, x, c]] as f64;
                     stitched[[canvas_y, abs_x, c]] = (l_val * (1.0 - alpha) + r_val * alpha)
                         .round()
-                        .clamp(0.0, u16::MAX as f64)
+                        .clamp(0.0, max_value)
                         as u16;
                 }
             }
@@ -2979,7 +3690,8 @@ fn stitch_ncc_fallback(
             "total_width": total_w,
             "canvas_height": canvas_h,
             "order": order.label(),
-            "exposure_gain": gain,
+            "exposure_gain": seam_exposure_correction.gain_rgb,
+            "seam_exposure_correction": seam_exposure_correction.clone(),
             "crop": crop_metrics_json(crop_info),
         }),
     );
@@ -2999,10 +3711,45 @@ fn stitch_ncc_fallback(
 mod tests {
     use super::{
         default_validation_metrics, objective_score, overlap_plausibility_reason,
-        overlap_support_score, translation_evidence_score, translation_plausibility_score,
-        translation_prior_weight, translation_search_correspondence_score,
-        translation_search_score, vertical_offset_plausibility_score, StitchValidationMetrics,
+        overlap_support_score, seam_exposure_correction, translation_evidence_score,
+        translation_plausibility_score, translation_prior_weight,
+        translation_search_correspondence_score, translation_search_score,
+        vertical_offset_plausibility_score, StitchConfig, StitchValidationMetrics,
     };
+    use ndarray::Array3;
+
+    fn textured_seam_strips(h: usize, w: usize) -> (Array3<u16>, Array3<u16>) {
+        let mut left = Array3::<u16>::zeros((h, w, 3));
+        let mut right = Array3::<u16>::zeros((h, w, 3));
+        for y in 0..h {
+            for x in 0..w {
+                let texture = ((x * 131 + y * 79 + (x * y) % 37) % 1400) as f64;
+                let base = [
+                    4200.0 + x as f64 * 14.0 + y as f64 * 5.0 + texture,
+                    5000.0 + x as f64 * 7.0 + y as f64 * 11.0 + texture * 0.8,
+                    4600.0 + x as f64 * 10.0 + y as f64 * 8.0 + texture * 0.6,
+                ];
+                for c in 0..3 {
+                    left[[y, x, c]] = base[c].round() as u16;
+                    right[[y, x, c]] = base[c].round() as u16;
+                }
+            }
+        }
+        (left, right)
+    }
+
+    fn scale_strip(strip: &mut Array3<u16>, gain: [f64; 3]) {
+        let (h, w, _) = strip.dim();
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..3 {
+                    strip[[y, x, c]] = (strip[[y, x, c]] as f64 * gain[c])
+                        .round()
+                        .clamp(0.0, 16383.0) as u16;
+                }
+            }
+        }
+    }
 
     fn sample_validation_metrics(
         global_ncc_score: f64,
@@ -3029,6 +3776,68 @@ mod tests {
         metrics.plausibility_ok = true;
         metrics.plausibility_reason = None;
         metrics
+    }
+
+    #[test]
+    fn seam_exposure_skips_low_overlap_samples() {
+        let (left, mut right) = textured_seam_strips(24, 12);
+        scale_strip(&mut right, [0.88, 0.88, 0.88]);
+
+        let correction = seam_exposure_correction(&left, &right, &StitchConfig::default());
+
+        assert!(!correction.applied);
+        assert_eq!(correction.gain_rgb, [1.0, 1.0, 1.0]);
+        assert!(
+            correction.reason.contains("insufficient reliable overlap")
+                || correction
+                    .reason
+                    .contains("insufficient reliable overlap samples"),
+            "{}",
+            correction.reason
+        );
+    }
+
+    #[test]
+    fn seam_exposure_skips_film_base_like_overlap() {
+        let left = Array3::<u16>::from_elem((96, 48, 3), 9000);
+        let right = Array3::<u16>::from_elem((96, 48, 3), 7800);
+
+        let correction = seam_exposure_correction(&left, &right, &StitchConfig::default());
+
+        assert!(!correction.applied);
+        assert_eq!(correction.gain_rgb, [1.0, 1.0, 1.0]);
+        assert!(correction
+            .reason
+            .contains("insufficient reliable overlap windows"));
+    }
+
+    #[test]
+    fn seam_exposure_rejects_correction_that_increases_clipping() {
+        let (left, mut right) = textured_seam_strips(120, 64);
+        scale_strip(&mut right, [0.86, 0.86, 0.86]);
+        let (h, w, _) = right.dim();
+        for y in 0..h {
+            for x in 0..w {
+                if (x + y) % 7 == 0 {
+                    for c in 0..3 {
+                        right[[y, x, c]] = 16000;
+                    }
+                }
+            }
+        }
+
+        let correction = seam_exposure_correction(&left, &right, &StitchConfig::default());
+
+        assert!(!correction.applied);
+        assert_eq!(correction.gain_rgb, [1.0, 1.0, 1.0]);
+        assert!(
+            correction.reason.contains("increase clipping"),
+            "{}",
+            correction.reason
+        );
+        let before: f64 = correction.clipped_high_before.iter().sum();
+        let candidate_after: f64 = correction.candidate_clipped_high_after.iter().sum();
+        assert!(candidate_after > before);
     }
 
     #[test]

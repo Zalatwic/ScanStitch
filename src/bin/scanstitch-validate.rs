@@ -1,8 +1,24 @@
 use clap::Parser;
-use scanstitch::cli::Cli as PipelineCli;
+use ndarray::Array3;
+use scanstitch::cli::{Cli as PipelineCli, InputMode, QualityMode, RenderInputMode, RenderIntent};
+use scanstitch::colorspace::ColorMode;
 use scanstitch::report::PipelineReport;
-use scanstitch::validation::{summarize_report, summary_to_markdown};
-use std::path::PathBuf;
+use scanstitch::validation::{
+    compare_render_summaries, compare_summary_baseline, run_synthetic_color_suite,
+    summarize_report_with_source, summary_to_markdown, synthetic_color_suite_to_markdown,
+    tracked_baseline_from_summary, ColorCandidateAcceptanceSummary, TrackedValidationBaseline,
+    ValidationSummary,
+};
+use scanstitch::{base_detect, border, positive_input, tiff_io};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+const ROLL_BASE_PREPASS_MAX_DIMENSION: usize = 1600;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -13,6 +29,54 @@ struct ValidationCli {
     /// Fixture name to record in the summary. `logan` maps to LOGAN043/LOGAN044 by default.
     #[arg(long, default_value = "logan")]
     fixture: String,
+
+    /// JSON fixture registry with component paths and optional default output directories.
+    #[arg(long)]
+    fixture_registry: Option<PathBuf>,
+
+    /// List available fixtures and exit.
+    #[arg(long, default_value_t = false)]
+    list_fixtures: bool,
+
+    /// Run deterministic in-memory synthetic color decision cases and exit.
+    #[arg(long, default_value_t = false)]
+    synthetic_color_suite: bool,
+
+    /// Audit fixture registry readiness without running the pipeline.
+    #[arg(long, default_value_t = false)]
+    fixture_coverage: bool,
+
+    /// Compute fixture SHA-256 values during fixture coverage even when the registry has no expected hashes.
+    #[arg(long, default_value_t = false)]
+    compute_fixture_hashes: bool,
+
+    /// Write a registry snapshot with available fixture hashes filled in during fixture coverage.
+    #[arg(long)]
+    write_fixture_hash_registry: Option<PathBuf>,
+
+    /// Run every registered fixture as a real-image validation suite.
+    #[arg(long, default_value_t = false)]
+    fixture_suite: bool,
+
+    /// Directory containing a scanner roll to inspect or validate frame-by-frame.
+    #[arg(long)]
+    roll_dir: Option<PathBuf>,
+
+    /// Inspect every supported scan file in --roll-dir without rendering.
+    #[arg(long, default_value_t = false)]
+    roll_inventory: bool,
+
+    /// Run every readable scan in --roll-dir as an independent no-stitch validation frame.
+    #[arg(long, default_value_t = false)]
+    roll_suite: bool,
+
+    /// Limit --roll-suite rendering to one or more frame names, stems, or slugs.
+    #[arg(long = "roll-suite-frame", value_delimiter = ',')]
+    roll_suite_frames: Vec<String>,
+
+    /// Internal worker mode used to isolate one roll-suite render in a child process.
+    #[arg(long, hide = true, default_value_t = false)]
+    roll_suite_child: bool,
 
     /// First component TIFF. Required unless --report is used or --fixture logan files exist.
     #[arg(long)]
@@ -26,9 +90,109 @@ struct ValidationCli {
     #[arg(long)]
     report: Option<PathBuf>,
 
+    /// Compare render diagnostics against another report without mutating it.
+    #[arg(long)]
+    compare_report: Option<PathBuf>,
+
+    /// Compare against a tracked compact validation summary baseline.
+    #[arg(long)]
+    compare_summary: Option<PathBuf>,
+
+    /// Compare a roll-suite run against a previous roll-suite JSON summary.
+    #[arg(long)]
+    compare_roll_suite: Option<PathBuf>,
+
+    /// Write a tracked compact validation summary baseline from the current summary.
+    #[arg(long)]
+    write_summary_baseline: Option<PathBuf>,
+
+    /// Exit with an error when --compare-report finds review-required differences.
+    #[arg(long, default_value_t = false)]
+    strict: bool,
+
+    /// Exit nonzero for selected comparison issue groups or exact issue names.
+    #[arg(long, value_delimiter = ',')]
+    fail_on: Vec<String>,
+
+    /// Suppress human-readable terminal output.
+    #[arg(long, default_value_t = false)]
+    quiet: bool,
+
+    /// Print the JSON summary to stdout after writing files.
+    #[arg(long, default_value_t = false)]
+    print_json_summary: bool,
+
     /// Output directory for pipeline renders and validation summaries.
     #[arg(long, default_value = "output/validation/logan")]
     output_dir: PathBuf,
+
+    /// Optional scanner/film calibration profile JSON passed to the pipeline.
+    #[arg(long)]
+    calibration_profile: Option<PathBuf>,
+
+    /// Optional local calibration library directory passed to the pipeline.
+    #[arg(long)]
+    calibration_library: Option<PathBuf>,
+
+    /// Scanner/settings profile ID to select from the calibration library.
+    #[arg(long)]
+    scanner_profile: Option<String>,
+
+    /// Roll profile ID to select from the calibration library.
+    #[arg(long)]
+    roll_profile: Option<String>,
+
+    /// Film stock label used to rank calibration evidence and reject mismatched roll profiles.
+    #[arg(long)]
+    film_stock: Option<String>,
+
+    /// Override density film-base RGB as comma-separated scanner sample values.
+    #[arg(long, value_name = "R,G,B")]
+    base_color: Option<String>,
+
+    /// Internal provenance label for non-manual base-color overrides.
+    #[arg(long, hide = true)]
+    base_color_source: Option<String>,
+
+    /// Internal confidence for non-manual base-color overrides.
+    #[arg(long, hide = true)]
+    base_color_confidence: Option<f64>,
+
+    /// Internal diagnostic reason for non-manual base-color overrides.
+    #[arg(long, hide = true)]
+    base_color_reason: Option<String>,
+
+    /// Color mapping mode passed to the pipeline: auto / calibrated / image-derived / neutral.
+    #[arg(long, value_enum, default_value = "auto")]
+    color_mode: ColorMode,
+
+    /// Render input selection passed to the pipeline: auto / ica / direct-density.
+    #[arg(long, value_enum, default_value = "auto")]
+    render_input: RenderInputMode,
+
+    /// Input scan mode passed to the pipeline: negative or already-positive RGB.
+    #[arg(long, value_enum, default_value = "negative")]
+    input_mode: InputMode,
+
+    /// Finished-render intent passed to the pipeline.
+    #[arg(long, value_enum, default_value = "modern-clean")]
+    render_intent: RenderIntent,
+
+    /// Quality/throughput mode passed to the pipeline.
+    #[arg(long, value_enum, default_value = "perfect")]
+    quality_mode: QualityMode,
+
+    /// Write the scene-referred master even outside perfect mode.
+    #[arg(long, default_value_t = false)]
+    write_master: bool,
+
+    /// Apply saved guided-review decisions from a sidecar JSON.
+    #[arg(long)]
+    review_sidecar: Option<PathBuf>,
+
+    /// Write guided-review decisions from validation pipeline saves.
+    #[arg(long)]
+    write_review_sidecar: Option<PathBuf>,
 
     /// Path for the compact JSON summary.
     #[arg(long)]
@@ -71,19 +235,1299 @@ struct ValidationCli {
     use_opencv: bool,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FixtureRegistry {
+    fixtures: BTreeMap<String, FixtureEntry>,
+    #[serde(default)]
+    coverage_requirements: FixtureCoverageRequirements,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedFixtureRegistry {
+    fixtures: BTreeMap<String, FixtureEntry>,
+    coverage_requirements: FixtureCoverageRequirements,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FixtureCoverageRequirements {
+    #[serde(default)]
+    min_fixtures: Option<usize>,
+    #[serde(default)]
+    min_component_pairs: Option<usize>,
+    #[serde(default)]
+    min_component_sha256_pairs: Option<usize>,
+    #[serde(default)]
+    min_readable_tiff_pairs: Option<usize>,
+    #[serde(default)]
+    min_tiff_layout_consistent_pairs: Option<usize>,
+    #[serde(default)]
+    min_tiff_dimension_matched_pairs: Option<usize>,
+    #[serde(default)]
+    min_tiff_bits_per_sample: Option<u8>,
+    #[serde(default)]
+    min_summary_baselines: Option<usize>,
+    #[serde(default)]
+    min_summary_baseline_sha256_fixtures: Option<usize>,
+    #[serde(default)]
+    min_calibrated_fixtures: Option<usize>,
+    #[serde(default)]
+    min_calibration_sha256_fixtures: Option<usize>,
+    #[serde(default)]
+    min_uncalibrated_fixtures: Option<usize>,
+    #[serde(default)]
+    min_unique_scanner_profiles: Option<usize>,
+    #[serde(default)]
+    min_unique_roll_profiles: Option<usize>,
+    #[serde(default)]
+    min_unique_film_stocks: Option<usize>,
+    #[serde(default)]
+    min_scene_tags: Option<usize>,
+    #[serde(default)]
+    min_exposure_tags: Option<usize>,
+    #[serde(default)]
+    min_calibration_cases: Option<usize>,
+    #[serde(default)]
+    min_film_stock_calibration_pairs: Option<usize>,
+    #[serde(default)]
+    min_scene_exposure_pairs: Option<usize>,
+    #[serde(default)]
+    min_reference_fixtures: Option<usize>,
+    #[serde(default)]
+    min_reference_evidence_types: Option<usize>,
+    #[serde(default)]
+    min_reference_patch_fixtures: Option<usize>,
+    #[serde(default)]
+    min_reference_patch_count: Option<usize>,
+    #[serde(default)]
+    min_debug_artifact_expectation_fixtures: Option<usize>,
+    #[serde(default)]
+    required_film_stocks: Vec<String>,
+    #[serde(default)]
+    required_scene_tags: Vec<String>,
+    #[serde(default)]
+    required_exposure_tags: Vec<String>,
+    #[serde(default)]
+    required_calibration_cases: Vec<String>,
+    #[serde(default)]
+    required_scanner_profiles: Vec<String>,
+    #[serde(default)]
+    required_roll_profiles: Vec<String>,
+    #[serde(default)]
+    required_reference_evidence: Vec<String>,
+    #[serde(default)]
+    required_film_stock_calibration_pairs: Vec<String>,
+    #[serde(default)]
+    required_scene_exposure_pairs: Vec<String>,
+    #[serde(default)]
+    required_debug_artifact_kinds: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FixtureEntry {
+    component1: PathBuf,
+    component2: PathBuf,
+    #[serde(default)]
+    component1_sha256: Option<String>,
+    #[serde(default)]
+    component2_sha256: Option<String>,
+    #[serde(default)]
+    output_dir: Option<PathBuf>,
+    #[serde(default)]
+    calibration_profile: Option<PathBuf>,
+    #[serde(default)]
+    calibration_profile_sha256: Option<String>,
+    #[serde(default)]
+    calibration_library: Option<PathBuf>,
+    #[serde(default)]
+    calibration_library_sha256: Option<String>,
+    #[serde(default)]
+    scanner_profile: Option<String>,
+    #[serde(default)]
+    roll_profile: Option<String>,
+    #[serde(default)]
+    film_stock: Option<String>,
+    #[serde(default)]
+    scene_tags: Vec<String>,
+    #[serde(default)]
+    exposure_tags: Vec<String>,
+    #[serde(default)]
+    reference_evidence: Vec<String>,
+    #[serde(default)]
+    calibration_case: Option<String>,
+    #[serde(default)]
+    expectations: FixtureExpectations,
+    #[serde(default)]
+    summary_baseline: Option<PathBuf>,
+    #[serde(default)]
+    summary_baseline_sha256: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FixtureExpectations {
+    #[serde(default)]
+    stitch_decision: Option<String>,
+    #[serde(default)]
+    base_estimate_source: Option<String>,
+    #[serde(default)]
+    output_color_space: Option<String>,
+    #[serde(default)]
+    render_input_source: Option<String>,
+    #[serde(default)]
+    render_input_reason_contains: Option<String>,
+    #[serde(default)]
+    mapping_strategy: Option<String>,
+    #[serde(default)]
+    selected_mapping_reason_contains: Option<String>,
+    #[serde(default)]
+    selected_candidate: Option<String>,
+    #[serde(default)]
+    selected_candidate_rank: Option<usize>,
+    #[serde(default)]
+    calibration_acceptance_status: Option<String>,
+    #[serde(default)]
+    calibration_confidence_min: Option<f64>,
+    #[serde(default)]
+    calibration_matrix_condition_number_max: Option<f64>,
+    #[serde(default)]
+    calibration_rejection_details_required: Vec<String>,
+    #[serde(default)]
+    candidate_risk: Option<String>,
+    #[serde(default)]
+    tone_color_trust_state: Option<String>,
+    #[serde(default)]
+    highlight_chroma_compressed_ratio_min: Option<f64>,
+    #[serde(default)]
+    highlight_chroma_compressed_ratio_max: Option<f64>,
+    #[serde(default)]
+    highlight_neutral_chroma_compressed_ratio_max: Option<f64>,
+    #[serde(default)]
+    shadow_chroma_compressed_ratio_max: Option<f64>,
+    #[serde(default)]
+    selected_quality_score_max: Option<f64>,
+    #[serde(default)]
+    technical_safety_score_max: Option<f64>,
+    #[serde(default)]
+    color_fidelity_score_max: Option<f64>,
+    #[serde(default)]
+    memory_color_penalty_max: Option<f64>,
+    #[serde(default)]
+    spatial_consistency_penalty_max: Option<f64>,
+    #[serde(default)]
+    selected_runner_up_quality_delta_min: Option<f64>,
+    #[serde(default)]
+    density_monotonicity_score_min: Option<f64>,
+    #[serde(default)]
+    hue_linearity_score_min: Option<f64>,
+    #[serde(default)]
+    saturation_preservation_median_ratio_min: Option<f64>,
+    #[serde(default)]
+    spatial_neutral_delta_p95_max: Option<f64>,
+    #[serde(default)]
+    post_scale_preserved_ratio_min: Option<f64>,
+    #[serde(default)]
+    reference_patch_evaluation_required: bool,
+    #[serde(default)]
+    reference_patch_count_min: Option<usize>,
+    #[serde(default)]
+    reference_patch_hue_family_regression_count_max: Option<usize>,
+    #[serde(default)]
+    reference_patch_selected_regresses_image_derived: Option<bool>,
+    #[serde(default)]
+    reference_patch_delta_e2000_delta_vs_image_derived_max: Option<f64>,
+    #[serde(default)]
+    reference_patch_max_delta_vs_image_derived_max: Option<f64>,
+    #[serde(default)]
+    reference_patch_delta_e_max_delta_vs_image_derived_max: Option<f64>,
+    #[serde(default)]
+    reference_patch_delta_e2000_max_delta_vs_image_derived_max: Option<f64>,
+    #[serde(default)]
+    reference_patch_rms_delta_e_max: Option<f64>,
+    #[serde(default)]
+    reference_patch_rms_delta_e2000_max: Option<f64>,
+    #[serde(default)]
+    debug_artifacts_required: bool,
+    #[serde(default)]
+    debug_artifact_kinds_required: Vec<String>,
+    #[serde(default)]
+    candidate_acceptance_signatures_required: Vec<String>,
+    #[serde(default)]
+    selection_rejections_required: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FixtureCoverageSummary {
+    status: String,
+    fixture_count: usize,
+    component_pair_available_count: usize,
+    component_sha256_declared_pair_count: usize,
+    component_sha256_computed_pair_count: usize,
+    component_sha256_pair_count: usize,
+    readable_tiff_pair_count: usize,
+    tiff_layout_consistent_pair_count: usize,
+    tiff_dimension_matched_pair_count: usize,
+    validation_ready_fixture_count: usize,
+    summary_baseline_declared_count: usize,
+    summary_baseline_file_count: usize,
+    summary_baseline_parseable_count: usize,
+    summary_baseline_contract_complete_count: usize,
+    summary_baseline_count: usize,
+    summary_baseline_sha256_declared_count: usize,
+    summary_baseline_sha256_computed_count: usize,
+    summary_baseline_sha256_count: usize,
+    calibration_evidence_declared_count: usize,
+    calibration_evidence_count: usize,
+    calibration_evidence_unusable_count: usize,
+    calibration_sha256_declared_count: usize,
+    calibration_sha256_computed_count: usize,
+    calibration_sha256_count: usize,
+    uncalibrated_fixture_count: usize,
+    scanner_profile_count: usize,
+    unique_scanner_profiles: Vec<String>,
+    missing_required_scanner_profiles: Vec<String>,
+    roll_profile_count: usize,
+    unique_roll_profiles: Vec<String>,
+    missing_required_roll_profiles: Vec<String>,
+    film_stock_count: usize,
+    unique_film_stocks: Vec<String>,
+    missing_required_film_stocks: Vec<String>,
+    scene_tag_count: usize,
+    scene_tags: Vec<String>,
+    missing_required_scene_tags: Vec<String>,
+    exposure_tag_count: usize,
+    exposure_tags: Vec<String>,
+    missing_required_exposure_tags: Vec<String>,
+    calibration_case_count: usize,
+    calibration_cases: Vec<String>,
+    missing_required_calibration_cases: Vec<String>,
+    reference_fixture_count: usize,
+    reference_evidence_type_count: usize,
+    reference_evidence: Vec<String>,
+    missing_required_reference_evidence: Vec<String>,
+    reference_patch_fixture_count: usize,
+    reference_patch_count: usize,
+    debug_artifact_expectation_fixture_count: usize,
+    debug_artifact_kinds_required: Vec<String>,
+    missing_required_debug_artifact_kinds: Vec<String>,
+    film_stock_calibration_pair_count: usize,
+    film_stock_calibration_pairs: Vec<String>,
+    missing_required_film_stock_calibration_pairs: Vec<String>,
+    scene_exposure_pair_count: usize,
+    scene_exposure_pairs: Vec<String>,
+    missing_required_scene_exposure_pairs: Vec<String>,
+    coverage_requirements: FixtureCoverageRequirements,
+    fixtures: Vec<FixtureCoverageEntry>,
+    action_items: Vec<String>,
+    issues: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FixtureCoverageEntry {
+    name: String,
+    component1: String,
+    component1_exists: bool,
+    component1_sha256: Option<FixtureSha256Probe>,
+    component1_tiff: Option<FixtureTiffProbe>,
+    component2: String,
+    component2_exists: bool,
+    component2_sha256: Option<FixtureSha256Probe>,
+    component2_tiff: Option<FixtureTiffProbe>,
+    tiff_pair: Option<FixtureTiffPairProbe>,
+    output_dir: Option<String>,
+    summary_baseline: Option<String>,
+    summary_baseline_exists: Option<bool>,
+    summary_baseline_parse_status: Option<String>,
+    summary_baseline_contract_status: Option<String>,
+    summary_baseline_contract_missing_fields: Vec<String>,
+    summary_baseline_valid: bool,
+    summary_baseline_sha256: Option<FixtureSha256Probe>,
+    calibration_profile: Option<String>,
+    calibration_profile_exists: Option<bool>,
+    calibration_profile_parse_status: Option<String>,
+    calibration_profile_sha256: Option<FixtureSha256Probe>,
+    calibration_library: Option<String>,
+    calibration_library_exists: Option<bool>,
+    calibration_library_selection_status: Option<String>,
+    calibration_library_sha256: Option<FixtureSha256Probe>,
+    calibration_reference_patch_count: Option<usize>,
+    scanner_profile: Option<String>,
+    roll_profile: Option<String>,
+    film_stock: Option<String>,
+    scene_tags: Vec<String>,
+    exposure_tags: Vec<String>,
+    reference_evidence: Vec<String>,
+    calibration_case: Option<String>,
+    debug_artifacts_required: bool,
+    debug_artifact_kinds_required: Vec<String>,
+    calibration_evidence_declared: bool,
+    calibration_evidence_usable: bool,
+    validation_ready: bool,
+    action_items: Vec<String>,
+    repair_plan: Vec<FixtureRepairPlanItem>,
+    issues: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FixtureRepairPlanItem {
+    action: String,
+    paths: Vec<String>,
+    details: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FixtureSha256Probe {
+    status: String,
+    expected_sha256: Option<String>,
+    actual_sha256: Option<String>,
+    file_size_bytes: Option<u64>,
+    file_count: Option<usize>,
+    matched: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FixtureTiffProbe {
+    status: String,
+    readable: bool,
+    width: Option<usize>,
+    height: Option<usize>,
+    color_type: Option<String>,
+    source_bits_per_sample: Option<u8>,
+    source_channel_count: Option<usize>,
+    source_has_alpha: Option<bool>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FixtureTiffPairProbe {
+    dimensions_match: Option<bool>,
+    color_type_match: Option<bool>,
+    bits_per_sample_match: Option<bool>,
+    channel_count_match: Option<bool>,
+    alpha_flag_match: Option<bool>,
+    layout_consistent: bool,
+    dimension_matched: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct FixtureSuiteSummary {
+    status: String,
+    fixture_count: usize,
+    passed_count: usize,
+    review_required_count: usize,
+    failed_count: usize,
+    coverage: FixtureCoverageSummary,
+    fixtures: Vec<FixtureSuiteEntry>,
+    issues: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FixtureSuiteEntry {
+    name: String,
+    status: String,
+    coverage_validation_ready: bool,
+    coverage_issues: Vec<String>,
+    coverage_action_items: Vec<String>,
+    output_dir: String,
+    output_path: Option<String>,
+    output_modified_at: Option<String>,
+    output_color_space: Option<String>,
+    expected_output_color_space: Option<String>,
+    output_file_icc_profile_matches_report: Option<bool>,
+    stale_render_artifact_count: Option<usize>,
+    report_path: Option<String>,
+    summary_json_path: Option<String>,
+    summary_md_path: Option<String>,
+    summary_baseline_path: Option<String>,
+    summary_baseline_status: Option<String>,
+    stitch_decision: Option<String>,
+    expected_stitch_decision: Option<String>,
+    base_estimate_source: Option<String>,
+    expected_base_estimate_source: Option<String>,
+    reference_evidence: Vec<String>,
+    render_input_source: Option<String>,
+    expected_render_input_source: Option<String>,
+    render_input_reason: Option<String>,
+    expected_render_input_reason_contains: Option<String>,
+    selected_mapping_reason: Option<String>,
+    expected_selected_mapping_reason_contains: Option<String>,
+    expected_calibration_source: Option<String>,
+    expected_calibration_scanner_profile: Option<String>,
+    expected_calibration_roll_profile: Option<String>,
+    expected_calibration_film_stock: Option<String>,
+    calibration_status: Option<String>,
+    calibration_source: Option<String>,
+    calibration_scanner_profile_status: Option<String>,
+    calibration_scanner_profile_id: Option<String>,
+    calibration_roll_profile_status: Option<String>,
+    calibration_roll_profile_id: Option<String>,
+    calibration_requested_film_stock: Option<String>,
+    calibration_acceptance_status: Option<String>,
+    calibration_confidence: Option<f64>,
+    expected_calibration_confidence_min: Option<f64>,
+    calibration_matrix_condition_number: Option<f64>,
+    expected_calibration_matrix_condition_number_max: Option<f64>,
+    calibration_rejection_details: Vec<String>,
+    expected_calibration_rejection_details_required: Vec<String>,
+    selected_candidate: Option<String>,
+    expected_selected_candidate: Option<String>,
+    selected_candidate_rank: Option<usize>,
+    expected_selected_candidate_rank: Option<usize>,
+    candidate_acceptance_signatures: Vec<String>,
+    expected_candidate_acceptance_signatures_required: Vec<String>,
+    selection_rejections: Vec<String>,
+    expected_selection_rejections_required: Vec<String>,
+    selected_quality_score: Option<f64>,
+    expected_selected_quality_score_max: Option<f64>,
+    selected_runner_up_quality_delta: Option<f64>,
+    expected_selected_runner_up_quality_delta_min: Option<f64>,
+    technical_safety_score: Option<f64>,
+    expected_technical_safety_score_max: Option<f64>,
+    color_fidelity_score: Option<f64>,
+    expected_color_fidelity_score_max: Option<f64>,
+    memory_color_penalty: Option<f64>,
+    expected_memory_color_penalty_max: Option<f64>,
+    spatial_consistency_penalty: Option<f64>,
+    expected_spatial_consistency_penalty_max: Option<f64>,
+    density_monotonicity_score: Option<f64>,
+    expected_density_monotonicity_score_min: Option<f64>,
+    hue_linearity_score: Option<f64>,
+    expected_hue_linearity_score_min: Option<f64>,
+    saturation_preservation_median_ratio: Option<f64>,
+    expected_saturation_preservation_median_ratio_min: Option<f64>,
+    spatial_neutral_delta_p95: Option<f64>,
+    expected_spatial_neutral_delta_p95_max: Option<f64>,
+    candidate_risk: Option<String>,
+    expected_candidate_risk: Option<String>,
+    tone_color_trust_state: Option<String>,
+    expected_tone_color_trust_state: Option<String>,
+    highlight_chroma_compressed_ratio: Option<f64>,
+    expected_highlight_chroma_compressed_ratio_min: Option<f64>,
+    expected_highlight_chroma_compressed_ratio_max: Option<f64>,
+    highlight_neutral_chroma_compressed_ratio: Option<f64>,
+    expected_highlight_neutral_chroma_compressed_ratio_max: Option<f64>,
+    shadow_chroma_compressed_ratio: Option<f64>,
+    expected_shadow_chroma_compressed_ratio_max: Option<f64>,
+    mapping_strategy: Option<String>,
+    expected_mapping_strategy: Option<String>,
+    post_scale_preserved_ratio: Option<f64>,
+    expected_post_scale_preserved_ratio_min: Option<f64>,
+    reference_patch_evaluation_present: Option<bool>,
+    reference_patch_patch_count: Option<usize>,
+    reference_patch_selected_rms_delta_e: Option<f64>,
+    reference_patch_selected_rms_delta_e2000: Option<f64>,
+    reference_patch_delta_e2000_delta_vs_image_derived: Option<f64>,
+    reference_patch_max_delta_vs_image_derived: Option<f64>,
+    reference_patch_delta_e_max_delta_vs_image_derived: Option<f64>,
+    reference_patch_delta_e2000_max_delta_vs_image_derived: Option<f64>,
+    reference_patch_selected_regresses_image_derived: Option<bool>,
+    reference_patch_hue_family_regressions: Vec<String>,
+    expected_reference_patch_evaluation_required: bool,
+    expected_reference_patch_count_min: Option<usize>,
+    expected_reference_patch_hue_family_regression_count_max: Option<usize>,
+    expected_reference_patch_selected_regresses_image_derived: Option<bool>,
+    expected_reference_patch_delta_e2000_delta_vs_image_derived_max: Option<f64>,
+    expected_reference_patch_max_delta_vs_image_derived_max: Option<f64>,
+    expected_reference_patch_delta_e_max_delta_vs_image_derived_max: Option<f64>,
+    expected_reference_patch_delta_e2000_max_delta_vs_image_derived_max: Option<f64>,
+    expected_reference_patch_rms_delta_e_max: Option<f64>,
+    expected_reference_patch_rms_delta_e2000_max: Option<f64>,
+    debug_artifact_count: Option<usize>,
+    debug_artifact_invalid_count: Option<usize>,
+    debug_artifact_kinds: Vec<String>,
+    expected_debug_artifacts_required: bool,
+    expected_debug_artifact_kinds_required: Vec<String>,
+    issues: Vec<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FixtureSuiteCoverageContext {
+    validation_ready: bool,
+    issues: Vec<String>,
+    action_items: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RollInventorySummary {
+    status: String,
+    roll_dir: String,
+    roll_name: String,
+    frame_count: usize,
+    usable_frame_count: usize,
+    unreadable_frame_count: usize,
+    sequence_gap_count: usize,
+    sequence_gaps: Vec<RollSequenceGap>,
+    frames: Vec<RollFrameInspection>,
+    issues: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RollFrameInspection {
+    name: String,
+    stem: String,
+    path: String,
+    file_size_bytes: Option<u64>,
+    status: String,
+    usable: bool,
+    width: Option<usize>,
+    height: Option<usize>,
+    color_type: Option<String>,
+    source_bits_per_sample: Option<u8>,
+    source_channel_count: Option<usize>,
+    source_has_alpha: Option<bool>,
+    sequence_prefix: Option<String>,
+    sequence_number: Option<usize>,
+    sequence_width: Option<usize>,
+    positive_input_probe: Option<positive_input::PositiveInputInspection>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RollSequenceGap {
+    prefix: String,
+    width: usize,
+    start: usize,
+    end: usize,
+    count: usize,
+    missing: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RollSuiteSummary {
+    status: String,
+    roll_dir: String,
+    roll_name: String,
+    frame_count: usize,
+    passed_count: usize,
+    review_required_count: usize,
+    failed_count: usize,
+    output_dir: String,
+    roll_base_color: Option<[f64; 3]>,
+    roll_base_source: Option<String>,
+    roll_base_confidence: Option<f64>,
+    roll_base_frame_count: usize,
+    roll_base_candidate_count: usize,
+    roll_base_rejected_dark_candidate_count: usize,
+    roll_base_high_transmittance_envelope: Option<[f64; 3]>,
+    roll_base_reason: Option<String>,
+    roll_base_clusters: Vec<RollBaseClusterSummary>,
+    review: RollSuiteReviewSummary,
+    quality: RollSuiteQualitySummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    comparison: Option<RollSuiteComparison>,
+    inventory: RollInventorySummary,
+    frames: Vec<RollSuiteEntry>,
+    issues: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RollSuiteReviewSummary {
+    frame_count: usize,
+    candidate_safe_count: usize,
+    candidate_review_required_count: usize,
+    candidate_unknown_count: usize,
+    tone_color_trusted_count: usize,
+    tone_color_review_required_count: usize,
+    tone_color_unknown_count: usize,
+    reference_patch_evaluation_present_count: usize,
+    reference_patch_evaluation_missing_count: usize,
+    reference_patch_evaluation_unknown_count: usize,
+    candidate_risk_counts: Vec<RollSuiteValueCount>,
+    tone_color_trust_state_counts: Vec<RollSuiteValueCount>,
+    calibration_status_counts: Vec<RollSuiteValueCount>,
+    issue_counts: Vec<RollSuiteValueCount>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RollSuiteValueCount {
+    value: String,
+    count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RollSuiteComparison {
+    baseline_path: String,
+    status: String,
+    issues: Vec<String>,
+    frame_count_delta: isize,
+    review_required_count_delta: isize,
+    failed_count_delta: isize,
+    baseline_only_frames: Vec<String>,
+    current_only_frames: Vec<String>,
+    quality: RollSuiteQualityComparison,
+    frames: Vec<RollSuiteFrameComparison>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RollSuiteQualityComparison {
+    render_luminance_range_p05_p95_mean_delta: Option<f64>,
+    render_luminance_range_p05_p95_min_delta: Option<f64>,
+    render_luminance_range_p05_p95_max_delta: Option<f64>,
+    midtone_luminance_p50_mean_delta: Option<f64>,
+    midtone_luminance_p50_min_delta: Option<f64>,
+    midtone_luminance_p50_max_delta: Option<f64>,
+    midtone_luminance_p50_range_delta: Option<f64>,
+    shadow_saturation_p95_mean_delta: Option<f64>,
+    shadow_saturation_p95_max_delta: Option<f64>,
+    midtone_neutral_saturation_p95_mean_delta: Option<f64>,
+    midtone_neutral_saturation_p95_max_delta: Option<f64>,
+    bright_neutral_saturation_p95_mean_delta: Option<f64>,
+    bright_neutral_saturation_p95_max_delta: Option<f64>,
+    midtone_neutral_rgb_balance_delta_mean_delta: Option<f64>,
+    midtone_neutral_rgb_balance_delta_max_delta: Option<f64>,
+    bright_neutral_rgb_balance_delta_mean_delta: Option<f64>,
+    bright_neutral_rgb_balance_delta_max_delta: Option<f64>,
+    high_frequency_chroma_residual_p95_mean_delta: Option<f64>,
+    high_frequency_chroma_residual_p95_max_delta: Option<f64>,
+    high_frequency_flat_chroma_residual_p95_mean_delta: Option<f64>,
+    high_frequency_flat_chroma_residual_p95_max_delta: Option<f64>,
+    high_frequency_chroma_to_luma_p95_ratio_mean_delta: Option<f64>,
+    high_frequency_flat_chroma_to_luma_p95_ratio_mean_delta: Option<f64>,
+    noise_reduction_saturation_limited_ratio_mean_delta: Option<f64>,
+    noise_reduction_mean_abs_chroma_delta_mean_delta: Option<f64>,
+    colorspace_post_scale_preserved_ratio_min_delta: Option<f64>,
+    post_chroma_compression_clipped_high_max_delta: Option<f64>,
+    post_chroma_compression_clipped_low_max_delta: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RollSuiteFrameComparison {
+    name: String,
+    baseline_status: Option<String>,
+    current_status: Option<String>,
+    status_changed: bool,
+    baseline_candidate_risk: Option<String>,
+    current_candidate_risk: Option<String>,
+    candidate_risk_changed: bool,
+    render_luminance_range_p05_p95_delta: Option<f64>,
+    midtone_luminance_p50_delta: Option<f64>,
+    shadow_saturation_p95_delta: Option<f64>,
+    midtone_neutral_saturation_p95_delta: Option<f64>,
+    bright_neutral_saturation_p95_delta: Option<f64>,
+    midtone_neutral_rgb_balance_delta_delta: Option<f64>,
+    bright_neutral_rgb_balance_delta_delta: Option<f64>,
+    high_frequency_chroma_residual_p95_delta: Option<f64>,
+    high_frequency_flat_chroma_residual_p95_delta: Option<f64>,
+    colorspace_post_scale_preserved_ratio_delta: Option<f64>,
+    post_chroma_compression_clipped_high_max_delta: Option<f64>,
+    post_chroma_compression_clipped_low_max_delta: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RollSuiteQualitySummary {
+    frame_count: usize,
+    high_frequency_frame_count: usize,
+    high_frequency_luma_residual_p95_mean: Option<f64>,
+    high_frequency_luma_residual_p95_max: Option<f64>,
+    high_frequency_chroma_residual_p95_mean: Option<f64>,
+    high_frequency_chroma_residual_p95_max: Option<f64>,
+    high_frequency_chroma_to_luma_p95_ratio_mean: Option<f64>,
+    high_frequency_chroma_to_luma_p95_ratio_max: Option<f64>,
+    high_frequency_flat_frame_count: usize,
+    high_frequency_flat_sample_ratio_mean: Option<f64>,
+    high_frequency_flat_luma_residual_p95_mean: Option<f64>,
+    high_frequency_flat_luma_residual_p95_max: Option<f64>,
+    high_frequency_flat_chroma_residual_p95_mean: Option<f64>,
+    high_frequency_flat_chroma_residual_p95_max: Option<f64>,
+    high_frequency_flat_chroma_to_luma_p95_ratio_mean: Option<f64>,
+    high_frequency_flat_chroma_to_luma_p95_ratio_max: Option<f64>,
+    noise_reduction_enabled_count: usize,
+    noise_reduction_applied_ratio_mean: Option<f64>,
+    noise_reduction_applied_ratio_max: Option<f64>,
+    noise_reduction_texture_limited_ratio_mean: Option<f64>,
+    noise_reduction_saturation_limited_ratio_mean: Option<f64>,
+    noise_reduction_mean_abs_chroma_delta_mean: Option<f64>,
+    noise_reduction_mean_abs_luma_delta_mean: Option<f64>,
+    noise_reduction_max_abs_chroma_delta_max: Option<f64>,
+    noise_reduction_max_abs_luma_delta_max: Option<f64>,
+    colorspace_post_scale_preserved_ratio_mean: Option<f64>,
+    colorspace_post_scale_preserved_ratio_min: Option<f64>,
+    render_luminance_range_p05_p95_mean: Option<f64>,
+    render_luminance_range_p05_p95_min: Option<f64>,
+    render_luminance_range_p05_p95_max: Option<f64>,
+    midtone_luminance_p50_mean: Option<f64>,
+    midtone_luminance_p50_min: Option<f64>,
+    midtone_luminance_p50_max: Option<f64>,
+    midtone_luminance_p50_range: Option<f64>,
+    shadow_saturation_p95_mean: Option<f64>,
+    shadow_saturation_p95_max: Option<f64>,
+    shadow_visible_saturation_p95_mean: Option<f64>,
+    shadow_visible_saturation_p95_max: Option<f64>,
+    midtone_neutral_saturation_p95_mean: Option<f64>,
+    midtone_neutral_saturation_p95_max: Option<f64>,
+    bright_neutral_saturation_p95_mean: Option<f64>,
+    bright_neutral_saturation_p95_max: Option<f64>,
+    shadow_rgb_balance_delta_mean: Option<f64>,
+    shadow_rgb_balance_delta_max: Option<f64>,
+    shadow_visible_rgb_balance_delta_mean: Option<f64>,
+    shadow_visible_rgb_balance_delta_max: Option<f64>,
+    midtone_rgb_balance_delta_mean: Option<f64>,
+    midtone_rgb_balance_delta_max: Option<f64>,
+    midtone_neutral_rgb_balance_delta_mean: Option<f64>,
+    midtone_neutral_rgb_balance_delta_max: Option<f64>,
+    bright_neutral_rgb_balance_delta_mean: Option<f64>,
+    bright_neutral_rgb_balance_delta_max: Option<f64>,
+    highlight_chroma_compressed_ratio_mean: Option<f64>,
+    highlight_chroma_compressed_ratio_max: Option<f64>,
+    shadow_chroma_compressed_ratio_mean: Option<f64>,
+    shadow_chroma_compressed_ratio_max: Option<f64>,
+    post_chroma_compression_clipped_high_max: Option<f64>,
+    post_chroma_compression_clipped_low_max: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct RollBaseEstimate {
+    color: [f64; 3],
+    source: String,
+    confidence: f64,
+    frame_count: usize,
+    candidate_count: usize,
+    rejected_dark_candidate_count: usize,
+    high_transmittance_envelope: [f64; 3],
+    reason: String,
+    clusters: Vec<RollBaseClusterSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RollBaseClusterSummary {
+    color: [f64; 3],
+    frame_count: usize,
+    mean_luminance: f64,
+    max_relative_luminance_spread: f64,
+    source_counts: Vec<RollBaseSourceCount>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RollBaseSourceCount {
+    source: String,
+    count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct RollSuiteEntry {
+    name: String,
+    source_path: String,
+    status: String,
+    output_dir: String,
+    source_width: Option<usize>,
+    source_height: Option<usize>,
+    source_color_type: Option<String>,
+    source_bits_per_sample: Option<u8>,
+    output_path: Option<String>,
+    output_width: Option<usize>,
+    output_height: Option<usize>,
+    output_color_space: Option<String>,
+    output_file_icc_profile_matches_report: Option<bool>,
+    stale_render_artifact_count: Option<usize>,
+    report_path: Option<String>,
+    summary_json_path: Option<String>,
+    summary_md_path: Option<String>,
+    stitch_decision: Option<String>,
+    base_confidence: Option<f64>,
+    raw_base_confidence: Option<f64>,
+    base_estimate_source: Option<String>,
+    input_base_confidence: Option<f64>,
+    render_review_status: Option<String>,
+    render_reviewable: Option<bool>,
+    positive_input_likely_negative_like: Option<bool>,
+    positive_input_accepted_high_warm_score: Option<bool>,
+    positive_input_orange_mask_score: Option<f64>,
+    positive_input_reason: Option<String>,
+    base_color_override_applied: Option<bool>,
+    density_confidence: Option<f64>,
+    render_input_source: Option<String>,
+    render_input_reason: Option<String>,
+    mapping_strategy: Option<String>,
+    selected_mapping_reason: Option<String>,
+    selected_candidate: Option<String>,
+    selected_candidate_rank: Option<usize>,
+    selected_quality_score: Option<f64>,
+    candidate_risk: Option<String>,
+    tone_color_trust_state: Option<String>,
+    colorspace_pre_scale_preserved_ratio: Option<f64>,
+    colorspace_post_scale_preserved_ratio: Option<f64>,
+    render_luminance_p05: Option<f64>,
+    render_luminance_p50: Option<f64>,
+    render_luminance_p95: Option<f64>,
+    render_luminance_range_p05_p95: Option<f64>,
+    midtone_luminance_p50: Option<f64>,
+    shadow_saturation_p95: Option<f64>,
+    shadow_visible_pixel_count: Option<usize>,
+    shadow_visible_saturation_p95: Option<f64>,
+    midtone_neutral_pixel_count: Option<usize>,
+    midtone_neutral_saturation_p95: Option<f64>,
+    bright_neutral_saturation_p95: Option<f64>,
+    shadow_rgb_balance_delta: Option<f64>,
+    shadow_visible_rgb_balance_delta: Option<f64>,
+    midtone_rgb_balance_delta: Option<f64>,
+    midtone_neutral_rgb_balance_delta: Option<f64>,
+    bright_neutral_rgb_balance_delta: Option<f64>,
+    highlight_chroma_compressed_ratio: Option<f64>,
+    highlight_neutral_chroma_compressed_ratio: Option<f64>,
+    shadow_chroma_compressed_ratio: Option<f64>,
+    post_chroma_compression_clipped_high_max: Option<f64>,
+    post_chroma_compression_clipped_low_max: Option<f64>,
+    high_frequency_luma_residual_p95: Option<f64>,
+    high_frequency_chroma_residual_p95: Option<f64>,
+    high_frequency_chroma_to_luma_p95_ratio: Option<f64>,
+    high_frequency_flat_sample_count: Option<usize>,
+    high_frequency_flat_sample_ratio: Option<f64>,
+    high_frequency_flat_luma_residual_p95: Option<f64>,
+    high_frequency_flat_chroma_residual_p95: Option<f64>,
+    high_frequency_flat_chroma_to_luma_p95_ratio: Option<f64>,
+    noise_reduction_enabled: Option<bool>,
+    noise_reduction_applied_ratio: Option<f64>,
+    noise_reduction_texture_limited_ratio: Option<f64>,
+    noise_reduction_saturation_limited_ratio: Option<f64>,
+    noise_reduction_mean_abs_chroma_delta: Option<f64>,
+    noise_reduction_max_abs_chroma_delta: Option<f64>,
+    noise_reduction_mean_abs_luma_delta: Option<f64>,
+    noise_reduction_max_abs_luma_delta: Option<f64>,
+    calibration_status: Option<String>,
+    calibration_source: Option<String>,
+    calibration_acceptance_status: Option<String>,
+    calibration_confidence: Option<f64>,
+    reference_patch_evaluation_present: Option<bool>,
+    debug_artifact_count: Option<usize>,
+    debug_artifact_invalid_count: Option<usize>,
+    debug_artifact_kinds: Vec<String>,
+    issues: Vec<String>,
+    error: Option<String>,
+}
+
+fn run_roll_suite_child(cli: &ValidationCli) -> Result<(), Box<dyn std::error::Error>> {
+    let component1 = cli
+        .component1
+        .clone()
+        .ok_or("--roll-suite-child requires --component1")?;
+    let component2 = cli
+        .component2
+        .clone()
+        .ok_or("--roll-suite-child requires --component2")?;
+    let pipeline_cli = PipelineCli {
+        component1,
+        component2,
+        output_dir: cli.output_dir.clone(),
+        calibration_profile: cli.calibration_profile.clone(),
+        calibration_library: cli.calibration_library.clone(),
+        scanner_profile: cli.scanner_profile.clone(),
+        roll_profile: cli.roll_profile.clone(),
+        film_stock: cli.film_stock.clone(),
+        base_color: cli.base_color.clone(),
+        base_color_source: cli.base_color_source.clone(),
+        base_color_confidence: cli.base_color_confidence,
+        base_color_reason: cli.base_color_reason.clone(),
+        color_mode: cli.color_mode,
+        render_input: cli.render_input,
+        input_mode: cli.input_mode,
+        render_intent: cli.render_intent,
+        quality_mode: cli.quality_mode,
+        write_master: cli.write_master,
+        review_sidecar: cli.review_sidecar.clone(),
+        write_review_sidecar: cli.write_review_sidecar.clone(),
+        debug: cli.debug,
+        force_stitch: cli.force_stitch,
+        force_no_stitch: cli.force_no_stitch,
+        transform: cli.transform.clone(),
+        ica_max_iter: cli.ica_max_iter,
+        ica_tol: cli.ica_tol,
+        bit_depth: cli.bit_depth,
+        use_opencv: cli.use_opencv,
+    };
+
+    let report = scanstitch::pipeline::run(&pipeline_cli)?;
+    let report_path = pipeline_cli.output_dir.join("report.json");
+    report.save(&report_path)?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let cli = ValidationCli::parse();
+    validate_input_mode_options(cli.input_mode, cli.render_input)?;
+    if cli.roll_suite_child {
+        return run_roll_suite_child(&cli);
+    }
 
+    let registry = load_fixture_registry(cli.fixture_registry.as_ref())?;
+    let fixtures = &registry.fixtures;
+
+    if cli.write_fixture_hash_registry.is_some() && !cli.fixture_coverage {
+        return Err("--write-fixture-hash-registry requires --fixture-coverage".into());
+    }
+    if !cli.roll_suite && !cli.roll_suite_frames.is_empty() {
+        return Err("--roll-suite-frame requires --roll-suite".into());
+    }
+
+    if cli.list_fixtures {
+        for (name, fixture) in fixtures {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                name,
+                fixture.component1.display(),
+                fixture.component2.display(),
+                fixture
+                    .summary_baseline
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                fixture_calibration_label(fixture),
+                fixture.scanner_profile.as_deref().unwrap_or(""),
+                fixture.roll_profile.as_deref().unwrap_or(""),
+                fixture.film_stock.as_deref().unwrap_or(""),
+                fixture.scene_tags.join(","),
+                fixture.exposure_tags.join(","),
+                fixture.reference_evidence.join(","),
+                fixture.calibration_case.as_deref().unwrap_or(""),
+                fixture.description.as_deref().unwrap_or("")
+            );
+        }
+        return Ok(());
+    }
+
+    if cli.roll_inventory || cli.roll_suite {
+        validate_roll_inputs(&cli)?;
+        if cli.roll_suite {
+            let mut summary = run_roll_suite(&cli);
+            if let Some(compare_path) = &cli.compare_roll_suite {
+                let baseline_json = std::fs::read_to_string(compare_path)?;
+                let baseline_summary = serde_json::from_str::<serde_json::Value>(&baseline_json)?;
+                let current_summary =
+                    serde_json::to_value(&summary).expect("roll suite should serialize to value");
+                summary.comparison = Some(compare_roll_suites(
+                    compare_path.to_string_lossy().to_string(),
+                    &baseline_summary,
+                    &current_summary,
+                ));
+            }
+            let output_root = roll_mode_output_dir(&cli);
+            let json_path = cli
+                .summary_json
+                .clone()
+                .unwrap_or_else(|| output_root.join("roll-suite.json"));
+            let md_path = cli
+                .summary_md
+                .clone()
+                .unwrap_or_else(|| output_root.join("roll-suite.md"));
+            let json_summary =
+                serde_json::to_string_pretty(&summary).expect("roll suite should serialize");
+            write_text(&json_path, &json_summary)?;
+            write_text(&md_path, &roll_suite_to_markdown(&summary))?;
+            if cli.print_json_summary {
+                println!("{json_summary}");
+            }
+            if !cli.quiet {
+                println!("roll_suite_json={}", json_path.display());
+                println!("roll_suite_md={}", md_path.display());
+                println!(
+                    "roll_suite_status={} passed={} review_required={} failed={} issues={}",
+                    summary.status,
+                    summary.passed_count,
+                    summary.review_required_count,
+                    summary.failed_count,
+                    if summary.issues.is_empty() {
+                        "none".to_string()
+                    } else {
+                        summary.issues.join(",")
+                    }
+                );
+                if let Some(comparison) = &summary.comparison {
+                    println!(
+                        "roll_suite_comparison_status={} issues={}",
+                        comparison.status,
+                        if comparison.issues.is_empty() {
+                            "none".to_string()
+                        } else {
+                            comparison.issues.join(",")
+                        }
+                    );
+                }
+            }
+            let mut all_issues = summary.issues.clone();
+            if let Some(comparison) = &summary.comparison {
+                all_issues.extend(comparison.issues.iter().cloned());
+            }
+            let selected_failures = selected_failures(&all_issues, &cli.fail_on);
+            if cli.strict && !summary.issues.is_empty() {
+                return Err(format!(
+                    "strict roll suite failed with issue(s): {}",
+                    summary.issues.join(", ")
+                )
+                .into());
+            }
+            if let Some(comparison) = &summary.comparison {
+                if cli.strict && !comparison.issues.is_empty() {
+                    return Err(format!(
+                        "strict roll suite comparison failed with issue(s): {}",
+                        comparison.issues.join(", ")
+                    )
+                    .into());
+                }
+            }
+            if !selected_failures.is_empty() {
+                return Err(format!(
+                    "--fail-on matched roll suite issue(s): {}",
+                    selected_failures.join(", ")
+                )
+                .into());
+            }
+            return Ok(());
+        }
+
+        let summary = run_roll_inventory(&cli);
+        let output_root = roll_mode_output_dir(&cli);
+        let json_path = cli
+            .summary_json
+            .clone()
+            .unwrap_or_else(|| output_root.join("roll-inventory.json"));
+        let md_path = cli
+            .summary_md
+            .clone()
+            .unwrap_or_else(|| output_root.join("roll-inventory.md"));
+        let json_summary =
+            serde_json::to_string_pretty(&summary).expect("roll inventory should serialize");
+        write_text(&json_path, &json_summary)?;
+        write_text(&md_path, &roll_inventory_to_markdown(&summary))?;
+        if cli.print_json_summary {
+            println!("{json_summary}");
+        }
+        if !cli.quiet {
+            println!("roll_inventory_json={}", json_path.display());
+            println!("roll_inventory_md={}", md_path.display());
+            println!(
+                "roll_inventory_status={} frames={} usable={} issues={}",
+                summary.status,
+                summary.frame_count,
+                summary.usable_frame_count,
+                if summary.issues.is_empty() {
+                    "none".to_string()
+                } else {
+                    summary.issues.join(",")
+                }
+            );
+        }
+        let selected_failures = selected_failures(&summary.issues, &cli.fail_on);
+        if cli.strict && !summary.issues.is_empty() {
+            return Err(format!(
+                "strict roll inventory failed with issue(s): {}",
+                summary.issues.join(", ")
+            )
+            .into());
+        }
+        if !selected_failures.is_empty() {
+            return Err(format!(
+                "--fail-on matched roll inventory issue(s): {}",
+                selected_failures.join(", ")
+            )
+            .into());
+        }
+        return Ok(());
+    }
+
+    if cli.compare_roll_suite.is_some() {
+        return Err("--compare-roll-suite requires --roll-suite".into());
+    }
+
+    if cli.fixture_coverage {
+        validate_fixture_hash_registry_writer(&cli)?;
+        let compute_fixture_hashes =
+            cli.compute_fixture_hashes || cli.write_fixture_hash_registry.is_some();
+        let summary = fixture_coverage_summary(
+            fixtures,
+            &registry.coverage_requirements,
+            compute_fixture_hashes,
+        );
+        let json_path = cli
+            .summary_json
+            .clone()
+            .unwrap_or_else(|| fixture_set_output_dir(&cli).join("fixture-coverage.json"));
+        let md_path = cli
+            .summary_md
+            .clone()
+            .unwrap_or_else(|| fixture_set_output_dir(&cli).join("fixture-coverage.md"));
+        let json_summary =
+            serde_json::to_string_pretty(&summary).expect("fixture coverage should serialize");
+        write_text(&json_path, &json_summary)?;
+        write_text(&md_path, &fixture_coverage_to_markdown(&summary))?;
+        if let Some(hash_registry_path) = &cli.write_fixture_hash_registry {
+            let snapshot =
+                fixture_hash_registry_snapshot(fixtures, &registry.coverage_requirements, &summary);
+            let mut snapshot_json = serde_json::to_value(&snapshot)
+                .expect("fixture registry snapshot should serialize");
+            strip_empty_registry_snapshot_values(&mut snapshot_json);
+            let snapshot_contents = serde_json::to_string_pretty(&snapshot_json)
+                .expect("fixture registry snapshot JSON should serialize");
+            write_text(hash_registry_path, &snapshot_contents)?;
+        }
+        if cli.print_json_summary {
+            println!("{json_summary}");
+        }
+        if !cli.quiet {
+            println!("fixture_coverage_json={}", json_path.display());
+            println!("fixture_coverage_md={}", md_path.display());
+            if let Some(hash_registry_path) = &cli.write_fixture_hash_registry {
+                println!("fixture_hash_registry={}", hash_registry_path.display());
+            }
+            println!(
+                "fixture_coverage_status={} issues={}",
+                summary.status,
+                if summary.issues.is_empty() {
+                    "none".to_string()
+                } else {
+                    summary.issues.join(",")
+                }
+            );
+        }
+        let selected_failures = selected_failures(&summary.issues, &cli.fail_on);
+        if cli.strict && !summary.issues.is_empty() {
+            return Err(format!(
+                "strict fixture coverage failed with issue(s): {}",
+                summary.issues.join(", ")
+            )
+            .into());
+        }
+        if !selected_failures.is_empty() {
+            return Err(format!(
+                "--fail-on matched fixture coverage issue(s): {}",
+                selected_failures.join(", ")
+            )
+            .into());
+        }
+        return Ok(());
+    }
+
+    if cli.fixture_suite {
+        validate_fixture_suite_inputs(&cli)?;
+        let summary = run_fixture_suite(&cli, fixtures, &registry.coverage_requirements);
+        let json_path = cli
+            .summary_json
+            .clone()
+            .unwrap_or_else(|| fixture_set_output_dir(&cli).join("fixture-suite.json"));
+        let md_path = cli
+            .summary_md
+            .clone()
+            .unwrap_or_else(|| fixture_set_output_dir(&cli).join("fixture-suite.md"));
+        let json_summary =
+            serde_json::to_string_pretty(&summary).expect("fixture suite should serialize");
+        write_text(&json_path, &json_summary)?;
+        write_text(&md_path, &fixture_suite_to_markdown(&summary))?;
+        if cli.print_json_summary {
+            println!("{json_summary}");
+        }
+        if !cli.quiet {
+            println!("fixture_suite_json={}", json_path.display());
+            println!("fixture_suite_md={}", md_path.display());
+            println!(
+                "fixture_suite_status={} passed={} review_required={} failed={} issues={}",
+                summary.status,
+                summary.passed_count,
+                summary.review_required_count,
+                summary.failed_count,
+                if summary.issues.is_empty() {
+                    "none".to_string()
+                } else {
+                    summary.issues.join(",")
+                }
+            );
+        }
+        let selected_failures = selected_failures(&summary.issues, &cli.fail_on);
+        if cli.strict && !summary.issues.is_empty() {
+            return Err(format!(
+                "strict fixture suite failed with issue(s): {}",
+                summary.issues.join(", ")
+            )
+            .into());
+        }
+        if !selected_failures.is_empty() {
+            return Err(format!(
+                "--fail-on matched fixture suite issue(s): {}",
+                selected_failures.join(", ")
+            )
+            .into());
+        }
+        return Ok(());
+    }
+
+    if cli.synthetic_color_suite {
+        let summary = run_synthetic_color_suite();
+        let json_path = cli.summary_json.clone().unwrap_or_else(|| {
+            effective_output_dir(&cli, fixtures).join("synthetic-color-suite.json")
+        });
+        let md_path = cli.summary_md.clone().unwrap_or_else(|| {
+            effective_output_dir(&cli, fixtures).join("synthetic-color-suite.md")
+        });
+        let json_summary =
+            serde_json::to_string_pretty(&summary).expect("synthetic suite should serialize");
+        write_text(&json_path, &json_summary)?;
+        write_text(&md_path, &synthetic_color_suite_to_markdown(&summary))?;
+        if cli.print_json_summary {
+            println!("{json_summary}");
+        }
+        if !cli.quiet {
+            println!("synthetic_color_suite_json={}", json_path.display());
+            println!("synthetic_color_suite_md={}", md_path.display());
+            println!(
+                "synthetic_color_suite_status={} issues={}",
+                summary.status,
+                if summary.issues.is_empty() {
+                    "none".to_string()
+                } else {
+                    summary.issues.join(",")
+                }
+            );
+        }
+        let selected_failures = selected_failures(&summary.issues, &cli.fail_on);
+        if cli.strict && !summary.issues.is_empty() {
+            return Err(format!(
+                "strict synthetic color suite failed with issue(s): {}",
+                summary.issues.join(", ")
+            )
+            .into());
+        }
+        if !selected_failures.is_empty() {
+            return Err(format!(
+                "--fail-on matched synthetic color suite issue(s): {}",
+                selected_failures.join(", ")
+            )
+            .into());
+        }
+        return Ok(());
+    }
+
+    let mut current_report_path = cli.report.clone();
     let report = if let Some(report_path) = &cli.report {
         let contents = std::fs::read_to_string(report_path)?;
         serde_json::from_str::<PipelineReport>(&contents)?
     } else {
-        let (component1, component2) = resolve_components(&cli)?;
+        let (component1, component2) = resolve_components(&cli, fixtures)?;
+        let output_dir = effective_output_dir(&cli, fixtures);
         let pipeline_cli = PipelineCli {
             component1,
             component2,
-            output_dir: cli.output_dir.clone(),
+            output_dir,
+            calibration_profile: effective_calibration_profile(&cli, fixtures),
+            calibration_library: effective_calibration_library(&cli, fixtures),
+            scanner_profile: effective_scanner_profile(&cli, fixtures),
+            roll_profile: effective_roll_profile(&cli, fixtures),
+            film_stock: effective_pipeline_film_stock(&cli, fixtures),
+            base_color: cli.base_color.clone(),
+            base_color_source: None,
+            base_color_confidence: None,
+            base_color_reason: None,
+            color_mode: cli.color_mode,
+            render_input: cli.render_input,
+            input_mode: cli.input_mode,
+            render_intent: cli.render_intent,
+            quality_mode: cli.quality_mode,
+            write_master: cli.write_master,
+            review_sidecar: cli.review_sidecar.clone(),
+            write_review_sidecar: cli.write_review_sidecar.clone(),
             debug: cli.debug,
             force_stitch: cli.force_stitch,
             force_no_stitch: cli.force_no_stitch,
@@ -94,41 +1538,8192 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             use_opencv: cli.use_opencv,
         };
         let report = scanstitch::pipeline::run(&pipeline_cli)?;
-        report.save(&pipeline_cli.output_dir.join("report.json"))?;
+        let report_path = pipeline_cli.output_dir.join("report.json");
+        report.save(&report_path)?;
+        current_report_path = Some(report_path);
         report
     };
 
-    let summary = summarize_report(&cli.fixture, &report);
+    let mut summary =
+        summarize_report_with_source(&cli.fixture, &report, current_report_path.as_deref());
+    if let Some(compare_report_path) = &cli.compare_report {
+        let contents = std::fs::read_to_string(compare_report_path)?;
+        let compare_report = serde_json::from_str::<PipelineReport>(&contents)?;
+        let compare_summary = summarize_report_with_source(
+            format!("{}-baseline", cli.fixture),
+            &compare_report,
+            Some(compare_report_path),
+        );
+        summary.comparison = Some(compare_render_summaries(
+            compare_report_path.to_string_lossy().to_string(),
+            &compare_summary.render,
+            current_report_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string()),
+            &summary.render,
+        ));
+    }
+    let compare_summary_path = cli
+        .compare_summary
+        .clone()
+        .or_else(|| fixture_summary_baseline(&cli, fixtures));
+    if let Some(compare_summary_path) = &compare_summary_path {
+        let contents = std::fs::read_to_string(compare_summary_path)?;
+        let baseline = serde_json::from_str::<TrackedValidationBaseline>(&contents)?;
+        let mut comparison = compare_summary_baseline(
+            compare_summary_path.to_string_lossy().to_string(),
+            &baseline,
+            &summary,
+        );
+        comparison.issues.extend(
+            summary_baseline_contract_issues(&baseline)
+                .into_iter()
+                .map(|field| format!("summary_baseline_incomplete:{field}")),
+        );
+        if !comparison.issues.is_empty() {
+            comparison.status = "review_required".to_string();
+        }
+        summary.summary_baseline_comparison = Some(comparison);
+    }
     let json_path = cli
         .summary_json
         .clone()
-        .unwrap_or_else(|| cli.output_dir.join("summary.json"));
+        .unwrap_or_else(|| effective_output_dir(&cli, fixtures).join("summary.json"));
     let md_path = cli
         .summary_md
         .clone()
-        .unwrap_or_else(|| cli.output_dir.join("summary.md"));
+        .unwrap_or_else(|| effective_output_dir(&cli, fixtures).join("summary.md"));
 
-    write_text(
-        &json_path,
-        &serde_json::to_string_pretty(&summary).expect("summary should serialize"),
-    )?;
+    let json_summary = serde_json::to_string_pretty(&summary).expect("summary should serialize");
+    write_text(&json_path, &json_summary)?;
     write_text(&md_path, &summary_to_markdown(&summary))?;
+    if let Some(baseline_path) = &cli.write_summary_baseline {
+        let baseline = tracked_baseline_from_summary(&summary);
+        let baseline_json =
+            serde_json::to_string_pretty(&baseline).expect("summary baseline should serialize");
+        write_text(baseline_path, &baseline_json)?;
+    }
 
-    println!("summary_json={}", json_path.display());
-    println!("summary_md={}", md_path.display());
-    println!(
-        "decision={} confidence={:.3} mapping_strategy={} exposure_scale={:.3}",
-        summary.stitch.decision.as_deref().unwrap_or(""),
-        summary.stitch.confidence.unwrap_or(0.0),
-        summary.colorspace.mapping_strategy.as_deref().unwrap_or(""),
-        summary.colorspace.exposure_scale.unwrap_or(0.0)
-    );
+    if cli.print_json_summary {
+        println!("{json_summary}");
+    }
+    if !cli.quiet {
+        println!("summary_json={}", json_path.display());
+        println!("summary_md={}", md_path.display());
+        if let Some(baseline_path) = &cli.write_summary_baseline {
+            println!("summary_baseline={}", baseline_path.display());
+        }
+        print_summary_table(&summary);
+    }
+    if let Some(comparison) = &summary.comparison {
+        if !cli.quiet {
+            println!(
+                "comparison_status={} issues={}",
+                comparison.status,
+                if comparison.issues.is_empty() {
+                    "none".to_string()
+                } else {
+                    comparison.issues.join(",")
+                }
+            );
+        }
+        let selected_failures = selected_failures(&comparison.issues, &cli.fail_on);
+        if cli.strict && !comparison.issues.is_empty() {
+            return Err(format!(
+                "strict comparison failed with issue(s): {}",
+                comparison.issues.join(", ")
+            )
+            .into());
+        }
+        if !selected_failures.is_empty() {
+            return Err(format!(
+                "--fail-on matched comparison issue(s): {}",
+                selected_failures.join(", ")
+            )
+            .into());
+        }
+    }
+    if let Some(comparison) = &summary.summary_baseline_comparison {
+        if !cli.quiet {
+            println!(
+                "summary_baseline_status={} issues={}",
+                comparison.status,
+                if comparison.issues.is_empty() {
+                    "none".to_string()
+                } else {
+                    comparison.issues.join(",")
+                }
+            );
+        }
+        let selected_failures = selected_failures(&comparison.issues, &cli.fail_on);
+        if cli.strict && !comparison.issues.is_empty() {
+            return Err(format!(
+                "strict summary baseline comparison failed with issue(s): {}",
+                comparison.issues.join(", ")
+            )
+            .into());
+        }
+        if !selected_failures.is_empty() {
+            return Err(format!(
+                "--fail-on matched summary baseline issue(s): {}",
+                selected_failures.join(", ")
+            )
+            .into());
+        }
+    }
 
     Ok(())
 }
 
+fn load_fixture_registry(
+    path: Option<&PathBuf>,
+) -> Result<LoadedFixtureRegistry, Box<dyn std::error::Error>> {
+    let mut fixtures = BTreeMap::new();
+    fixtures.insert(
+        "logan".to_string(),
+        FixtureEntry {
+            component1: PathBuf::from("LOGAN043.tif"),
+            component2: PathBuf::from("LOGAN044.tif"),
+            component1_sha256: None,
+            component2_sha256: None,
+            output_dir: Some(PathBuf::from("output/validation/logan")),
+            calibration_profile: None,
+            calibration_profile_sha256: None,
+            calibration_library: None,
+            calibration_library_sha256: None,
+            scanner_profile: None,
+            roll_profile: None,
+            film_stock: None,
+            scene_tags: Vec::new(),
+            exposure_tags: Vec::new(),
+            reference_evidence: Vec::new(),
+            calibration_case: None,
+            expectations: FixtureExpectations::default(),
+            summary_baseline: None,
+            summary_baseline_sha256: None,
+            description: Some("Local LOGAN split-frame pair".to_string()),
+        },
+    );
+
+    let mut coverage_requirements = FixtureCoverageRequirements::default();
+    if let Some(path) = path {
+        let contents = std::fs::read_to_string(path)?;
+        let registry = serde_json::from_str::<FixtureRegistry>(&contents)?;
+        let registry_issues = validate_fixture_registry(&registry);
+        if !registry_issues.is_empty() {
+            return Err(format!(
+                "fixture registry {} invalid: {}",
+                path.display(),
+                registry_issues.join(", ")
+            )
+            .into());
+        }
+        coverage_requirements = registry.coverage_requirements;
+        fixtures.extend(registry.fixtures);
+    }
+
+    Ok(LoadedFixtureRegistry {
+        fixtures,
+        coverage_requirements,
+    })
+}
+
+fn validate_fixture_hash_registry_writer(
+    cli: &ValidationCli,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(snapshot_path) = &cli.write_fixture_hash_registry else {
+        return Ok(());
+    };
+    let Some(registry_path) = &cli.fixture_registry else {
+        return Ok(());
+    };
+
+    let registry_path = std::fs::canonicalize(registry_path)?;
+    if std::fs::canonicalize(snapshot_path)
+        .is_ok_and(|snapshot_path| snapshot_path == registry_path)
+    {
+        return Err("--write-fixture-hash-registry must not overwrite --fixture-registry; choose a separate snapshot path".into());
+    }
+
+    Ok(())
+}
+
+fn fixture_hash_registry_snapshot(
+    fixtures: &BTreeMap<String, FixtureEntry>,
+    requirements: &FixtureCoverageRequirements,
+    summary: &FixtureCoverageSummary,
+) -> FixtureRegistry {
+    let mut snapshot = FixtureRegistry {
+        fixtures: fixtures.clone(),
+        coverage_requirements: requirements.clone(),
+    };
+    let coverage_entries = summary
+        .fixtures
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+
+    for (name, fixture) in &mut snapshot.fixtures {
+        let Some(entry) = coverage_entries.get(name.as_str()) else {
+            continue;
+        };
+        fill_hash_from_probe(
+            &mut fixture.component1_sha256,
+            entry.component1_sha256.as_ref(),
+        );
+        fill_hash_from_probe(
+            &mut fixture.component2_sha256,
+            entry.component2_sha256.as_ref(),
+        );
+        fill_hash_from_probe(
+            &mut fixture.summary_baseline_sha256,
+            entry.summary_baseline_sha256.as_ref(),
+        );
+        fill_hash_from_probe(
+            &mut fixture.calibration_profile_sha256,
+            entry.calibration_profile_sha256.as_ref(),
+        );
+        fill_hash_from_probe(
+            &mut fixture.calibration_library_sha256,
+            entry.calibration_library_sha256.as_ref(),
+        );
+    }
+
+    snapshot
+}
+
+fn fill_hash_from_probe(target: &mut Option<String>, probe: Option<&FixtureSha256Probe>) {
+    if let Some(actual_sha256) = probe.and_then(|probe| probe.actual_sha256.as_ref()) {
+        *target = Some(actual_sha256.clone());
+    }
+}
+
+fn strip_empty_registry_snapshot_values(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            let keys = map.keys().cloned().collect::<Vec<_>>();
+            for key in keys {
+                let remove_default_false = (key == "reference_patch_evaluation_required"
+                    || key == "debug_artifacts_required")
+                    && map.get(&key) == Some(&serde_json::Value::Bool(false));
+                let remove_child = !remove_default_false
+                    && map
+                        .get_mut(&key)
+                        .is_some_and(strip_empty_registry_snapshot_values);
+                if remove_default_false || remove_child {
+                    map.remove(&key);
+                }
+            }
+            map.is_empty()
+        }
+        serde_json::Value::Array(items) => {
+            for index in (0..items.len()).rev() {
+                if strip_empty_registry_snapshot_values(&mut items[index]) {
+                    items.remove(index);
+                }
+            }
+            items.is_empty()
+        }
+        serde_json::Value::Null => true,
+        _ => false,
+    }
+}
+
+fn effective_output_dir(cli: &ValidationCli, fixtures: &BTreeMap<String, FixtureEntry>) -> PathBuf {
+    let default_output = PathBuf::from("output/validation/logan");
+    if cli.output_dir == default_output {
+        if let Some(output_dir) = fixtures
+            .get(&cli.fixture)
+            .and_then(|fixture| fixture.output_dir.clone())
+        {
+            return output_dir;
+        }
+    }
+    cli.output_dir.clone()
+}
+
+fn fixture_set_output_dir(cli: &ValidationCli) -> PathBuf {
+    let default_output = PathBuf::from("output/validation/logan");
+    if cli.output_dir == default_output {
+        PathBuf::from("output/validation")
+    } else {
+        cli.output_dir.clone()
+    }
+}
+
+fn fixture_summary_baseline(
+    cli: &ValidationCli,
+    fixtures: &BTreeMap<String, FixtureEntry>,
+) -> Option<PathBuf> {
+    fixtures
+        .get(&cli.fixture)
+        .and_then(|fixture| fixture.summary_baseline.clone())
+}
+
+fn effective_calibration_profile(
+    cli: &ValidationCli,
+    fixtures: &BTreeMap<String, FixtureEntry>,
+) -> Option<PathBuf> {
+    cli.calibration_profile.clone().or_else(|| {
+        fixtures
+            .get(&cli.fixture)
+            .and_then(|fixture| fixture.calibration_profile.clone())
+    })
+}
+
+fn effective_calibration_library(
+    cli: &ValidationCli,
+    fixtures: &BTreeMap<String, FixtureEntry>,
+) -> Option<PathBuf> {
+    cli.calibration_library.clone().or_else(|| {
+        fixtures
+            .get(&cli.fixture)
+            .and_then(|fixture| fixture.calibration_library.clone())
+    })
+}
+
+fn effective_scanner_profile(
+    cli: &ValidationCli,
+    fixtures: &BTreeMap<String, FixtureEntry>,
+) -> Option<String> {
+    cli.scanner_profile.clone().or_else(|| {
+        fixtures
+            .get(&cli.fixture)
+            .and_then(|fixture| fixture.scanner_profile.clone())
+    })
+}
+
+fn effective_roll_profile(
+    cli: &ValidationCli,
+    fixtures: &BTreeMap<String, FixtureEntry>,
+) -> Option<String> {
+    cli.roll_profile.clone().or_else(|| {
+        fixtures
+            .get(&cli.fixture)
+            .and_then(|fixture| fixture.roll_profile.clone())
+    })
+}
+
+fn effective_pipeline_film_stock(
+    cli: &ValidationCli,
+    fixtures: &BTreeMap<String, FixtureEntry>,
+) -> Option<String> {
+    let fixture = fixtures.get(&cli.fixture);
+    let calibration_library = effective_calibration_library(cli, fixtures);
+    pipeline_film_stock(
+        cli.film_stock.as_ref(),
+        fixture,
+        calibration_library.as_ref(),
+    )
+}
+
+fn pipeline_film_stock(
+    cli_film_stock: Option<&String>,
+    fixture: Option<&FixtureEntry>,
+    calibration_library: Option<&PathBuf>,
+) -> Option<String> {
+    cli_film_stock.cloned().or_else(|| {
+        calibration_library
+            .is_some()
+            .then(|| fixture.and_then(|fixture| fixture.film_stock.clone()))
+            .flatten()
+    })
+}
+
+fn validate_fixture_registry(registry: &FixtureRegistry) -> Vec<String> {
+    let mut issues = Vec::new();
+    if registry.fixtures.is_empty() {
+        issues.push("fixtures_empty".to_string());
+    }
+
+    validate_unique_non_empty_values(
+        "coverage_requirements:required_film_stock",
+        &registry.coverage_requirements.required_film_stocks,
+        &mut issues,
+    );
+    validate_unique_non_empty_values(
+        "coverage_requirements:required_scene_tag",
+        &registry.coverage_requirements.required_scene_tags,
+        &mut issues,
+    );
+    validate_unique_non_empty_values(
+        "coverage_requirements:required_exposure_tag",
+        &registry.coverage_requirements.required_exposure_tags,
+        &mut issues,
+    );
+    validate_unique_non_empty_values(
+        "coverage_requirements:required_calibration_case",
+        &registry.coverage_requirements.required_calibration_cases,
+        &mut issues,
+    );
+    validate_unique_non_empty_values(
+        "coverage_requirements:required_scanner_profile",
+        &registry.coverage_requirements.required_scanner_profiles,
+        &mut issues,
+    );
+    validate_unique_non_empty_values(
+        "coverage_requirements:required_roll_profile",
+        &registry.coverage_requirements.required_roll_profiles,
+        &mut issues,
+    );
+    validate_unique_non_empty_values(
+        "coverage_requirements:required_reference_evidence",
+        &registry.coverage_requirements.required_reference_evidence,
+        &mut issues,
+    );
+    validate_unique_non_empty_values(
+        "coverage_requirements:required_debug_artifact_kind",
+        &registry.coverage_requirements.required_debug_artifact_kinds,
+        &mut issues,
+    );
+    for kind in &registry.coverage_requirements.required_debug_artifact_kinds {
+        if !kind.is_empty() && !is_known_debug_artifact_kind(kind) {
+            issues.push(format!(
+                "coverage_requirements:required_debug_artifact_kind_unknown:{kind}"
+            ));
+        }
+    }
+    if registry
+        .coverage_requirements
+        .min_tiff_bits_per_sample
+        .is_some_and(|bits| bits > 16)
+    {
+        issues.push("coverage_requirements:min_tiff_bits_per_sample_out_of_range".to_string());
+    }
+    validate_required_pair_labels(
+        "coverage_requirements:required_film_stock_calibration_pair",
+        &registry
+            .coverage_requirements
+            .required_film_stock_calibration_pairs,
+        &mut issues,
+    );
+    validate_required_pair_labels(
+        "coverage_requirements:required_scene_exposure_pair",
+        &registry.coverage_requirements.required_scene_exposure_pairs,
+        &mut issues,
+    );
+
+    for (name, fixture) in &registry.fixtures {
+        validate_fixture_entry(name, fixture, &mut issues);
+    }
+
+    issues
+}
+
+fn validate_fixture_entry(name: &str, fixture: &FixtureEntry, issues: &mut Vec<String>) {
+    validate_required_path(name, "component1", &fixture.component1, issues);
+    validate_required_path(name, "component2", &fixture.component2, issues);
+    validate_optional_sha256(
+        name,
+        "component1_sha256",
+        fixture.component1_sha256.as_deref(),
+        issues,
+    );
+    validate_optional_sha256(
+        name,
+        "component2_sha256",
+        fixture.component2_sha256.as_deref(),
+        issues,
+    );
+    validate_optional_path(name, "output_dir", fixture.output_dir.as_deref(), issues);
+    validate_optional_path(
+        name,
+        "summary_baseline",
+        fixture.summary_baseline.as_deref(),
+        issues,
+    );
+    validate_optional_sha256(
+        name,
+        "summary_baseline_sha256",
+        fixture.summary_baseline_sha256.as_deref(),
+        issues,
+    );
+    validate_optional_path(
+        name,
+        "calibration_profile",
+        fixture.calibration_profile.as_deref(),
+        issues,
+    );
+    validate_optional_sha256(
+        name,
+        "calibration_profile_sha256",
+        fixture.calibration_profile_sha256.as_deref(),
+        issues,
+    );
+    validate_optional_path(
+        name,
+        "calibration_library",
+        fixture.calibration_library.as_deref(),
+        issues,
+    );
+    validate_optional_sha256(
+        name,
+        "calibration_library_sha256",
+        fixture.calibration_library_sha256.as_deref(),
+        issues,
+    );
+    validate_optional_label(
+        name,
+        "scanner_profile",
+        fixture.scanner_profile.as_deref(),
+        issues,
+    );
+    validate_optional_label(
+        name,
+        "roll_profile",
+        fixture.roll_profile.as_deref(),
+        issues,
+    );
+    validate_optional_label(name, "film_stock", fixture.film_stock.as_deref(), issues);
+    validate_optional_label(
+        name,
+        "calibration_case",
+        fixture.calibration_case.as_deref(),
+        issues,
+    );
+    validate_fixture_expectations(name, &fixture.expectations, issues);
+    validate_optional_label(name, "description", fixture.description.as_deref(), issues);
+    validate_unique_non_empty_values(&format!("{name}:scene_tag"), &fixture.scene_tags, issues);
+    validate_unique_non_empty_values(
+        &format!("{name}:exposure_tag"),
+        &fixture.exposure_tags,
+        issues,
+    );
+    validate_unique_non_empty_values(
+        &format!("{name}:reference_evidence"),
+        &fixture.reference_evidence,
+        issues,
+    );
+
+    if fixture.calibration_profile.is_some() && fixture.calibration_library.is_some() {
+        issues.push(format!(
+            "{name}:calibration_profile_and_calibration_library_both_declared"
+        ));
+    }
+    if fixture.component1_sha256.is_some() != fixture.component2_sha256.is_some() {
+        issues.push(format!("{name}:component_sha256_pair_incomplete"));
+    }
+    if fixture.summary_baseline_sha256.is_some() && fixture.summary_baseline.is_none() {
+        issues.push(format!(
+            "{name}:summary_baseline_sha256_without_summary_baseline"
+        ));
+    }
+    if fixture.calibration_profile_sha256.is_some() && fixture.calibration_profile.is_none() {
+        issues.push(format!(
+            "{name}:calibration_profile_sha256_without_calibration_profile"
+        ));
+    }
+    if fixture.calibration_library_sha256.is_some() && fixture.calibration_library.is_none() {
+        issues.push(format!(
+            "{name}:calibration_library_sha256_without_calibration_library"
+        ));
+    }
+    if fixture.calibration_library.is_none()
+        && (fixture.scanner_profile.is_some() || fixture.roll_profile.is_some())
+    {
+        issues.push(format!("{name}:profile_id_without_calibration_library"));
+    }
+    if fixture.roll_profile.is_some() && fixture.scanner_profile.is_none() {
+        issues.push(format!("{name}:roll_profile_without_scanner_profile"));
+    }
+
+    match fixture.calibration_case.as_deref() {
+        Some("scanner-roll-library") => {
+            if fixture.calibration_library.is_none() {
+                issues.push(format!(
+                    "{name}:scanner_roll_library_case_without_calibration_library"
+                ));
+            }
+            if fixture.scanner_profile.is_none() {
+                issues.push(format!(
+                    "{name}:scanner_roll_library_case_without_scanner_profile"
+                ));
+            }
+        }
+        Some("external-profile") => {
+            if fixture.calibration_profile.is_none() {
+                issues.push(format!(
+                    "{name}:external_profile_case_without_calibration_profile"
+                ));
+            }
+        }
+        Some("uncalibrated-image-derived") => {
+            if fixture.calibration_profile.is_some() {
+                issues.push(format!(
+                    "{name}:uncalibrated_case_declares_calibration_profile"
+                ));
+            }
+            if fixture.calibration_library.is_some() {
+                issues.push(format!(
+                    "{name}:uncalibrated_case_declares_calibration_library"
+                ));
+            }
+            if fixture.scanner_profile.is_some() {
+                issues.push(format!("{name}:uncalibrated_case_declares_scanner_profile"));
+            }
+            if fixture.roll_profile.is_some() {
+                issues.push(format!("{name}:uncalibrated_case_declares_roll_profile"));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn validate_fixture_expectations(
+    fixture_name: &str,
+    expectations: &FixtureExpectations,
+    issues: &mut Vec<String>,
+) {
+    validate_optional_label(
+        fixture_name,
+        "expectations.stitch_decision",
+        expectations.stitch_decision.as_deref(),
+        issues,
+    );
+    validate_optional_label(
+        fixture_name,
+        "expectations.base_estimate_source",
+        expectations.base_estimate_source.as_deref(),
+        issues,
+    );
+    validate_optional_label(
+        fixture_name,
+        "expectations.output_color_space",
+        expectations.output_color_space.as_deref(),
+        issues,
+    );
+    validate_optional_label(
+        fixture_name,
+        "expectations.render_input_source",
+        expectations.render_input_source.as_deref(),
+        issues,
+    );
+    validate_optional_label(
+        fixture_name,
+        "expectations.render_input_reason_contains",
+        expectations.render_input_reason_contains.as_deref(),
+        issues,
+    );
+    validate_optional_label(
+        fixture_name,
+        "expectations.mapping_strategy",
+        expectations.mapping_strategy.as_deref(),
+        issues,
+    );
+    validate_optional_label(
+        fixture_name,
+        "expectations.selected_mapping_reason_contains",
+        expectations.selected_mapping_reason_contains.as_deref(),
+        issues,
+    );
+    validate_optional_label(
+        fixture_name,
+        "expectations.selected_candidate",
+        expectations.selected_candidate.as_deref(),
+        issues,
+    );
+    validate_optional_label(
+        fixture_name,
+        "expectations.calibration_acceptance_status",
+        expectations.calibration_acceptance_status.as_deref(),
+        issues,
+    );
+    validate_optional_label(
+        fixture_name,
+        "expectations.candidate_risk",
+        expectations.candidate_risk.as_deref(),
+        issues,
+    );
+    validate_optional_label(
+        fixture_name,
+        "expectations.tone_color_trust_state",
+        expectations.tone_color_trust_state.as_deref(),
+        issues,
+    );
+    validate_unique_non_empty_values(
+        &format!("{fixture_name}:expectations.debug_artifact_kinds_required"),
+        &expectations.debug_artifact_kinds_required,
+        issues,
+    );
+    validate_unique_non_empty_values(
+        &format!("{fixture_name}:expectations.candidate_acceptance_signatures_required"),
+        &expectations.candidate_acceptance_signatures_required,
+        issues,
+    );
+    validate_unique_non_empty_values(
+        &format!("{fixture_name}:expectations.calibration_rejection_details_required"),
+        &expectations.calibration_rejection_details_required,
+        issues,
+    );
+    validate_unique_non_empty_values(
+        &format!("{fixture_name}:expectations.selection_rejections_required"),
+        &expectations.selection_rejections_required,
+        issues,
+    );
+    for kind in &expectations.debug_artifact_kinds_required {
+        let kind = kind.trim();
+        if !kind.is_empty() && !is_known_debug_artifact_kind(kind) {
+            issues.push(format!(
+                "{fixture_name}:expectations.debug_artifact_kinds_required_unknown:{kind}"
+            ));
+        }
+    }
+    if expectations
+        .selected_quality_score_max
+        .is_some_and(|value| value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.selected_quality_score_max_out_of_range"
+        ));
+    }
+    if expectations
+        .highlight_chroma_compressed_ratio_min
+        .is_some_and(|value| !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.highlight_chroma_compressed_ratio_min_out_of_range"
+        ));
+    }
+    if expectations
+        .highlight_chroma_compressed_ratio_max
+        .is_some_and(|value| !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.highlight_chroma_compressed_ratio_max_out_of_range"
+        ));
+    }
+    if expectations
+        .highlight_neutral_chroma_compressed_ratio_max
+        .is_some_and(|value| !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.highlight_neutral_chroma_compressed_ratio_max_out_of_range"
+        ));
+    }
+    if expectations
+        .shadow_chroma_compressed_ratio_max
+        .is_some_and(|value| !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.shadow_chroma_compressed_ratio_max_out_of_range"
+        ));
+    }
+    if expectations
+        .calibration_confidence_min
+        .is_some_and(|value| !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.calibration_confidence_min_out_of_range"
+        ));
+    }
+    if expectations
+        .calibration_matrix_condition_number_max
+        .is_some_and(|value| value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.calibration_matrix_condition_number_max_out_of_range"
+        ));
+    }
+    if expectations
+        .technical_safety_score_max
+        .is_some_and(|value| value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.technical_safety_score_max_out_of_range"
+        ));
+    }
+    if expectations
+        .color_fidelity_score_max
+        .is_some_and(|value| value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.color_fidelity_score_max_out_of_range"
+        ));
+    }
+    if expectations
+        .memory_color_penalty_max
+        .is_some_and(|value| value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.memory_color_penalty_max_out_of_range"
+        ));
+    }
+    if expectations
+        .spatial_consistency_penalty_max
+        .is_some_and(|value| value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.spatial_consistency_penalty_max_out_of_range"
+        ));
+    }
+    if expectations
+        .selected_runner_up_quality_delta_min
+        .is_some_and(|value| value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.selected_runner_up_quality_delta_min_out_of_range"
+        ));
+    }
+    if expectations
+        .density_monotonicity_score_min
+        .is_some_and(|value| value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.density_monotonicity_score_min_out_of_range"
+        ));
+    }
+    if expectations
+        .hue_linearity_score_min
+        .is_some_and(|value| value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.hue_linearity_score_min_out_of_range"
+        ));
+    }
+    if expectations
+        .saturation_preservation_median_ratio_min
+        .is_some_and(|value| value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.saturation_preservation_median_ratio_min_out_of_range"
+        ));
+    }
+    if expectations
+        .spatial_neutral_delta_p95_max
+        .is_some_and(|value| value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.spatial_neutral_delta_p95_max_out_of_range"
+        ));
+    }
+    if expectations
+        .post_scale_preserved_ratio_min
+        .is_some_and(|value| !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.post_scale_preserved_ratio_min_out_of_range"
+        ));
+    }
+    if expectations
+        .reference_patch_rms_delta_e_max
+        .is_some_and(|value| value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.reference_patch_rms_delta_e_max_out_of_range"
+        ));
+    }
+    if expectations
+        .reference_patch_rms_delta_e2000_max
+        .is_some_and(|value| value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.reference_patch_rms_delta_e2000_max_out_of_range"
+        ));
+    }
+}
+
+fn is_known_debug_artifact_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "candidate_comparison" | "gamut_clipping_map" | "scene_referred_prophoto_float"
+    )
+}
+
+fn validate_required_path(
+    fixture_name: &str,
+    field_name: &str,
+    path: &Path,
+    issues: &mut Vec<String>,
+) {
+    if path.as_os_str().is_empty() {
+        issues.push(format!("{fixture_name}:{field_name}_empty"));
+    }
+}
+
+fn validate_optional_path(
+    fixture_name: &str,
+    field_name: &str,
+    path: Option<&Path>,
+    issues: &mut Vec<String>,
+) {
+    if path.is_some_and(|path| path.as_os_str().is_empty()) {
+        issues.push(format!("{fixture_name}:{field_name}_empty"));
+    }
+}
+
+fn validate_optional_label(
+    fixture_name: &str,
+    field_name: &str,
+    value: Option<&str>,
+    issues: &mut Vec<String>,
+) {
+    if value.is_some_and(|value| value.trim().is_empty()) {
+        issues.push(format!("{fixture_name}:{field_name}_empty"));
+    }
+}
+
+fn validate_optional_sha256(
+    fixture_name: &str,
+    field_name: &str,
+    value: Option<&str>,
+    issues: &mut Vec<String>,
+) {
+    if value.is_some_and(|value| !is_valid_sha256_hex(value)) {
+        issues.push(format!("{fixture_name}:{field_name}_invalid"));
+    }
+}
+
+fn is_valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_unique_non_empty_values(prefix: &str, values: &[String], issues: &mut Vec<String>) {
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            issues.push(format!("{prefix}_empty"));
+        } else if !seen.insert(trimmed) {
+            issues.push(format!("{prefix}_duplicate:{trimmed}"));
+        }
+    }
+}
+
+fn validate_required_pair_labels(prefix: &str, values: &[String], issues: &mut Vec<String>) {
+    validate_unique_non_empty_values(prefix, values, issues);
+    for value in values {
+        if !is_valid_pair_label(value) {
+            issues.push(format!("{prefix}_invalid:{value}"));
+        }
+    }
+}
+
+fn is_valid_pair_label(value: &str) -> bool {
+    let Some((left, right)) = value.split_once('|') else {
+        return false;
+    };
+    !left.trim().is_empty() && !right.trim().is_empty() && !right.contains('|')
+}
+
+fn fixture_calibration_label(fixture: &FixtureEntry) -> String {
+    if let Some(profile) = &fixture.calibration_profile {
+        format!("profile={}", profile.display())
+    } else if let Some(library) = &fixture.calibration_library {
+        format!("library={}", library.display())
+    } else {
+        String::new()
+    }
+}
+
+fn fixture_coverage_summary(
+    fixtures: &BTreeMap<String, FixtureEntry>,
+    requirements: &FixtureCoverageRequirements,
+    compute_fixture_hashes: bool,
+) -> FixtureCoverageSummary {
+    let mut entries = Vec::new();
+    let mut issues = Vec::new();
+
+    for (name, fixture) in fixtures {
+        let entry = fixture_coverage_entry(name, fixture, requirements, compute_fixture_hashes);
+        issues.extend(entry.issues.iter().cloned());
+        entries.push(entry);
+    }
+
+    let component_pair_available_count = entries
+        .iter()
+        .filter(|entry| entry.component1_exists && entry.component2_exists)
+        .count();
+    let component_sha256_declared_pair_count = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .component1_sha256
+                .as_ref()
+                .is_some_and(|probe| probe.expected_sha256.is_some())
+                && entry
+                    .component2_sha256
+                    .as_ref()
+                    .is_some_and(|probe| probe.expected_sha256.is_some())
+        })
+        .count();
+    let component_sha256_computed_pair_count = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .component1_sha256
+                .as_ref()
+                .is_some_and(|probe| probe.actual_sha256.is_some())
+                && entry
+                    .component2_sha256
+                    .as_ref()
+                    .is_some_and(|probe| probe.actual_sha256.is_some())
+        })
+        .count();
+    let component_sha256_pair_count = entries
+        .iter()
+        .filter(|entry| {
+            entry.validation_ready
+                && entry
+                    .component1_sha256
+                    .as_ref()
+                    .is_some_and(|probe| probe.matched)
+                && entry
+                    .component2_sha256
+                    .as_ref()
+                    .is_some_and(|probe| probe.matched)
+        })
+        .count();
+    let readable_tiff_pair_count = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .component1_tiff
+                .as_ref()
+                .is_some_and(|probe| probe.readable)
+                && entry
+                    .component2_tiff
+                    .as_ref()
+                    .is_some_and(|probe| probe.readable)
+        })
+        .count();
+    let tiff_layout_consistent_pair_count = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .tiff_pair
+                .as_ref()
+                .is_some_and(|pair| pair.layout_consistent)
+        })
+        .count();
+    let tiff_dimension_matched_pair_count = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .tiff_pair
+                .as_ref()
+                .is_some_and(|pair| pair.dimension_matched)
+        })
+        .count();
+    let validation_ready_fixture_count = entries
+        .iter()
+        .filter(|entry| entry.validation_ready)
+        .count();
+    let summary_baseline_declared_count = entries
+        .iter()
+        .filter(|entry| entry.summary_baseline.is_some())
+        .count();
+    let summary_baseline_file_count = entries
+        .iter()
+        .filter(|entry| entry.summary_baseline_exists == Some(true))
+        .count();
+    let summary_baseline_parseable_count = entries
+        .iter()
+        .filter(|entry| entry.summary_baseline_parse_status.as_deref() == Some("valid"))
+        .count();
+    let summary_baseline_contract_complete_count = entries
+        .iter()
+        .filter(|entry| entry.summary_baseline_valid)
+        .count();
+    let summary_baseline_count = summary_baseline_contract_complete_count;
+    let summary_baseline_sha256_declared_count = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .summary_baseline_sha256
+                .as_ref()
+                .is_some_and(|probe| probe.expected_sha256.is_some())
+        })
+        .count();
+    let summary_baseline_sha256_computed_count = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .summary_baseline_sha256
+                .as_ref()
+                .is_some_and(|probe| probe.actual_sha256.is_some())
+        })
+        .count();
+    let summary_baseline_sha256_count = entries
+        .iter()
+        .filter(|entry| {
+            entry.validation_ready
+                && entry
+                    .summary_baseline_sha256
+                    .as_ref()
+                    .is_some_and(|probe| probe.matched)
+        })
+        .count();
+    let calibration_evidence_declared_count = entries
+        .iter()
+        .filter(|entry| entry.calibration_evidence_declared)
+        .count();
+    let calibration_evidence_count = entries
+        .iter()
+        .filter(|entry| entry.calibration_evidence_usable)
+        .count();
+    let calibration_evidence_unusable_count =
+        calibration_evidence_declared_count.saturating_sub(calibration_evidence_count);
+    let calibration_sha256_declared_count = entries
+        .iter()
+        .filter(|entry| {
+            fixture_calibration_sha256_probe(entry)
+                .is_some_and(|probe| probe.expected_sha256.is_some())
+        })
+        .count();
+    let calibration_sha256_computed_count = entries
+        .iter()
+        .filter(|entry| {
+            fixture_calibration_sha256_probe(entry)
+                .is_some_and(|probe| probe.actual_sha256.is_some())
+        })
+        .count();
+    let calibration_sha256_count = entries
+        .iter()
+        .filter(|entry| {
+            entry.validation_ready
+                && fixture_calibration_sha256_probe(entry).is_some_and(|probe| probe.matched)
+        })
+        .count();
+    let uncalibrated_fixture_count = entries
+        .iter()
+        .filter(|entry| entry.validation_ready && !entry.calibration_evidence_declared)
+        .count();
+    let scanner_profile_count = entries
+        .iter()
+        .filter(|entry| entry.validation_ready && entry.scanner_profile.is_some())
+        .count();
+    let unique_scanner_profiles = entries
+        .iter()
+        .filter(|entry| entry.validation_ready)
+        .filter_map(|entry| entry.scanner_profile.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let roll_profile_count = entries
+        .iter()
+        .filter(|entry| entry.validation_ready && entry.roll_profile.is_some())
+        .count();
+    let unique_roll_profiles = entries
+        .iter()
+        .filter(|entry| entry.validation_ready)
+        .filter_map(|entry| entry.roll_profile.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let film_stock_count = entries
+        .iter()
+        .filter(|entry| entry.validation_ready && entry.film_stock.is_some())
+        .count();
+    let unique_film_stocks = entries
+        .iter()
+        .filter(|entry| entry.validation_ready)
+        .filter_map(|entry| entry.film_stock.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let scene_tags = entries
+        .iter()
+        .filter(|entry| entry.validation_ready)
+        .flat_map(|entry| entry.scene_tags.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let exposure_tags = entries
+        .iter()
+        .filter(|entry| entry.validation_ready)
+        .flat_map(|entry| entry.exposure_tags.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let calibration_cases = entries
+        .iter()
+        .filter(|entry| entry.validation_ready)
+        .filter_map(|entry| entry.calibration_case.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let reference_fixture_count = entries
+        .iter()
+        .filter(|entry| entry.validation_ready && !entry.reference_evidence.is_empty())
+        .count();
+    let reference_evidence = entries
+        .iter()
+        .filter(|entry| entry.validation_ready)
+        .flat_map(|entry| entry.reference_evidence.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let reference_patch_fixture_count = entries
+        .iter()
+        .filter(|entry| {
+            entry.validation_ready && entry.calibration_reference_patch_count.unwrap_or(0) > 0
+        })
+        .count();
+    let reference_patch_count = entries
+        .iter()
+        .filter(|entry| entry.validation_ready)
+        .filter_map(|entry| entry.calibration_reference_patch_count)
+        .sum::<usize>();
+    let debug_artifact_expectation_fixture_count = entries
+        .iter()
+        .filter(|entry| {
+            entry.validation_ready
+                && (entry.debug_artifacts_required
+                    || !entry.debug_artifact_kinds_required.is_empty())
+        })
+        .count();
+    let debug_artifact_kinds_required = entries
+        .iter()
+        .filter(|entry| entry.validation_ready)
+        .flat_map(|entry| entry.debug_artifact_kinds_required.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let missing_required_scanner_profiles = missing_required_values(
+        &requirements.required_scanner_profiles,
+        &unique_scanner_profiles,
+    );
+    let missing_required_roll_profiles =
+        missing_required_values(&requirements.required_roll_profiles, &unique_roll_profiles);
+    let missing_required_film_stocks =
+        missing_required_values(&requirements.required_film_stocks, &unique_film_stocks);
+    let missing_required_scene_tags =
+        missing_required_values(&requirements.required_scene_tags, &scene_tags);
+    let missing_required_exposure_tags =
+        missing_required_values(&requirements.required_exposure_tags, &exposure_tags);
+    let missing_required_calibration_cases =
+        missing_required_values(&requirements.required_calibration_cases, &calibration_cases);
+    let missing_required_reference_evidence = missing_required_values(
+        &requirements.required_reference_evidence,
+        &reference_evidence,
+    );
+    let film_stock_calibration_pairs = fixture_film_stock_calibration_pairs(&entries);
+    let scene_exposure_pairs = fixture_scene_exposure_pairs(&entries);
+    let missing_required_film_stock_calibration_pairs = missing_required_values(
+        &requirements.required_film_stock_calibration_pairs,
+        &film_stock_calibration_pairs,
+    );
+    let missing_required_scene_exposure_pairs = missing_required_values(
+        &requirements.required_scene_exposure_pairs,
+        &scene_exposure_pairs,
+    );
+    let missing_required_debug_artifact_kinds = missing_required_values(
+        &requirements.required_debug_artifact_kinds,
+        &debug_artifact_kinds_required,
+    );
+    let mut action_items = fixture_coverage_action_items(
+        requirements,
+        validation_ready_fixture_count,
+        component_pair_available_count,
+        component_sha256_pair_count,
+        readable_tiff_pair_count,
+        tiff_layout_consistent_pair_count,
+        tiff_dimension_matched_pair_count,
+        summary_baseline_count,
+        summary_baseline_sha256_count,
+        calibration_evidence_count,
+        calibration_sha256_count,
+        uncalibrated_fixture_count,
+        unique_scanner_profiles.len(),
+        unique_roll_profiles.len(),
+        unique_film_stocks.len(),
+        scene_tags.len(),
+        exposure_tags.len(),
+        calibration_cases.len(),
+        reference_fixture_count,
+        reference_evidence.len(),
+        reference_patch_fixture_count,
+        reference_patch_count,
+        debug_artifact_expectation_fixture_count,
+        film_stock_calibration_pairs.len(),
+        scene_exposure_pairs.len(),
+        &missing_required_film_stocks,
+        &missing_required_scene_tags,
+        &missing_required_exposure_tags,
+        &missing_required_calibration_cases,
+        &missing_required_scanner_profiles,
+        &missing_required_roll_profiles,
+        &missing_required_reference_evidence,
+        &missing_required_debug_artifact_kinds,
+        &missing_required_film_stock_calibration_pairs,
+        &missing_required_scene_exposure_pairs,
+    );
+    push_fixture_coverage_entry_actions(&mut action_items, &entries);
+
+    if calibration_evidence_count == 0 {
+        issues.push("fixture_coverage_no_calibrated_fixtures".to_string());
+    }
+    if validation_ready_fixture_count == 0 {
+        issues.push("fixture_coverage_no_validation_ready_fixtures".to_string());
+    }
+    if film_stock_count == 0 {
+        issues.push("fixture_coverage_no_film_stock_metadata".to_string());
+    }
+    if scene_tags.is_empty() {
+        issues.push("fixture_coverage_no_scene_metadata".to_string());
+    }
+    if exposure_tags.is_empty() {
+        issues.push("fixture_coverage_no_exposure_metadata".to_string());
+    }
+    if calibration_cases.is_empty() {
+        issues.push("fixture_coverage_no_calibration_case_metadata".to_string());
+    }
+    apply_coverage_requirements(
+        requirements,
+        validation_ready_fixture_count,
+        component_pair_available_count,
+        component_sha256_pair_count,
+        readable_tiff_pair_count,
+        tiff_layout_consistent_pair_count,
+        tiff_dimension_matched_pair_count,
+        summary_baseline_count,
+        summary_baseline_sha256_count,
+        calibration_evidence_count,
+        calibration_sha256_count,
+        uncalibrated_fixture_count,
+        &unique_scanner_profiles,
+        &unique_roll_profiles,
+        &unique_film_stocks,
+        &scene_tags,
+        &exposure_tags,
+        &calibration_cases,
+        reference_fixture_count,
+        &reference_evidence,
+        reference_patch_fixture_count,
+        reference_patch_count,
+        debug_artifact_expectation_fixture_count,
+        &debug_artifact_kinds_required,
+        &film_stock_calibration_pairs,
+        &scene_exposure_pairs,
+        &mut issues,
+    );
+
+    FixtureCoverageSummary {
+        status: if issues.is_empty() {
+            "passed".to_string()
+        } else {
+            "review_required".to_string()
+        },
+        fixture_count: entries.len(),
+        component_pair_available_count,
+        component_sha256_declared_pair_count,
+        component_sha256_computed_pair_count,
+        component_sha256_pair_count,
+        readable_tiff_pair_count,
+        tiff_layout_consistent_pair_count,
+        tiff_dimension_matched_pair_count,
+        validation_ready_fixture_count,
+        summary_baseline_declared_count,
+        summary_baseline_file_count,
+        summary_baseline_parseable_count,
+        summary_baseline_contract_complete_count,
+        summary_baseline_count,
+        summary_baseline_sha256_declared_count,
+        summary_baseline_sha256_computed_count,
+        summary_baseline_sha256_count,
+        calibration_evidence_declared_count,
+        calibration_evidence_count,
+        calibration_evidence_unusable_count,
+        calibration_sha256_declared_count,
+        calibration_sha256_computed_count,
+        calibration_sha256_count,
+        uncalibrated_fixture_count,
+        scanner_profile_count,
+        unique_scanner_profiles,
+        missing_required_scanner_profiles,
+        roll_profile_count,
+        unique_roll_profiles,
+        missing_required_roll_profiles,
+        film_stock_count,
+        unique_film_stocks,
+        missing_required_film_stocks,
+        scene_tag_count: scene_tags.len(),
+        scene_tags,
+        missing_required_scene_tags,
+        exposure_tag_count: exposure_tags.len(),
+        exposure_tags,
+        missing_required_exposure_tags,
+        calibration_case_count: calibration_cases.len(),
+        calibration_cases,
+        missing_required_calibration_cases,
+        reference_fixture_count,
+        reference_evidence_type_count: reference_evidence.len(),
+        reference_evidence,
+        missing_required_reference_evidence,
+        reference_patch_fixture_count,
+        reference_patch_count,
+        debug_artifact_expectation_fixture_count,
+        debug_artifact_kinds_required,
+        missing_required_debug_artifact_kinds,
+        film_stock_calibration_pair_count: film_stock_calibration_pairs.len(),
+        film_stock_calibration_pairs,
+        missing_required_film_stock_calibration_pairs,
+        scene_exposure_pair_count: scene_exposure_pairs.len(),
+        scene_exposure_pairs,
+        missing_required_scene_exposure_pairs,
+        coverage_requirements: requirements.clone(),
+        fixtures: entries,
+        action_items,
+        issues,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fixture_coverage_action_items(
+    requirements: &FixtureCoverageRequirements,
+    validation_ready_fixture_count: usize,
+    component_pair_available_count: usize,
+    component_sha256_pair_count: usize,
+    readable_tiff_pair_count: usize,
+    tiff_layout_consistent_pair_count: usize,
+    tiff_dimension_matched_pair_count: usize,
+    summary_baseline_count: usize,
+    summary_baseline_sha256_count: usize,
+    calibration_evidence_count: usize,
+    calibration_sha256_count: usize,
+    uncalibrated_fixture_count: usize,
+    unique_scanner_profile_count: usize,
+    unique_roll_profile_count: usize,
+    unique_film_stock_count: usize,
+    scene_tag_count: usize,
+    exposure_tag_count: usize,
+    calibration_case_count: usize,
+    reference_fixture_count: usize,
+    reference_evidence_type_count: usize,
+    reference_patch_fixture_count: usize,
+    reference_patch_count: usize,
+    debug_artifact_expectation_fixture_count: usize,
+    film_stock_calibration_pair_count: usize,
+    scene_exposure_pair_count: usize,
+    missing_required_film_stocks: &[String],
+    missing_required_scene_tags: &[String],
+    missing_required_exposure_tags: &[String],
+    missing_required_calibration_cases: &[String],
+    missing_required_scanner_profiles: &[String],
+    missing_required_roll_profiles: &[String],
+    missing_required_reference_evidence: &[String],
+    missing_required_debug_artifact_kinds: &[String],
+    missing_required_film_stock_calibration_pairs: &[String],
+    missing_required_scene_exposure_pairs: &[String],
+) -> Vec<String> {
+    let mut actions = Vec::new();
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_validation_ready_fixtures",
+        requirements.min_fixtures,
+        validation_ready_fixture_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_component_pairs",
+        requirements.min_component_pairs,
+        component_pair_available_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "pin_component_sha256_pairs_for_validation_ready_fixtures",
+        requirements.min_component_sha256_pairs,
+        component_sha256_pair_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_readable_tiff_pairs",
+        requirements.min_readable_tiff_pairs,
+        readable_tiff_pair_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_tiff_layout_consistent_pairs",
+        requirements.min_tiff_layout_consistent_pairs,
+        tiff_layout_consistent_pair_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_tiff_dimension_matched_pairs",
+        requirements.min_tiff_dimension_matched_pairs,
+        tiff_dimension_matched_pair_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_complete_summary_baselines",
+        requirements.min_summary_baselines,
+        summary_baseline_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "pin_summary_baseline_sha256_for_validation_ready_fixtures",
+        requirements.min_summary_baseline_sha256_fixtures,
+        summary_baseline_sha256_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_validation_ready_calibrated_fixtures",
+        requirements.min_calibrated_fixtures,
+        calibration_evidence_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "pin_calibration_sha256_for_validation_ready_fixtures",
+        requirements.min_calibration_sha256_fixtures,
+        calibration_sha256_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_validation_ready_uncalibrated_fixtures",
+        requirements.min_uncalibrated_fixtures,
+        uncalibrated_fixture_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_unique_scanner_profile_coverage",
+        requirements.min_unique_scanner_profiles,
+        unique_scanner_profile_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_unique_roll_profile_coverage",
+        requirements.min_unique_roll_profiles,
+        unique_roll_profile_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_unique_film_stock_coverage",
+        requirements.min_unique_film_stocks,
+        unique_film_stock_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_scene_tag_coverage",
+        requirements.min_scene_tags,
+        scene_tag_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_exposure_tag_coverage",
+        requirements.min_exposure_tags,
+        exposure_tag_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_calibration_case_coverage",
+        requirements.min_calibration_cases,
+        calibration_case_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_film_stock_calibration_pairs",
+        requirements.min_film_stock_calibration_pairs,
+        film_stock_calibration_pair_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_scene_exposure_pairs",
+        requirements.min_scene_exposure_pairs,
+        scene_exposure_pair_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_reference_fixtures",
+        requirements.min_reference_fixtures,
+        reference_fixture_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_reference_evidence_types",
+        requirements.min_reference_evidence_types,
+        reference_evidence_type_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_reference_patch_fixtures",
+        requirements.min_reference_patch_fixtures,
+        reference_patch_fixture_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_reference_patches",
+        requirements.min_reference_patch_count,
+        reference_patch_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_debug_artifact_expectation_fixtures",
+        requirements.min_debug_artifact_expectation_fixtures,
+        debug_artifact_expectation_fixture_count,
+    );
+    if validation_ready_fixture_count == 0 {
+        actions.push("add_validation_ready_fixture".to_string());
+    }
+    push_fixture_coverage_actions(
+        &mut actions,
+        "add_validation_ready_fixture_for_film_stock",
+        missing_required_film_stocks,
+    );
+    push_fixture_coverage_actions(
+        &mut actions,
+        "add_validation_ready_fixture_for_scene_tag",
+        missing_required_scene_tags,
+    );
+    push_fixture_coverage_actions(
+        &mut actions,
+        "add_validation_ready_fixture_for_exposure_tag",
+        missing_required_exposure_tags,
+    );
+    push_fixture_coverage_actions(
+        &mut actions,
+        "add_validation_ready_fixture_for_calibration_case",
+        missing_required_calibration_cases,
+    );
+    push_fixture_coverage_actions(
+        &mut actions,
+        "add_validation_ready_fixture_for_scanner_profile",
+        missing_required_scanner_profiles,
+    );
+    push_fixture_coverage_actions(
+        &mut actions,
+        "add_validation_ready_fixture_for_roll_profile",
+        missing_required_roll_profiles,
+    );
+    push_fixture_coverage_actions(
+        &mut actions,
+        "add_validation_ready_fixture_with_reference_evidence",
+        missing_required_reference_evidence,
+    );
+    push_fixture_coverage_actions(
+        &mut actions,
+        "declare_debug_artifact_expectation_for_validation_ready_fixture",
+        missing_required_debug_artifact_kinds,
+    );
+    push_fixture_coverage_actions(
+        &mut actions,
+        "add_validation_ready_fixture_for_film_stock_calibration_pair",
+        missing_required_film_stock_calibration_pairs,
+    );
+    push_fixture_coverage_actions(
+        &mut actions,
+        "add_validation_ready_fixture_for_scene_exposure_pair",
+        missing_required_scene_exposure_pairs,
+    );
+    actions
+}
+
+fn push_fixture_coverage_actions(actions: &mut Vec<String>, prefix: &str, values: &[String]) {
+    actions.extend(values.iter().map(|value| format!("{prefix}:{value}")));
+}
+
+fn push_fixture_coverage_min_action(
+    actions: &mut Vec<String>,
+    prefix: &str,
+    minimum: Option<usize>,
+    actual: usize,
+) {
+    if let Some(minimum) = minimum {
+        if actual < minimum {
+            actions.push(format!("{prefix}:{}", minimum - actual));
+        }
+    }
+}
+
+fn push_fixture_coverage_entry_actions(
+    actions: &mut Vec<String>,
+    entries: &[FixtureCoverageEntry],
+) {
+    for entry in entries {
+        actions.extend(entry.action_items.iter().cloned());
+    }
+}
+
+fn fixture_coverage_entry_actions(entry: &FixtureCoverageEntry) -> Vec<String> {
+    let mut actions = Vec::new();
+    let name = entry.name.as_str();
+    if !entry.component1_exists {
+        actions.push(format!("provide_component1_for_fixture:{name}"));
+    } else if fixture_coverage_entry_has_issue_prefix(entry, "component1_tiff_") {
+        actions.push(format!("repair_component1_tiff_for_fixture:{name}"));
+    }
+    if fixture_coverage_entry_has_issue(entry, "component1_tiff_bits_below_min") {
+        actions.push(format!(
+            "replace_component1_with_minimum_bit_depth_tiff_for_fixture:{name}"
+        ));
+    }
+    if !entry.component2_exists {
+        actions.push(format!("provide_component2_for_fixture:{name}"));
+    } else if fixture_coverage_entry_has_issue_prefix(entry, "component2_tiff_") {
+        actions.push(format!("repair_component2_tiff_for_fixture:{name}"));
+    }
+    if fixture_coverage_entry_has_issue(entry, "component2_tiff_bits_below_min") {
+        actions.push(format!(
+            "replace_component2_with_minimum_bit_depth_tiff_for_fixture:{name}"
+        ));
+    }
+    if fixture_coverage_entry_has_issue(entry, "tiff_pair_layout_mismatch") {
+        actions.push(format!(
+            "replace_component_pair_with_layout_matched_tiffs_for_fixture:{name}"
+        ));
+    }
+    if fixture_coverage_entry_has_issue(entry, "tiff_pair_dimensions_mismatch") {
+        actions.push(format!(
+            "replace_component_pair_with_dimension_matched_tiffs_for_fixture:{name}"
+        ));
+    }
+    if fixture_coverage_entry_has_issue_prefix(entry, "component1_sha256_") {
+        actions.push(format!("update_component1_sha256_for_fixture:{name}"));
+    }
+    if fixture_coverage_entry_has_issue_prefix(entry, "component2_sha256_") {
+        actions.push(format!("update_component2_sha256_for_fixture:{name}"));
+    }
+
+    match (
+        entry.summary_baseline.as_ref(),
+        entry.summary_baseline_exists,
+        entry.summary_baseline_parse_status.as_deref(),
+        entry.summary_baseline_contract_status.as_deref(),
+    ) {
+        (None, _, _, _) => actions.push(format!("declare_summary_baseline_for_fixture:{name}")),
+        (Some(_), Some(false), _, _) => {
+            actions.push(format!("provide_summary_baseline_for_fixture:{name}"))
+        }
+        (Some(_), Some(true), Some("invalid"), _) => {
+            actions.push(format!("repair_summary_baseline_for_fixture:{name}"))
+        }
+        (Some(_), Some(true), _, Some("incomplete")) => {
+            actions.push(format!("complete_summary_baseline_for_fixture:{name}"))
+        }
+        _ => {}
+    }
+    if fixture_coverage_entry_has_issue_prefix(entry, "summary_baseline_sha256_") {
+        actions.push(format!("update_summary_baseline_sha256_for_fixture:{name}"));
+    }
+
+    match (
+        entry.calibration_profile.as_ref(),
+        entry.calibration_profile_exists,
+        entry.calibration_profile_parse_status.as_deref(),
+    ) {
+        (Some(_), Some(false), _) => {
+            actions.push(format!("provide_calibration_profile_for_fixture:{name}"))
+        }
+        (Some(_), Some(true), Some("invalid")) => {
+            actions.push(format!("repair_calibration_profile_for_fixture:{name}"))
+        }
+        _ => {}
+    }
+    if fixture_coverage_entry_has_issue_prefix(entry, "calibration_profile_sha256_") {
+        actions.push(format!(
+            "update_calibration_profile_sha256_for_fixture:{name}"
+        ));
+    }
+
+    match (
+        entry.calibration_library.as_ref(),
+        entry.calibration_library_exists,
+        entry.calibration_library_selection_status.as_deref(),
+    ) {
+        (Some(_), Some(false), _) => {
+            actions.push(format!("provide_calibration_library_for_fixture:{name}"))
+        }
+        (Some(_), Some(true), Some(status)) if status != "applied" => {
+            actions.push(format!("repair_calibration_library_for_fixture:{name}"))
+        }
+        _ => {}
+    }
+    if fixture_coverage_entry_has_issue_prefix(entry, "calibration_library_sha256_") {
+        actions.push(format!(
+            "update_calibration_library_sha256_for_fixture:{name}"
+        ));
+    }
+
+    if entry.film_stock.is_none() {
+        actions.push(format!("declare_film_stock_for_fixture:{name}"));
+    }
+    if entry.scene_tags.is_empty() {
+        actions.push(format!("declare_scene_tags_for_fixture:{name}"));
+    }
+    if entry.exposure_tags.is_empty() {
+        actions.push(format!("declare_exposure_tags_for_fixture:{name}"));
+    }
+    if entry.calibration_case.is_none() {
+        actions.push(format!("declare_calibration_case_for_fixture:{name}"));
+    }
+    if fixture_coverage_entry_has_issue(
+        entry,
+        "reference_patch_evaluation_required_without_calibration_patches",
+    ) {
+        actions.push(format!("add_reference_patches_for_fixture:{name}"));
+    }
+    actions
+}
+
+fn fixture_coverage_entry_repair_plan(entry: &FixtureCoverageEntry) -> Vec<FixtureRepairPlanItem> {
+    entry
+        .action_items
+        .iter()
+        .map(|action| fixture_coverage_repair_plan_item(entry, action))
+        .collect()
+}
+
+fn fixture_coverage_repair_plan_item(
+    entry: &FixtureCoverageEntry,
+    action: &str,
+) -> FixtureRepairPlanItem {
+    let mut paths = Vec::new();
+    let details = if action.starts_with("provide_component1_for_fixture:") {
+        paths.push(entry.component1.clone());
+        "Provide the first component TIFF declared by the fixture registry.".to_string()
+    } else if action.starts_with("provide_component2_for_fixture:") {
+        paths.push(entry.component2.clone());
+        "Provide the second component TIFF declared by the fixture registry.".to_string()
+    } else if action.starts_with("repair_component1_tiff_for_fixture:") {
+        paths.push(entry.component1.clone());
+        "Replace or repair component1 so it is a readable supported TIFF.".to_string()
+    } else if action.starts_with("repair_component2_tiff_for_fixture:") {
+        paths.push(entry.component2.clone());
+        "Replace or repair component2 so it is a readable supported TIFF.".to_string()
+    } else if action.starts_with("replace_component1_with_minimum_bit_depth_tiff_for_fixture:") {
+        paths.push(entry.component1.clone());
+        "Replace component1 with a TIFF that satisfies the registry minimum bit depth.".to_string()
+    } else if action.starts_with("replace_component2_with_minimum_bit_depth_tiff_for_fixture:") {
+        paths.push(entry.component2.clone());
+        "Replace component2 with a TIFF that satisfies the registry minimum bit depth.".to_string()
+    } else if action.starts_with("replace_component_pair_with_layout_matched_tiffs_for_fixture:") {
+        paths.extend([entry.component1.clone(), entry.component2.clone()]);
+        "Replace the component pair with TIFFs whose color type, bit depth, channel count, and alpha layout match.".to_string()
+    } else if action.starts_with("replace_component_pair_with_dimension_matched_tiffs_for_fixture:")
+    {
+        paths.extend([entry.component1.clone(), entry.component2.clone()]);
+        "Replace the component pair with TIFFs whose dimensions match.".to_string()
+    } else if action.starts_with("update_component1_sha256_for_fixture:") {
+        paths.push(entry.component1.clone());
+        "Update component1_sha256 after intentionally replacing or accepting the local component file.".to_string()
+    } else if action.starts_with("update_component2_sha256_for_fixture:") {
+        paths.push(entry.component2.clone());
+        "Update component2_sha256 after intentionally replacing or accepting the local component file.".to_string()
+    } else if action.starts_with("declare_summary_baseline_for_fixture:") {
+        "Declare a summary_baseline path for this fixture.".to_string()
+    } else if action.starts_with("provide_summary_baseline_for_fixture:") {
+        push_optional_path(&mut paths, entry.summary_baseline.as_ref());
+        "Provide the compact summary baseline declared by the fixture registry.".to_string()
+    } else if action.starts_with("repair_summary_baseline_for_fixture:") {
+        push_optional_path(&mut paths, entry.summary_baseline.as_ref());
+        "Repair the compact summary baseline so it parses as the validation baseline schema."
+            .to_string()
+    } else if action.starts_with("complete_summary_baseline_for_fixture:") {
+        push_optional_path(&mut paths, entry.summary_baseline.as_ref());
+        "Regenerate or complete the compact summary baseline so all tracked contract fields are present.".to_string()
+    } else if action.starts_with("update_summary_baseline_sha256_for_fixture:") {
+        push_optional_path(&mut paths, entry.summary_baseline.as_ref());
+        "Update summary_baseline_sha256 after intentionally replacing or accepting the baseline."
+            .to_string()
+    } else if action.starts_with("provide_calibration_profile_for_fixture:") {
+        push_optional_path(&mut paths, entry.calibration_profile.as_ref());
+        "Provide the external calibration profile declared by the fixture registry.".to_string()
+    } else if action.starts_with("repair_calibration_profile_for_fixture:") {
+        push_optional_path(&mut paths, entry.calibration_profile.as_ref());
+        "Repair the external calibration profile so it loads and validates.".to_string()
+    } else if action.starts_with("update_calibration_profile_sha256_for_fixture:") {
+        push_optional_path(&mut paths, entry.calibration_profile.as_ref());
+        "Update calibration_profile_sha256 after intentionally replacing or accepting the profile."
+            .to_string()
+    } else if action.starts_with("provide_calibration_library_for_fixture:") {
+        push_optional_path(&mut paths, entry.calibration_library.as_ref());
+        "Provide the calibration library declared by the fixture registry.".to_string()
+    } else if action.starts_with("repair_calibration_library_for_fixture:") {
+        push_optional_path(&mut paths, entry.calibration_library.as_ref());
+        "Repair the calibration library so the requested scanner, roll, and film-stock evidence can be selected.".to_string()
+    } else if action.starts_with("update_calibration_library_sha256_for_fixture:") {
+        push_optional_path(&mut paths, entry.calibration_library.as_ref());
+        "Update calibration_library_sha256 after intentionally replacing or accepting the library."
+            .to_string()
+    } else if action.starts_with("declare_film_stock_for_fixture:") {
+        "Declare fixture film_stock metadata.".to_string()
+    } else if action.starts_with("declare_scene_tags_for_fixture:") {
+        "Declare fixture scene_tags metadata.".to_string()
+    } else if action.starts_with("declare_exposure_tags_for_fixture:") {
+        "Declare fixture exposure_tags metadata.".to_string()
+    } else if action.starts_with("declare_calibration_case_for_fixture:") {
+        "Declare fixture calibration_case metadata.".to_string()
+    } else if action.starts_with("add_reference_patches_for_fixture:") {
+        push_optional_path(&mut paths, entry.calibration_profile.as_ref());
+        push_optional_path(&mut paths, entry.calibration_library.as_ref());
+        "Add target/reference patches to the selected calibration evidence for reference-patch validation.".to_string()
+    } else {
+        "Resolve the fixture coverage action reported by the validation harness.".to_string()
+    };
+
+    FixtureRepairPlanItem {
+        action: action.to_string(),
+        paths,
+        details,
+    }
+}
+
+fn push_optional_path(paths: &mut Vec<String>, path: Option<&String>) {
+    if let Some(path) = path {
+        paths.push(path.clone());
+    }
+}
+
+fn fixture_coverage_entry_has_issue_prefix(
+    entry: &FixtureCoverageEntry,
+    suffix_prefix: &str,
+) -> bool {
+    let issue_prefix = format!("{}:{suffix_prefix}", entry.name);
+    entry
+        .issues
+        .iter()
+        .any(|issue| issue.starts_with(&issue_prefix))
+}
+
+fn fixture_coverage_entry_has_issue(entry: &FixtureCoverageEntry, suffix: &str) -> bool {
+    let issue = format!("{}:{suffix}", entry.name);
+    entry.issues.iter().any(|entry_issue| entry_issue == &issue)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_coverage_requirements(
+    requirements: &FixtureCoverageRequirements,
+    fixture_count: usize,
+    component_pair_available_count: usize,
+    component_sha256_pair_count: usize,
+    readable_tiff_pair_count: usize,
+    tiff_layout_consistent_pair_count: usize,
+    tiff_dimension_matched_pair_count: usize,
+    summary_baseline_count: usize,
+    summary_baseline_sha256_count: usize,
+    calibration_evidence_count: usize,
+    calibration_sha256_count: usize,
+    uncalibrated_fixture_count: usize,
+    unique_scanner_profiles: &[String],
+    unique_roll_profiles: &[String],
+    unique_film_stocks: &[String],
+    scene_tags: &[String],
+    exposure_tags: &[String],
+    calibration_cases: &[String],
+    reference_fixture_count: usize,
+    reference_evidence: &[String],
+    reference_patch_fixture_count: usize,
+    reference_patch_count: usize,
+    debug_artifact_expectation_fixture_count: usize,
+    debug_artifact_kinds_required: &[String],
+    film_stock_calibration_pairs: &[String],
+    scene_exposure_pairs: &[String],
+    issues: &mut Vec<String>,
+) {
+    push_min_requirement_issue(
+        requirements.min_fixtures,
+        fixture_count,
+        "fixture_coverage_min_fixtures_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_component_pairs,
+        component_pair_available_count,
+        "fixture_coverage_min_component_pairs_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_component_sha256_pairs,
+        component_sha256_pair_count,
+        "fixture_coverage_min_component_sha256_pairs_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_readable_tiff_pairs,
+        readable_tiff_pair_count,
+        "fixture_coverage_min_readable_tiff_pairs_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_tiff_layout_consistent_pairs,
+        tiff_layout_consistent_pair_count,
+        "fixture_coverage_min_tiff_layout_consistent_pairs_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_tiff_dimension_matched_pairs,
+        tiff_dimension_matched_pair_count,
+        "fixture_coverage_min_tiff_dimension_matched_pairs_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_summary_baselines,
+        summary_baseline_count,
+        "fixture_coverage_min_summary_baselines_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_summary_baseline_sha256_fixtures,
+        summary_baseline_sha256_count,
+        "fixture_coverage_min_summary_baseline_sha256_fixtures_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_calibrated_fixtures,
+        calibration_evidence_count,
+        "fixture_coverage_min_calibrated_fixtures_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_calibration_sha256_fixtures,
+        calibration_sha256_count,
+        "fixture_coverage_min_calibration_sha256_fixtures_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_uncalibrated_fixtures,
+        uncalibrated_fixture_count,
+        "fixture_coverage_min_uncalibrated_fixtures_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_unique_scanner_profiles,
+        unique_scanner_profiles.len(),
+        "fixture_coverage_min_unique_scanner_profiles_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_unique_roll_profiles,
+        unique_roll_profiles.len(),
+        "fixture_coverage_min_unique_roll_profiles_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_unique_film_stocks,
+        unique_film_stocks.len(),
+        "fixture_coverage_min_unique_film_stocks_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_scene_tags,
+        scene_tags.len(),
+        "fixture_coverage_min_scene_tags_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_exposure_tags,
+        exposure_tags.len(),
+        "fixture_coverage_min_exposure_tags_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_calibration_cases,
+        calibration_cases.len(),
+        "fixture_coverage_min_calibration_cases_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_film_stock_calibration_pairs,
+        film_stock_calibration_pairs.len(),
+        "fixture_coverage_min_film_stock_calibration_pairs_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_scene_exposure_pairs,
+        scene_exposure_pairs.len(),
+        "fixture_coverage_min_scene_exposure_pairs_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_reference_fixtures,
+        reference_fixture_count,
+        "fixture_coverage_min_reference_fixtures_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_reference_evidence_types,
+        reference_evidence.len(),
+        "fixture_coverage_min_reference_evidence_types_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_reference_patch_fixtures,
+        reference_patch_fixture_count,
+        "fixture_coverage_min_reference_patch_fixtures_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_reference_patch_count,
+        reference_patch_count,
+        "fixture_coverage_min_reference_patch_count_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_debug_artifact_expectation_fixtures,
+        debug_artifact_expectation_fixture_count,
+        "fixture_coverage_min_debug_artifact_expectation_fixtures_not_met",
+        issues,
+    );
+    push_missing_required_values(
+        &requirements.required_film_stocks,
+        unique_film_stocks,
+        "fixture_coverage_required_film_stock_missing",
+        issues,
+    );
+    push_missing_required_values(
+        &requirements.required_scene_tags,
+        scene_tags,
+        "fixture_coverage_required_scene_tag_missing",
+        issues,
+    );
+    push_missing_required_values(
+        &requirements.required_exposure_tags,
+        exposure_tags,
+        "fixture_coverage_required_exposure_tag_missing",
+        issues,
+    );
+    push_missing_required_values(
+        &requirements.required_calibration_cases,
+        calibration_cases,
+        "fixture_coverage_required_calibration_case_missing",
+        issues,
+    );
+    push_missing_required_values(
+        &requirements.required_scanner_profiles,
+        unique_scanner_profiles,
+        "fixture_coverage_required_scanner_profile_missing",
+        issues,
+    );
+    push_missing_required_values(
+        &requirements.required_roll_profiles,
+        unique_roll_profiles,
+        "fixture_coverage_required_roll_profile_missing",
+        issues,
+    );
+    push_missing_required_values(
+        &requirements.required_reference_evidence,
+        reference_evidence,
+        "fixture_coverage_required_reference_evidence_missing",
+        issues,
+    );
+    push_missing_required_values(
+        &requirements.required_film_stock_calibration_pairs,
+        film_stock_calibration_pairs,
+        "fixture_coverage_required_film_stock_calibration_pair_missing",
+        issues,
+    );
+    push_missing_required_values(
+        &requirements.required_scene_exposure_pairs,
+        scene_exposure_pairs,
+        "fixture_coverage_required_scene_exposure_pair_missing",
+        issues,
+    );
+    push_missing_required_values(
+        &requirements.required_debug_artifact_kinds,
+        debug_artifact_kinds_required,
+        "fixture_coverage_required_debug_artifact_kind_missing",
+        issues,
+    );
+}
+
+fn fixture_film_stock_calibration_pairs(entries: &[FixtureCoverageEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|entry| entry.validation_ready)
+        .filter_map(|entry| {
+            Some(coverage_pair_label(
+                non_empty_metadata(entry.film_stock.as_deref())?,
+                non_empty_metadata(entry.calibration_case.as_deref())?,
+            ))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn fixture_calibration_sha256_probe(entry: &FixtureCoverageEntry) -> Option<&FixtureSha256Probe> {
+    entry
+        .calibration_profile_sha256
+        .as_ref()
+        .or(entry.calibration_library_sha256.as_ref())
+}
+
+fn fixture_scene_exposure_pairs(entries: &[FixtureCoverageEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|entry| entry.validation_ready)
+        .flat_map(|entry| {
+            entry
+                .scene_tags
+                .iter()
+                .filter_map(|scene| non_empty_metadata(Some(scene.as_str())))
+                .flat_map(move |scene| {
+                    entry
+                        .exposure_tags
+                        .iter()
+                        .filter_map(|exposure| non_empty_metadata(Some(exposure.as_str())))
+                        .map(move |exposure| coverage_pair_label(scene, exposure))
+                })
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn non_empty_metadata(value: Option<&str>) -> Option<&str> {
+    value.and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then_some(value)
+    })
+}
+
+fn coverage_pair_label(left: &str, right: &str) -> String {
+    format!("{left}|{right}")
+}
+
+fn push_min_requirement_issue(
+    required: Option<usize>,
+    actual: usize,
+    issue: &str,
+    issues: &mut Vec<String>,
+) {
+    if required.is_some_and(|minimum| actual < minimum) {
+        issues.push(issue.to_string());
+    }
+}
+
+fn push_missing_required_values(
+    required: &[String],
+    actual: &[String],
+    issue_prefix: &str,
+    issues: &mut Vec<String>,
+) {
+    for value in missing_required_values(required, actual) {
+        issues.push(format!("{issue_prefix}:{value}"));
+    }
+}
+
+fn missing_required_values(required: &[String], actual: &[String]) -> Vec<String> {
+    let actual = actual.iter().collect::<BTreeSet<_>>();
+    required
+        .iter()
+        .filter(|value| !actual.contains(*value))
+        .cloned()
+        .collect()
+}
+
+fn probe_fixture_component_sha256(
+    path: &Path,
+    expected_sha256: Option<&str>,
+    compute_undeclared_hashes: bool,
+) -> Option<FixtureSha256Probe> {
+    let expected_sha256 = expected_sha256.map(str::to_ascii_lowercase);
+    if expected_sha256.is_none() && !compute_undeclared_hashes {
+        return None;
+    }
+    if expected_sha256
+        .as_deref()
+        .is_some_and(|expected| !is_valid_sha256_hex(expected))
+    {
+        return Some(FixtureSha256Probe {
+            status: "invalid_expected".to_string(),
+            expected_sha256,
+            actual_sha256: None,
+            file_size_bytes: None,
+            file_count: None,
+            matched: false,
+            error: Some("expected SHA-256 is not 64 hexadecimal characters".to_string()),
+        });
+    }
+    if !path.exists() {
+        return Some(FixtureSha256Probe {
+            status: "missing".to_string(),
+            expected_sha256,
+            actual_sha256: None,
+            file_size_bytes: None,
+            file_count: None,
+            matched: false,
+            error: None,
+        });
+    }
+
+    match hash_file_sha256(path) {
+        Ok((actual_sha256, file_size_bytes)) => {
+            let matched = expected_sha256
+                .as_deref()
+                .is_some_and(|expected| actual_sha256 == expected);
+            Some(FixtureSha256Probe {
+                status: match (expected_sha256.is_some(), matched) {
+                    (true, true) => "matched",
+                    (true, false) => "mismatch",
+                    (false, _) => "computed",
+                }
+                .to_string(),
+                expected_sha256,
+                actual_sha256: Some(actual_sha256),
+                file_size_bytes: Some(file_size_bytes),
+                file_count: Some(1),
+                matched,
+                error: None,
+            })
+        }
+        Err(err) => Some(FixtureSha256Probe {
+            status: "unreadable".to_string(),
+            expected_sha256,
+            actual_sha256: None,
+            file_size_bytes: None,
+            file_count: None,
+            matched: false,
+            error: Some(err.to_string()),
+        }),
+    }
+}
+
+fn hash_file_sha256(path: &Path) -> Result<(String, u64), Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let file_size_bytes = file.metadata()?.len();
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok((format!("{:x}", hasher.finalize()), file_size_bytes))
+}
+
+fn probe_fixture_calibration_library_sha256(
+    path: &Path,
+    expected_sha256: Option<&str>,
+    compute_undeclared_hashes: bool,
+) -> Option<FixtureSha256Probe> {
+    let expected_sha256 = expected_sha256.map(str::to_ascii_lowercase);
+    if expected_sha256.is_none() && !compute_undeclared_hashes {
+        return None;
+    }
+    if expected_sha256
+        .as_deref()
+        .is_some_and(|expected| !is_valid_sha256_hex(expected))
+    {
+        return Some(FixtureSha256Probe {
+            status: "invalid_expected".to_string(),
+            expected_sha256,
+            actual_sha256: None,
+            file_size_bytes: None,
+            file_count: None,
+            matched: false,
+            error: Some("expected SHA-256 is not 64 hexadecimal characters".to_string()),
+        });
+    }
+    if !path.exists() {
+        return Some(FixtureSha256Probe {
+            status: "missing".to_string(),
+            expected_sha256,
+            actual_sha256: None,
+            file_size_bytes: None,
+            file_count: None,
+            matched: false,
+            error: None,
+        });
+    }
+
+    match hash_calibration_library_sha256(path) {
+        Ok((actual_sha256, file_size_bytes, file_count)) => {
+            let matched = expected_sha256
+                .as_deref()
+                .is_some_and(|expected| actual_sha256 == expected);
+            Some(FixtureSha256Probe {
+                status: match (expected_sha256.is_some(), matched) {
+                    (true, true) => "matched",
+                    (true, false) => "mismatch",
+                    (false, _) => "computed",
+                }
+                .to_string(),
+                expected_sha256,
+                actual_sha256: Some(actual_sha256),
+                file_size_bytes: Some(file_size_bytes),
+                file_count: Some(file_count),
+                matched,
+                error: None,
+            })
+        }
+        Err(err) => Some(FixtureSha256Probe {
+            status: "unreadable".to_string(),
+            expected_sha256,
+            actual_sha256: None,
+            file_size_bytes: None,
+            file_count: None,
+            matched: false,
+            error: Some(err.to_string()),
+        }),
+    }
+}
+
+fn hash_calibration_library_sha256(
+    path: &Path,
+) -> Result<(String, u64, usize), Box<dyn std::error::Error>> {
+    if !path.is_dir() {
+        return Err("calibration library is not a directory".into());
+    }
+
+    let mut stack = vec![path.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                stack.push(entry_path);
+            } else if entry_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            {
+                files.push(entry_path);
+            }
+        }
+    }
+    files.sort_by_key(|file| relative_path_label(path, file));
+
+    let mut hasher = Sha256::new();
+    let mut file_size_bytes = 0_u64;
+    let file_count = files.len();
+    for file in files {
+        let relative_path = relative_path_label(path, &file);
+        let (file_hash, size) = hash_file_sha256(&file)?;
+        hasher.update(relative_path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(file_hash.as_bytes());
+        hasher.update(b"\0");
+        file_size_bytes = file_size_bytes.saturating_add(size);
+    }
+
+    Ok((
+        format!("{:x}", hasher.finalize()),
+        file_size_bytes,
+        file_count,
+    ))
+}
+
+fn relative_path_label(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn validate_fixture_component_sha256_probe(
+    fixture_name: &str,
+    component: &str,
+    probe: Option<&FixtureSha256Probe>,
+    issues: &mut Vec<String>,
+) {
+    let Some(probe) = probe else {
+        return;
+    };
+    match probe.status.as_str() {
+        "matched" | "computed" | "missing" => {}
+        "mismatch" => issues.push(format!("{fixture_name}:{component}_sha256_mismatch")),
+        "invalid_expected" => issues.push(format!("{fixture_name}:{component}_sha256_invalid")),
+        "unreadable" => issues.push(format!("{fixture_name}:{component}_sha256_read_failed")),
+        _ => issues.push(format!("{fixture_name}:{component}_sha256_probe_failed")),
+    }
+}
+
+fn probe_fixture_tiff(path: &Path) -> FixtureTiffProbe {
+    match probe_fixture_tiff_inner(path) {
+        Ok(probe) => probe,
+        Err(err) => FixtureTiffProbe {
+            status: "unreadable".to_string(),
+            readable: false,
+            width: None,
+            height: None,
+            color_type: None,
+            source_bits_per_sample: None,
+            source_channel_count: None,
+            source_has_alpha: None,
+            error: Some(err.to_string()),
+        },
+    }
+}
+
+fn probe_fixture_tiff_inner(path: &Path) -> Result<FixtureTiffProbe, Box<dyn std::error::Error>> {
+    let inspection = scanstitch::tiff_io::inspect_scan_source(path)?;
+    Ok(FixtureTiffProbe {
+        status: "readable".to_string(),
+        readable: true,
+        width: Some(inspection.width),
+        height: Some(inspection.height),
+        color_type: Some(inspection.color_type),
+        source_bits_per_sample: Some(inspection.source_bits_per_sample),
+        source_channel_count: Some(inspection.source_channel_count),
+        source_has_alpha: Some(inspection.source_has_alpha),
+        error: None,
+    })
+}
+
+fn validate_fixture_tiff_probe(
+    fixture_name: &str,
+    component: &str,
+    probe: Option<&FixtureTiffProbe>,
+    min_bits_per_sample: Option<u8>,
+    issues: &mut Vec<String>,
+) {
+    let Some(probe) = probe else {
+        return;
+    };
+    if !probe.readable {
+        issues.push(format!("{fixture_name}:{component}_tiff_unreadable"));
+        return;
+    }
+    if let Some(min_bits) = min_bits_per_sample {
+        if probe
+            .source_bits_per_sample
+            .is_some_and(|actual| actual < min_bits)
+        {
+            issues.push(format!("{fixture_name}:{component}_tiff_bits_below_min"));
+        }
+    }
+}
+
+fn validate_fixture_tiff_pair_probe(
+    fixture_name: &str,
+    pair: Option<&FixtureTiffPairProbe>,
+    issues: &mut Vec<String>,
+) {
+    let Some(pair) = pair else {
+        return;
+    };
+    if pair.dimensions_match == Some(false) {
+        issues.push(format!("{fixture_name}:tiff_pair_dimensions_mismatch"));
+    }
+
+    let mut layout_mismatch = false;
+    if pair.color_type_match == Some(false) {
+        layout_mismatch = true;
+        issues.push(format!("{fixture_name}:tiff_pair_color_type_mismatch"));
+    }
+    if pair.bits_per_sample_match == Some(false) {
+        layout_mismatch = true;
+        issues.push(format!("{fixture_name}:tiff_pair_bits_per_sample_mismatch"));
+    }
+    if pair.channel_count_match == Some(false) {
+        layout_mismatch = true;
+        issues.push(format!("{fixture_name}:tiff_pair_channel_count_mismatch"));
+    }
+    if pair.alpha_flag_match == Some(false) {
+        layout_mismatch = true;
+        issues.push(format!("{fixture_name}:tiff_pair_alpha_flag_mismatch"));
+    }
+    if layout_mismatch {
+        issues.push(format!("{fixture_name}:tiff_pair_layout_mismatch"));
+    }
+}
+
+fn fixture_tiff_pair_probe(
+    component1: Option<&FixtureTiffProbe>,
+    component2: Option<&FixtureTiffProbe>,
+) -> Option<FixtureTiffPairProbe> {
+    let (Some(component1), Some(component2)) = (component1, component2) else {
+        return None;
+    };
+    if !component1.readable || !component2.readable {
+        return Some(FixtureTiffPairProbe {
+            dimensions_match: None,
+            color_type_match: None,
+            bits_per_sample_match: None,
+            channel_count_match: None,
+            alpha_flag_match: None,
+            layout_consistent: false,
+            dimension_matched: false,
+        });
+    }
+    let dimensions_match =
+        component1.width == component2.width && component1.height == component2.height;
+    let color_type_match = component1.color_type == component2.color_type;
+    let bits_per_sample_match =
+        component1.source_bits_per_sample == component2.source_bits_per_sample;
+    let channel_count_match = component1.source_channel_count == component2.source_channel_count;
+    let alpha_flag_match = component1.source_has_alpha == component2.source_has_alpha;
+    let layout_consistent =
+        color_type_match && bits_per_sample_match && channel_count_match && alpha_flag_match;
+
+    Some(FixtureTiffPairProbe {
+        dimensions_match: Some(dimensions_match),
+        color_type_match: Some(color_type_match),
+        bits_per_sample_match: Some(bits_per_sample_match),
+        channel_count_match: Some(channel_count_match),
+        alpha_flag_match: Some(alpha_flag_match),
+        layout_consistent,
+        dimension_matched: dimensions_match,
+    })
+}
+
+fn optional_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "not set".to_string())
+}
+
+fn optional_f64(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.3}"))
+        .unwrap_or_else(|| "not set".to_string())
+}
+
+fn optional_delta_f64(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:+.6}"))
+        .unwrap_or_default()
+}
+
+fn fixture_coverage_entry(
+    name: &str,
+    fixture: &FixtureEntry,
+    requirements: &FixtureCoverageRequirements,
+    compute_fixture_hashes: bool,
+) -> FixtureCoverageEntry {
+    let mut issues = Vec::new();
+    let component1_exists = fixture.component1.exists();
+    let component2_exists = fixture.component2.exists();
+    if !component1_exists {
+        issues.push(format!("{name}:component1_missing"));
+    }
+    if !component2_exists {
+        issues.push(format!("{name}:component2_missing"));
+    }
+    let component1_sha256 = probe_fixture_component_sha256(
+        &fixture.component1,
+        fixture.component1_sha256.as_deref(),
+        compute_fixture_hashes,
+    );
+    let component2_sha256 = probe_fixture_component_sha256(
+        &fixture.component2,
+        fixture.component2_sha256.as_deref(),
+        compute_fixture_hashes,
+    );
+    validate_fixture_component_sha256_probe(
+        name,
+        "component1",
+        component1_sha256.as_ref(),
+        &mut issues,
+    );
+    validate_fixture_component_sha256_probe(
+        name,
+        "component2",
+        component2_sha256.as_ref(),
+        &mut issues,
+    );
+    let component1_tiff = component1_exists.then(|| probe_fixture_tiff(&fixture.component1));
+    let component2_tiff = component2_exists.then(|| probe_fixture_tiff(&fixture.component2));
+    let tiff_pair = fixture_tiff_pair_probe(component1_tiff.as_ref(), component2_tiff.as_ref());
+    validate_fixture_tiff_probe(
+        name,
+        "component1",
+        component1_tiff.as_ref(),
+        requirements.min_tiff_bits_per_sample,
+        &mut issues,
+    );
+    validate_fixture_tiff_probe(
+        name,
+        "component2",
+        component2_tiff.as_ref(),
+        requirements.min_tiff_bits_per_sample,
+        &mut issues,
+    );
+    validate_fixture_tiff_pair_probe(name, tiff_pair.as_ref(), &mut issues);
+    if fixture.scene_tags.is_empty() {
+        issues.push(format!("{name}:scene_tags_not_declared"));
+    }
+    if fixture.exposure_tags.is_empty() {
+        issues.push(format!("{name}:exposure_tags_not_declared"));
+    }
+    if fixture.calibration_case.is_none() {
+        issues.push(format!("{name}:calibration_case_not_declared"));
+    }
+
+    let (
+        summary_baseline_exists,
+        summary_baseline_parse_status,
+        summary_baseline_contract_status,
+        summary_baseline_contract_missing_fields,
+    ) = match &fixture.summary_baseline {
+        Some(path) => {
+            if path.exists() {
+                match std::fs::read_to_string(path).ok().and_then(|contents| {
+                    serde_json::from_str::<TrackedValidationBaseline>(&contents).ok()
+                }) {
+                    Some(baseline) => {
+                        let missing_fields = summary_baseline_contract_issues(&baseline)
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect::<Vec<_>>();
+                        if missing_fields.is_empty() {
+                            (
+                                Some(true),
+                                Some("valid".to_string()),
+                                Some("complete".to_string()),
+                                missing_fields,
+                            )
+                        } else {
+                            issues.extend(missing_fields.iter().map(|field| {
+                                format!("{name}:summary_baseline_incomplete:{field}")
+                            }));
+                            (
+                                Some(true),
+                                Some("valid".to_string()),
+                                Some("incomplete".to_string()),
+                                missing_fields,
+                            )
+                        }
+                    }
+                    None => {
+                        issues.push(format!("{name}:summary_baseline_invalid"));
+                        (Some(true), Some("invalid".to_string()), None, Vec::new())
+                    }
+                }
+            } else {
+                issues.push(format!("{name}:summary_baseline_missing"));
+                (Some(false), Some("missing".to_string()), None, Vec::new())
+            }
+        }
+        None => {
+            issues.push(format!("{name}:summary_baseline_not_declared"));
+            (None, None, None, Vec::new())
+        }
+    };
+    let summary_baseline_valid = summary_baseline_parse_status.as_deref() == Some("valid")
+        && summary_baseline_contract_status.as_deref() == Some("complete");
+
+    let summary_baseline_sha256 = fixture.summary_baseline.as_ref().and_then(|path| {
+        probe_fixture_component_sha256(
+            path,
+            fixture.summary_baseline_sha256.as_deref(),
+            compute_fixture_hashes,
+        )
+    });
+    validate_fixture_component_sha256_probe(
+        name,
+        "summary_baseline",
+        summary_baseline_sha256.as_ref(),
+        &mut issues,
+    );
+
+    let calibration_profile_sha256 = fixture.calibration_profile.as_ref().and_then(|path| {
+        probe_fixture_component_sha256(
+            path,
+            fixture.calibration_profile_sha256.as_deref(),
+            compute_fixture_hashes,
+        )
+    });
+    let calibration_library_sha256 = fixture.calibration_library.as_ref().and_then(|path| {
+        probe_fixture_calibration_library_sha256(
+            path,
+            fixture.calibration_library_sha256.as_deref(),
+            compute_fixture_hashes,
+        )
+    });
+    validate_fixture_component_sha256_probe(
+        name,
+        "calibration_profile",
+        calibration_profile_sha256.as_ref(),
+        &mut issues,
+    );
+    validate_fixture_component_sha256_probe(
+        name,
+        "calibration_library",
+        calibration_library_sha256.as_ref(),
+        &mut issues,
+    );
+
+    let (
+        calibration_profile_exists,
+        calibration_profile_parse_status,
+        calibration_profile_reference_patch_count,
+    ) = fixture
+        .calibration_profile
+        .as_ref()
+        .map_or((None, None, None), |path| {
+            let exists = path.exists();
+            if !exists {
+                issues.push(format!("{name}:calibration_profile_missing"));
+                (Some(false), Some("missing".to_string()), None)
+            } else {
+                let profile = scanstitch::color_calibration::load_profile(path);
+                if let Some(profile) = profile.profile {
+                    (
+                        Some(true),
+                        Some("valid".to_string()),
+                        Some(profile.target_patches.len()),
+                    )
+                } else {
+                    issues.push(format!("{name}:calibration_profile_invalid"));
+                    (Some(true), Some("invalid".to_string()), None)
+                }
+            }
+        });
+    let (
+        calibration_library_exists,
+        calibration_library_selection_status,
+        calibration_library_reference_patch_count,
+    ) = fixture
+        .calibration_library
+        .as_ref()
+        .map_or((None, None, None), |path| {
+            let exists = path.exists();
+            if !exists {
+                issues.push(format!("{name}:calibration_library_missing"));
+                return (Some(false), Some("missing".to_string()), None);
+            }
+            if !path.is_dir() {
+                issues.push(format!("{name}:calibration_library_not_directory"));
+                return (Some(true), Some("not_directory".to_string()), None);
+            }
+
+            let calibration = scanstitch::color_calibration::load_calibration(
+                None,
+                Some(path.as_path()),
+                fixture.scanner_profile.as_deref(),
+                fixture.roll_profile.as_deref(),
+                fixture.film_stock.as_deref(),
+                None,
+            );
+            let status = calibration.diagnostics.status;
+            let reference_patch_count = calibration
+                .profile
+                .as_ref()
+                .map(|profile| profile.target_patches.len());
+            if calibration.profile.is_none() {
+                issues.push(format!(
+                    "{name}:calibration_library_selection_unusable:{status}"
+                ));
+            }
+            (Some(true), Some(status), reference_patch_count)
+        });
+    if fixture.calibration_library.is_none()
+        && (fixture.scanner_profile.is_some() || fixture.roll_profile.is_some())
+    {
+        issues.push(format!("{name}:profile_id_without_calibration_library"));
+    }
+
+    let calibration_evidence_declared =
+        fixture.calibration_profile.is_some() || fixture.calibration_library.is_some();
+    let calibration_evidence_usable = calibration_profile_parse_status.as_deref() == Some("valid")
+        || calibration_library_selection_status.as_deref() == Some("applied");
+    let calibration_reference_patch_count = calibration_profile_reference_patch_count
+        .or(calibration_library_reference_patch_count)
+        .filter(|count| *count > 0);
+    if fixture.expectations.reference_patch_evaluation_required
+        && calibration_reference_patch_count.unwrap_or(0) == 0
+    {
+        issues.push(format!(
+            "{name}:reference_patch_evaluation_required_without_calibration_patches"
+        ));
+    }
+    let validation_ready =
+        component1_exists && component2_exists && summary_baseline_valid && issues.is_empty();
+
+    let mut entry = FixtureCoverageEntry {
+        name: name.to_string(),
+        component1: fixture.component1.display().to_string(),
+        component1_exists,
+        component1_sha256,
+        component1_tiff,
+        component2: fixture.component2.display().to_string(),
+        component2_exists,
+        component2_sha256,
+        component2_tiff,
+        tiff_pair,
+        output_dir: fixture
+            .output_dir
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        summary_baseline: fixture
+            .summary_baseline
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        summary_baseline_exists,
+        summary_baseline_parse_status,
+        summary_baseline_contract_status,
+        summary_baseline_contract_missing_fields,
+        summary_baseline_valid,
+        summary_baseline_sha256,
+        calibration_profile: fixture
+            .calibration_profile
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        calibration_profile_exists,
+        calibration_profile_parse_status,
+        calibration_profile_sha256,
+        calibration_library: fixture
+            .calibration_library
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        calibration_library_exists,
+        calibration_library_selection_status,
+        calibration_library_sha256,
+        calibration_reference_patch_count,
+        scanner_profile: fixture.scanner_profile.clone(),
+        roll_profile: fixture.roll_profile.clone(),
+        film_stock: fixture.film_stock.clone(),
+        scene_tags: fixture.scene_tags.clone(),
+        exposure_tags: fixture.exposure_tags.clone(),
+        reference_evidence: fixture.reference_evidence.clone(),
+        calibration_case: fixture.calibration_case.clone(),
+        debug_artifacts_required: fixture.expectations.debug_artifacts_required,
+        debug_artifact_kinds_required: fixture.expectations.debug_artifact_kinds_required.clone(),
+        calibration_evidence_declared,
+        calibration_evidence_usable,
+        validation_ready,
+        action_items: Vec::new(),
+        repair_plan: Vec::new(),
+        issues,
+    };
+    entry.action_items = fixture_coverage_entry_actions(&entry);
+    entry.repair_plan = fixture_coverage_entry_repair_plan(&entry);
+    entry
+}
+
+fn fixture_coverage_to_markdown(summary: &FixtureCoverageSummary) -> String {
+    let mut out = String::new();
+    out.push_str("# Fixture Coverage\n\n");
+    out.push_str(&format!("- status: `{}`\n", summary.status));
+    out.push_str(&format!("- fixtures: `{}`\n", summary.fixture_count));
+    out.push_str(&format!(
+        "- component pairs available: `{}`\n",
+        summary.component_pair_available_count
+    ));
+    out.push_str(&format!(
+        "- component SHA-256 pairs declared: `{}`\n",
+        summary.component_sha256_declared_pair_count
+    ));
+    out.push_str(&format!(
+        "- component SHA-256 pairs computed: `{}`\n",
+        summary.component_sha256_computed_pair_count
+    ));
+    out.push_str(&format!(
+        "- validation-ready component SHA-256 pairs matched: `{}`\n",
+        summary.component_sha256_pair_count
+    ));
+    out.push_str(&format!(
+        "- readable TIFF pairs: `{}`\n",
+        summary.readable_tiff_pair_count
+    ));
+    out.push_str(&format!(
+        "- TIFF layout-consistent pairs: `{}`\n",
+        summary.tiff_layout_consistent_pair_count
+    ));
+    out.push_str(&format!(
+        "- TIFF dimension-matched pairs: `{}`\n",
+        summary.tiff_dimension_matched_pair_count
+    ));
+    out.push_str(&format!(
+        "- validation-ready fixtures: `{}`\n",
+        summary.validation_ready_fixture_count
+    ));
+    out.push_str(&format!(
+        "- summary baselines parseable: `{}`\n",
+        summary.summary_baseline_parseable_count
+    ));
+    out.push_str(&format!(
+        "- summary baselines contract-complete: `{}`\n",
+        summary.summary_baseline_contract_complete_count
+    ));
+    out.push_str(&format!(
+        "- summary baselines declared: `{}`\n",
+        summary.summary_baseline_declared_count
+    ));
+    out.push_str(&format!(
+        "- summary baseline SHA-256 fixtures declared: `{}`\n",
+        summary.summary_baseline_sha256_declared_count
+    ));
+    out.push_str(&format!(
+        "- summary baseline SHA-256 fixtures computed: `{}`\n",
+        summary.summary_baseline_sha256_computed_count
+    ));
+    out.push_str(&format!(
+        "- validation-ready summary baseline SHA-256 fixtures matched: `{}`\n",
+        summary.summary_baseline_sha256_count
+    ));
+    out.push_str(&format!(
+        "- calibration evidence usable: `{}`\n",
+        summary.calibration_evidence_count
+    ));
+    out.push_str(&format!(
+        "- calibration evidence declared: `{}`\n",
+        summary.calibration_evidence_declared_count
+    ));
+    out.push_str(&format!(
+        "- calibration SHA-256 fixtures declared: `{}`\n",
+        summary.calibration_sha256_declared_count
+    ));
+    out.push_str(&format!(
+        "- calibration SHA-256 fixtures computed: `{}`\n",
+        summary.calibration_sha256_computed_count
+    ));
+    out.push_str(&format!(
+        "- validation-ready calibration SHA-256 fixtures matched: `{}`\n",
+        summary.calibration_sha256_count
+    ));
+    out.push_str(&format!(
+        "- uncalibrated fixtures: `{}`\n",
+        summary.uncalibrated_fixture_count
+    ));
+    out.push_str(&format!(
+        "- scanner profiles: `{}`\n",
+        summary.scanner_profile_count
+    ));
+    out.push_str(&format!(
+        "- unique scanner profiles: `{}`\n",
+        summary.unique_scanner_profiles.join(", ")
+    ));
+    out.push_str(&format!(
+        "- missing required scanner profiles: `{}`\n",
+        summary.missing_required_scanner_profiles.join(", ")
+    ));
+    out.push_str(&format!(
+        "- roll profiles: `{}`\n",
+        summary.roll_profile_count
+    ));
+    out.push_str(&format!(
+        "- unique roll profiles: `{}`\n",
+        summary.unique_roll_profiles.join(", ")
+    ));
+    out.push_str(&format!(
+        "- missing required roll profiles: `{}`\n",
+        summary.missing_required_roll_profiles.join(", ")
+    ));
+    out.push_str(&format!(
+        "- film stocks: `{}`\n\n",
+        summary.film_stock_count
+    ));
+    out.push_str(&format!(
+        "- unique film stocks: `{}`\n",
+        summary.unique_film_stocks.join(", ")
+    ));
+    out.push_str(&format!(
+        "- missing required film stocks: `{}`\n",
+        summary.missing_required_film_stocks.join(", ")
+    ));
+    out.push_str(&format!(
+        "- scene tags: `{}`\n",
+        summary.scene_tags.join(", ")
+    ));
+    out.push_str(&format!(
+        "- missing required scene tags: `{}`\n",
+        summary.missing_required_scene_tags.join(", ")
+    ));
+    out.push_str(&format!(
+        "- exposure tags: `{}`\n",
+        summary.exposure_tags.join(", ")
+    ));
+    out.push_str(&format!(
+        "- missing required exposure tags: `{}`\n",
+        summary.missing_required_exposure_tags.join(", ")
+    ));
+    out.push_str(&format!(
+        "- calibration cases: `{}`\n\n",
+        summary.calibration_cases.join(", ")
+    ));
+    out.push_str(&format!(
+        "- missing required calibration cases: `{}`\n\n",
+        summary.missing_required_calibration_cases.join(", ")
+    ));
+    out.push_str(&format!(
+        "- reference fixtures: `{}`\n",
+        summary.reference_fixture_count
+    ));
+    out.push_str(&format!(
+        "- reference evidence types: `{}`\n",
+        summary.reference_evidence_type_count
+    ));
+    out.push_str(&format!(
+        "- reference evidence: `{}`\n",
+        summary.reference_evidence.join(", ")
+    ));
+    out.push_str(&format!(
+        "- missing required reference evidence: `{}`\n\n",
+        summary.missing_required_reference_evidence.join(", ")
+    ));
+    out.push_str(&format!(
+        "- reference-patch fixtures: `{}`\n",
+        summary.reference_patch_fixture_count
+    ));
+    out.push_str(&format!(
+        "- reference patches: `{}`\n\n",
+        summary.reference_patch_count
+    ));
+    out.push_str(&format!(
+        "- validation-ready debug-artifact expectation fixtures: `{}`\n",
+        summary.debug_artifact_expectation_fixture_count
+    ));
+    out.push_str(&format!(
+        "- required debug artifact kinds declared by validation-ready fixtures: `{}`\n",
+        summary.debug_artifact_kinds_required.join(", ")
+    ));
+    out.push_str(&format!(
+        "- missing required debug artifact kinds: `{}`\n\n",
+        summary.missing_required_debug_artifact_kinds.join(", ")
+    ));
+    out.push_str(&format!(
+        "- film stock + calibration pairs: `{}`\n",
+        summary.film_stock_calibration_pairs.join(", ")
+    ));
+    out.push_str(&format!(
+        "- missing required film stock + calibration pairs: `{}`\n",
+        summary
+            .missing_required_film_stock_calibration_pairs
+            .join(", ")
+    ));
+    out.push_str(&format!(
+        "- scene + exposure pairs: `{}`\n\n",
+        summary.scene_exposure_pairs.join(", ")
+    ));
+    out.push_str(&format!(
+        "- missing required scene + exposure pairs: `{}`\n\n",
+        summary.missing_required_scene_exposure_pairs.join(", ")
+    ));
+    if !summary.action_items.is_empty() {
+        out.push_str("## Action Items\n\n");
+        for action in &summary.action_items {
+            out.push_str(&format!("- `{action}`\n"));
+        }
+        out.push('\n');
+    }
+    out.push_str("## Requirements\n\n");
+    out.push_str(&format!(
+        "- min fixtures: `{}`\n",
+        optional_usize(summary.coverage_requirements.min_fixtures)
+    ));
+    out.push_str(&format!(
+        "- min component pairs: `{}`\n",
+        optional_usize(summary.coverage_requirements.min_component_pairs)
+    ));
+    out.push_str(&format!(
+        "- min component SHA-256 pairs: `{}`\n",
+        optional_usize(summary.coverage_requirements.min_component_sha256_pairs)
+    ));
+    out.push_str(&format!(
+        "- min readable TIFF pairs: `{}`\n",
+        optional_usize(summary.coverage_requirements.min_readable_tiff_pairs)
+    ));
+    out.push_str(&format!(
+        "- min TIFF layout-consistent pairs: `{}`\n",
+        optional_usize(
+            summary
+                .coverage_requirements
+                .min_tiff_layout_consistent_pairs
+        )
+    ));
+    out.push_str(&format!(
+        "- min TIFF dimension-matched pairs: `{}`\n",
+        optional_usize(
+            summary
+                .coverage_requirements
+                .min_tiff_dimension_matched_pairs
+        )
+    ));
+    out.push_str(&format!(
+        "- min TIFF bits per sample: `{}`\n",
+        summary
+            .coverage_requirements
+            .min_tiff_bits_per_sample
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "not set".to_string())
+    ));
+    out.push_str(&format!(
+        "- min summary baselines: `{}`\n",
+        optional_usize(summary.coverage_requirements.min_summary_baselines)
+    ));
+    out.push_str(&format!(
+        "- min summary baseline SHA-256 fixtures: `{}`\n",
+        optional_usize(
+            summary
+                .coverage_requirements
+                .min_summary_baseline_sha256_fixtures
+        )
+    ));
+    out.push_str(&format!(
+        "- min calibrated fixtures: `{}`\n",
+        optional_usize(summary.coverage_requirements.min_calibrated_fixtures)
+    ));
+    out.push_str(&format!(
+        "- min calibration SHA-256 fixtures: `{}`\n",
+        optional_usize(
+            summary
+                .coverage_requirements
+                .min_calibration_sha256_fixtures
+        )
+    ));
+    out.push_str(&format!(
+        "- min uncalibrated fixtures: `{}`\n",
+        optional_usize(summary.coverage_requirements.min_uncalibrated_fixtures)
+    ));
+    out.push_str(&format!(
+        "- min unique scanner profiles: `{}`\n",
+        optional_usize(summary.coverage_requirements.min_unique_scanner_profiles)
+    ));
+    out.push_str(&format!(
+        "- min unique roll profiles: `{}`\n",
+        optional_usize(summary.coverage_requirements.min_unique_roll_profiles)
+    ));
+    out.push_str(&format!(
+        "- min unique film stocks: `{}`\n",
+        optional_usize(summary.coverage_requirements.min_unique_film_stocks)
+    ));
+    out.push_str(&format!(
+        "- min film stock + calibration pairs: `{}`\n",
+        optional_usize(
+            summary
+                .coverage_requirements
+                .min_film_stock_calibration_pairs
+        )
+    ));
+    out.push_str(&format!(
+        "- min scene + exposure pairs: `{}`\n",
+        optional_usize(summary.coverage_requirements.min_scene_exposure_pairs)
+    ));
+    out.push_str(&format!(
+        "- min reference fixtures: `{}`\n",
+        optional_usize(summary.coverage_requirements.min_reference_fixtures)
+    ));
+    out.push_str(&format!(
+        "- min reference evidence types: `{}`\n",
+        optional_usize(summary.coverage_requirements.min_reference_evidence_types)
+    ));
+    out.push_str(&format!(
+        "- min reference-patch fixtures: `{}`\n",
+        optional_usize(summary.coverage_requirements.min_reference_patch_fixtures)
+    ));
+    out.push_str(&format!(
+        "- min reference patches: `{}`\n",
+        optional_usize(summary.coverage_requirements.min_reference_patch_count)
+    ));
+    out.push_str(&format!(
+        "- min debug-artifact expectation fixtures: `{}`\n",
+        optional_usize(
+            summary
+                .coverage_requirements
+                .min_debug_artifact_expectation_fixtures
+        )
+    ));
+    out.push_str(&format!(
+        "- required scene tags: `{}`\n",
+        summary.coverage_requirements.required_scene_tags.join(", ")
+    ));
+    out.push_str(&format!(
+        "- required exposure tags: `{}`\n",
+        summary
+            .coverage_requirements
+            .required_exposure_tags
+            .join(", ")
+    ));
+    out.push_str(&format!(
+        "- required calibration cases: `{}`\n\n",
+        summary
+            .coverage_requirements
+            .required_calibration_cases
+            .join(", ")
+    ));
+    out.push_str(&format!(
+        "- required scanner profiles: `{}`\n",
+        summary
+            .coverage_requirements
+            .required_scanner_profiles
+            .join(", ")
+    ));
+    out.push_str(&format!(
+        "- required roll profiles: `{}`\n\n",
+        summary
+            .coverage_requirements
+            .required_roll_profiles
+            .join(", ")
+    ));
+    out.push_str(&format!(
+        "- required reference evidence: `{}`\n\n",
+        summary
+            .coverage_requirements
+            .required_reference_evidence
+            .join(", ")
+    ));
+    out.push_str(&format!(
+        "- required film stock + calibration pairs: `{}`\n",
+        summary
+            .coverage_requirements
+            .required_film_stock_calibration_pairs
+            .join(", ")
+    ));
+    out.push_str(&format!(
+        "- required scene + exposure pairs: `{}`\n\n",
+        summary
+            .coverage_requirements
+            .required_scene_exposure_pairs
+            .join(", ")
+    ));
+    out.push_str(&format!(
+        "- required debug artifact kinds: `{}`\n\n",
+        summary
+            .coverage_requirements
+            .required_debug_artifact_kinds
+            .join(", ")
+    ));
+    out.push_str("| Fixture | Ready | Components | SHA-256 | TIFF | Baseline | Baseline SHA-256 | Calibration | Calibration SHA-256 | Reference patches | Film stock | Scene tags | Exposure tags | Reference evidence | Calibration case | Debug expectations | Actions | Issues |\n");
+    out.push_str("|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|\n");
+    for fixture in &summary.fixtures {
+        let components = if fixture.component1_exists && fixture.component2_exists {
+            "ok"
+        } else {
+            "missing"
+        };
+        let sha256 = fixture_sha256_pair_label(fixture);
+        let tiff = fixture_tiff_pair_label(fixture);
+        let baseline = fixture
+            .summary_baseline_parse_status
+            .as_deref()
+            .unwrap_or("none");
+        let baseline = fixture
+            .summary_baseline_contract_status
+            .as_deref()
+            .map(|contract| format!("{baseline}/{contract}"))
+            .unwrap_or_else(|| baseline.to_string());
+        let baseline_sha256 = fixture_sha256_probe_label(fixture.summary_baseline_sha256.as_ref());
+        let calibration = if let Some(profile) = &fixture.calibration_profile {
+            let status = fixture
+                .calibration_profile_parse_status
+                .as_deref()
+                .unwrap_or("unknown");
+            format!("profile: {profile} ({status})")
+        } else if let Some(library) = &fixture.calibration_library {
+            let status = fixture
+                .calibration_library_selection_status
+                .as_deref()
+                .unwrap_or("unknown");
+            format!("library: {library} ({status})")
+        } else {
+            "none".to_string()
+        };
+        let calibration_sha256 = fixture_calibration_sha256_label(fixture);
+        let reference_patches = fixture
+            .calibration_reference_patch_count
+            .map(|count| count.to_string())
+            .unwrap_or_default();
+        let film_stock = fixture.film_stock.as_deref().unwrap_or("");
+        let scene_tags = fixture.scene_tags.join(", ");
+        let exposure_tags = fixture.exposure_tags.join(", ");
+        let reference_evidence = fixture.reference_evidence.join(", ");
+        let calibration_case = fixture.calibration_case.as_deref().unwrap_or("");
+        let debug_expectations = fixture_coverage_debug_expectation_label(fixture);
+        let actions = if fixture.action_items.is_empty() {
+            "none".to_string()
+        } else {
+            fixture.action_items.join(", ")
+        };
+        let issues = if fixture.issues.is_empty() {
+            "none".to_string()
+        } else {
+            fixture.issues.join(", ")
+        };
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            fixture.name,
+            if fixture.validation_ready {
+                "yes"
+            } else {
+                "no"
+            },
+            components,
+            sha256,
+            tiff,
+            baseline,
+            baseline_sha256,
+            calibration,
+            calibration_sha256,
+            reference_patches,
+            film_stock,
+            scene_tags,
+            exposure_tags,
+            reference_evidence,
+            calibration_case,
+            debug_expectations,
+            actions,
+            issues
+        ));
+    }
+    if !summary.issues.is_empty() {
+        out.push_str("\n## Issues\n\n");
+        for issue in &summary.issues {
+            out.push_str(&format!("- `{issue}`\n"));
+        }
+    }
+    out
+}
+
+fn fixture_sha256_pair_label(fixture: &FixtureCoverageEntry) -> String {
+    match (
+        fixture.component1_sha256.as_ref(),
+        fixture.component2_sha256.as_ref(),
+    ) {
+        (None, None) => "not declared".to_string(),
+        (component1, component2) => format!(
+            "{}/{}",
+            fixture_sha256_probe_label(component1),
+            fixture_sha256_probe_label(component2)
+        ),
+    }
+}
+
+fn fixture_sha256_probe_label(probe: Option<&FixtureSha256Probe>) -> String {
+    probe
+        .map(|probe| probe.status.clone())
+        .unwrap_or_else(|| "not declared".to_string())
+}
+
+fn fixture_calibration_sha256_label(fixture: &FixtureCoverageEntry) -> String {
+    if fixture.calibration_profile.is_some() {
+        return fixture_sha256_probe_label(fixture.calibration_profile_sha256.as_ref());
+    }
+    if fixture.calibration_library.is_some() {
+        return fixture_sha256_probe_label(fixture.calibration_library_sha256.as_ref());
+    }
+    String::new()
+}
+
+fn fixture_coverage_debug_expectation_label(fixture: &FixtureCoverageEntry) -> String {
+    if !fixture.debug_artifacts_required && fixture.debug_artifact_kinds_required.is_empty() {
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    if fixture.debug_artifacts_required {
+        parts.push("debug required".to_string());
+    }
+    if !fixture.debug_artifact_kinds_required.is_empty() {
+        parts.push(format!(
+            "kinds {}",
+            fixture.debug_artifact_kinds_required.join(", ")
+        ));
+    }
+    parts.join("; ")
+}
+
+fn fixture_tiff_pair_label(fixture: &FixtureCoverageEntry) -> String {
+    let labels = format!(
+        "{}/{}",
+        fixture_tiff_probe_label(fixture.component1_tiff.as_ref()),
+        fixture_tiff_probe_label(fixture.component2_tiff.as_ref())
+    );
+    if let Some(pair) = &fixture.tiff_pair {
+        format!(
+            "{labels}; layout {}; dimensions {}",
+            if pair.layout_consistent {
+                "matched"
+            } else {
+                "mismatch"
+            },
+            if pair.dimension_matched {
+                "matched"
+            } else {
+                "mismatch"
+            }
+        )
+    } else {
+        labels
+    }
+}
+
+fn fixture_tiff_probe_label(probe: Option<&FixtureTiffProbe>) -> String {
+    let Some(probe) = probe else {
+        return "missing".to_string();
+    };
+    if !probe.readable {
+        return probe.status.clone();
+    }
+    match (
+        probe.color_type.as_deref(),
+        probe.width,
+        probe.height,
+        probe.source_bits_per_sample,
+    ) {
+        (Some(color), Some(width), Some(height), Some(bits)) => {
+            format!("{color} {width}x{height} {bits}bpc")
+        }
+        _ => probe.status.clone(),
+    }
+}
+
+fn validate_fixture_suite_inputs(cli: &ValidationCli) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.component1.is_some()
+        || cli.component2.is_some()
+        || cli.report.is_some()
+        || cli.compare_report.is_some()
+        || cli.compare_summary.is_some()
+        || cli.write_summary_baseline.is_some()
+    {
+        return Err("--fixture-suite runs registry entries only; omit --component1/--component2, --report, --compare-report, --compare-summary, and --write-summary-baseline".into());
+    }
+    Ok(())
+}
+
+fn validate_input_mode_options(
+    input_mode: InputMode,
+    render_input: RenderInputMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if input_mode == InputMode::Positive && render_input == RenderInputMode::Ica {
+        return Err("--input-mode positive cannot be used with --render-input ica because ICA requires density-inverted negative-film data".into());
+    }
+    Ok(())
+}
+
+fn validate_roll_inputs(cli: &ValidationCli) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(roll_dir) = &cli.roll_dir else {
+        return Err("--roll-inventory and --roll-suite require --roll-dir".into());
+    };
+    if !roll_dir.is_dir() {
+        return Err(format!("--roll-dir {} is not a directory", roll_dir.display()).into());
+    }
+    if cli.component1.is_some()
+        || cli.component2.is_some()
+        || cli.report.is_some()
+        || cli.compare_report.is_some()
+        || cli.compare_summary.is_some()
+        || cli.write_summary_baseline.is_some()
+    {
+        return Err("--roll-inventory/--roll-suite use --roll-dir; omit --component1/--component2, --report, --compare-report, --compare-summary, and --write-summary-baseline".into());
+    }
+    if cli.roll_suite && cli.force_stitch {
+        return Err("--roll-suite validates independent frames; omit --force-stitch".into());
+    }
+    if cli.roll_inventory && cli.compare_roll_suite.is_some() {
+        return Err("--compare-roll-suite requires --roll-suite, not --roll-inventory".into());
+    }
+    if !cli.roll_suite && !cli.roll_suite_frames.is_empty() {
+        return Err("--roll-suite-frame requires --roll-suite".into());
+    }
+    Ok(())
+}
+
+fn run_roll_inventory(cli: &ValidationCli) -> RollInventorySummary {
+    let roll_dir = cli
+        .roll_dir
+        .as_ref()
+        .expect("roll inputs should require --roll-dir");
+    let roll_name = roll_name(roll_dir);
+    let mut issues = Vec::new();
+    let mut paths = Vec::new();
+
+    match std::fs::read_dir(roll_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) => {
+                        let path = entry.path();
+                        if path.is_file() && is_supported_roll_scan_path(&path) {
+                            paths.push(path);
+                        }
+                    }
+                    Err(err) => issues.push(format!("roll_inventory:read_dir_entry_failed:{err}")),
+                }
+            }
+        }
+        Err(err) => {
+            issues.push(format!("roll_inventory:read_dir_failed:{err}"));
+        }
+    }
+    paths.sort_by_key(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default()
+    });
+
+    let mut frames = paths
+        .iter()
+        .map(|path| inspect_roll_frame(path, cli.input_mode, cli.bit_depth))
+        .collect::<Vec<_>>();
+    let sequence_gaps = roll_sequence_gaps(&frames);
+    for gap in &sequence_gaps {
+        issues.push(format!(
+            "roll_inventory:sequence_gap:{}{}-{}",
+            gap.prefix,
+            roll_padded_number(gap.start, gap.width),
+            roll_padded_number(gap.end, gap.width)
+        ));
+    }
+    if frames.is_empty() {
+        issues.push("roll_inventory:no_supported_scan_files".to_string());
+    }
+    for frame in &frames {
+        if !frame.usable {
+            issues.push(format!(
+                "roll_inventory:{}:unreadable",
+                roll_frame_issue_label(frame)
+            ));
+        }
+        if cli.input_mode == InputMode::Positive
+            && frame
+                .positive_input_probe
+                .as_ref()
+                .is_some_and(|probe| probe.likely_negative_like)
+        {
+            issues.push(format!(
+                "roll_inventory:{}:positive_input_negative_like",
+                roll_frame_issue_label(frame)
+            ));
+        }
+    }
+
+    let usable_frame_count = frames.iter().filter(|frame| frame.usable).count();
+    let unreadable_frame_count = frames.len().saturating_sub(usable_frame_count);
+    let status = if frames.is_empty() || unreadable_frame_count > 0 {
+        "failed"
+    } else if !issues.is_empty() {
+        "review_required"
+    } else {
+        "passed"
+    }
+    .to_string();
+
+    RollInventorySummary {
+        status,
+        roll_dir: roll_dir.display().to_string(),
+        roll_name,
+        frame_count: frames.len(),
+        usable_frame_count,
+        unreadable_frame_count,
+        sequence_gap_count: sequence_gaps.len(),
+        sequence_gaps,
+        frames: {
+            frames.shrink_to_fit();
+            frames
+        },
+        issues,
+    }
+}
+
+fn run_roll_suite(cli: &ValidationCli) -> RollSuiteSummary {
+    let inventory = run_roll_inventory(cli);
+    let output_root = roll_mode_output_dir(cli);
+    let mut issues = inventory.issues.clone();
+    let render_frames = roll_suite_render_frames(cli, &inventory.frames, &mut issues);
+    let roll_base_estimate = if cli.input_mode == InputMode::Negative && cli.base_color.is_none() {
+        derive_roll_base_estimate(cli, &inventory.frames)
+    } else {
+        None
+    };
+    let base_color_arg = if cli.input_mode == InputMode::Negative {
+        cli.base_color.clone().or_else(|| {
+            roll_base_estimate
+                .as_ref()
+                .map(|estimate| format_base_color(estimate.color))
+        })
+    } else {
+        None
+    };
+    let no_selected_frames = render_frames.is_empty();
+    let no_selected_usable_frames = render_frames.iter().all(|frame| !frame.usable);
+    let mut frames = render_frames
+        .iter()
+        .map(|frame| {
+            run_roll_suite_entry(
+                cli,
+                frame,
+                &output_root,
+                base_color_arg.as_ref(),
+                roll_base_estimate.as_ref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if no_selected_frames {
+        issues.push("roll_suite:no_selected_frames".to_string());
+    }
+    if no_selected_usable_frames {
+        issues.push("roll_suite:no_usable_frames".to_string());
+    }
+    issues.extend(
+        frames
+            .iter()
+            .flat_map(|frame| frame.issues.iter().cloned())
+            .collect::<Vec<_>>(),
+    );
+
+    let passed_count = frames
+        .iter()
+        .filter(|frame| frame.status == "passed")
+        .count();
+    let review_required_count = frames
+        .iter()
+        .filter(|frame| frame.status == "review_required")
+        .count();
+    let failed_count = frames
+        .iter()
+        .filter(|frame| frame.status == "failed")
+        .count();
+    let status = if failed_count > 0 || no_selected_frames || no_selected_usable_frames {
+        "failed"
+    } else if review_required_count > 0 || !issues.is_empty() {
+        "review_required"
+    } else {
+        "passed"
+    }
+    .to_string();
+
+    frames.shrink_to_fit();
+    let review = summarize_roll_suite_review(&frames, &issues);
+    let quality = summarize_roll_suite_quality(&frames);
+    RollSuiteSummary {
+        status,
+        roll_dir: inventory.roll_dir.clone(),
+        roll_name: inventory.roll_name.clone(),
+        frame_count: frames.len(),
+        passed_count,
+        review_required_count,
+        failed_count,
+        output_dir: output_root.display().to_string(),
+        roll_base_color: roll_base_estimate.as_ref().map(|estimate| estimate.color),
+        roll_base_source: roll_base_estimate
+            .as_ref()
+            .map(|estimate| estimate.source.clone())
+            .or_else(|| {
+                (cli.input_mode == InputMode::Negative && cli.base_color.is_some())
+                    .then(|| "manual_cli_base_color".to_string())
+            }),
+        roll_base_confidence: roll_base_estimate
+            .as_ref()
+            .map(|estimate| estimate.confidence),
+        roll_base_frame_count: roll_base_estimate
+            .as_ref()
+            .map(|estimate| estimate.frame_count)
+            .unwrap_or(0),
+        roll_base_candidate_count: roll_base_estimate
+            .as_ref()
+            .map(|estimate| estimate.candidate_count)
+            .unwrap_or(0),
+        roll_base_rejected_dark_candidate_count: roll_base_estimate
+            .as_ref()
+            .map(|estimate| estimate.rejected_dark_candidate_count)
+            .unwrap_or(0),
+        roll_base_high_transmittance_envelope: roll_base_estimate
+            .as_ref()
+            .map(|estimate| estimate.high_transmittance_envelope),
+        roll_base_reason: roll_base_estimate
+            .as_ref()
+            .map(|estimate| estimate.reason.clone()),
+        roll_base_clusters: roll_base_estimate
+            .as_ref()
+            .map(|estimate| estimate.clusters.clone())
+            .unwrap_or_default(),
+        review,
+        quality,
+        comparison: None,
+        inventory,
+        frames,
+        issues,
+    }
+}
+
+fn roll_suite_render_frames<'a>(
+    cli: &ValidationCli,
+    frames: &'a [RollFrameInspection],
+    issues: &mut Vec<String>,
+) -> Vec<&'a RollFrameInspection> {
+    if cli.roll_suite_frames.is_empty() {
+        return frames.iter().collect();
+    }
+
+    let mut selected_indices = BTreeSet::<usize>::new();
+    for selector in &cli.roll_suite_frames {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            continue;
+        }
+        let mut matched = false;
+        for (idx, frame) in frames.iter().enumerate() {
+            if roll_suite_frame_matches(frame, selector) {
+                selected_indices.insert(idx);
+                matched = true;
+            }
+        }
+        if !matched {
+            issues.push(format!(
+                "roll_suite:frame_selector_not_found:{}",
+                roll_suite_selector_token(selector)
+            ));
+        }
+    }
+
+    selected_indices
+        .into_iter()
+        .filter_map(|idx| frames.get(idx))
+        .collect()
+}
+
+fn roll_suite_frame_matches(frame: &RollFrameInspection, selector: &str) -> bool {
+    let selector = roll_suite_selector_token(selector);
+    let candidates = [
+        frame.name.clone(),
+        frame.stem.clone(),
+        roll_frame_slug(frame),
+        roll_frame_issue_label(frame),
+    ];
+    candidates
+        .iter()
+        .any(|candidate| roll_suite_selector_token(candidate) == selector)
+}
+
+fn roll_suite_selector_token(selector: &str) -> String {
+    let path = Path::new(selector);
+    let label = path
+        .file_stem()
+        .or_else(|| path.file_name())
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_else(|| selector.into());
+    let mut token = String::new();
+    let mut last_was_dash = false;
+    for ch in label.chars() {
+        if ch.is_ascii_alphanumeric() {
+            token.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash {
+            token.push('-');
+            last_was_dash = true;
+        }
+    }
+    token.trim_matches('-').to_string()
+}
+
+fn summarize_roll_suite_review(
+    frames: &[RollSuiteEntry],
+    issues: &[String],
+) -> RollSuiteReviewSummary {
+    RollSuiteReviewSummary {
+        frame_count: frames.len(),
+        candidate_safe_count: frames
+            .iter()
+            .filter(|frame| frame.candidate_risk.as_deref() == Some("safe"))
+            .count(),
+        candidate_review_required_count: frames
+            .iter()
+            .filter(|frame| {
+                frame
+                    .candidate_risk
+                    .as_deref()
+                    .is_some_and(|risk| risk != "safe")
+            })
+            .count(),
+        candidate_unknown_count: frames
+            .iter()
+            .filter(|frame| frame.candidate_risk.as_deref().is_none_or(str::is_empty))
+            .count(),
+        tone_color_trusted_count: frames
+            .iter()
+            .filter(|frame| frame.tone_color_trust_state.as_deref() == Some("trusted"))
+            .count(),
+        tone_color_review_required_count: frames
+            .iter()
+            .filter(|frame| {
+                frame
+                    .tone_color_trust_state
+                    .as_deref()
+                    .is_some_and(|state| state != "trusted")
+            })
+            .count(),
+        tone_color_unknown_count: frames
+            .iter()
+            .filter(|frame| {
+                frame
+                    .tone_color_trust_state
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+            })
+            .count(),
+        reference_patch_evaluation_present_count: frames
+            .iter()
+            .filter(|frame| frame.reference_patch_evaluation_present == Some(true))
+            .count(),
+        reference_patch_evaluation_missing_count: frames
+            .iter()
+            .filter(|frame| frame.reference_patch_evaluation_present == Some(false))
+            .count(),
+        reference_patch_evaluation_unknown_count: frames
+            .iter()
+            .filter(|frame| frame.reference_patch_evaluation_present.is_none())
+            .count(),
+        candidate_risk_counts: roll_suite_value_counts(
+            frames.iter().map(|frame| frame.candidate_risk.as_deref()),
+        ),
+        tone_color_trust_state_counts: roll_suite_value_counts(
+            frames
+                .iter()
+                .map(|frame| frame.tone_color_trust_state.as_deref()),
+        ),
+        calibration_status_counts: roll_suite_value_counts(
+            frames
+                .iter()
+                .map(|frame| frame.calibration_status.as_deref()),
+        ),
+        issue_counts: roll_suite_value_counts(
+            issues
+                .iter()
+                .map(|issue| Some(roll_suite_issue_kind(issue.as_str()))),
+        ),
+    }
+}
+
+fn roll_suite_value_counts<'a>(
+    values: impl Iterator<Item = Option<&'a str>>,
+) -> Vec<RollSuiteValueCount> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for value in values {
+        let value = value
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown")
+            .to_string();
+        *counts.entry(value).or_insert(0) += 1;
+    }
+    let mut counts = counts
+        .into_iter()
+        .map(|(value, count)| RollSuiteValueCount { value, count })
+        .collect::<Vec<_>>();
+    counts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
+    counts
+}
+
+fn roll_suite_issue_kind(issue: &str) -> &str {
+    let mut parts = issue.splitn(3, ':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("roll_suite"), Some(_frame), Some(kind)) if !kind.is_empty() => kind,
+        _ => issue,
+    }
+}
+
+fn summarize_roll_suite_quality(frames: &[RollSuiteEntry]) -> RollSuiteQualitySummary {
+    let midtone_luminance_p50_min =
+        min_optional(frames.iter().map(|frame| frame.midtone_luminance_p50));
+    let midtone_luminance_p50_max =
+        max_optional(frames.iter().map(|frame| frame.midtone_luminance_p50));
+    let midtone_luminance_p50_range = match (midtone_luminance_p50_min, midtone_luminance_p50_max) {
+        (Some(min), Some(max)) => Some(max - min),
+        _ => None,
+    };
+
+    RollSuiteQualitySummary {
+        frame_count: frames.len(),
+        high_frequency_frame_count: frames
+            .iter()
+            .filter(|frame| {
+                frame.high_frequency_luma_residual_p95.is_some()
+                    || frame.high_frequency_chroma_residual_p95.is_some()
+                    || frame.high_frequency_chroma_to_luma_p95_ratio.is_some()
+            })
+            .count(),
+        high_frequency_luma_residual_p95_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.high_frequency_luma_residual_p95),
+        ),
+        high_frequency_luma_residual_p95_max: max_optional(
+            frames
+                .iter()
+                .map(|frame| frame.high_frequency_luma_residual_p95),
+        ),
+        high_frequency_chroma_residual_p95_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.high_frequency_chroma_residual_p95),
+        ),
+        high_frequency_chroma_residual_p95_max: max_optional(
+            frames
+                .iter()
+                .map(|frame| frame.high_frequency_chroma_residual_p95),
+        ),
+        high_frequency_chroma_to_luma_p95_ratio_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.high_frequency_chroma_to_luma_p95_ratio),
+        ),
+        high_frequency_chroma_to_luma_p95_ratio_max: max_optional(
+            frames
+                .iter()
+                .map(|frame| frame.high_frequency_chroma_to_luma_p95_ratio),
+        ),
+        high_frequency_flat_frame_count: frames
+            .iter()
+            .filter(|frame| frame.high_frequency_flat_sample_count.unwrap_or(0) > 0)
+            .count(),
+        high_frequency_flat_sample_ratio_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.high_frequency_flat_sample_ratio),
+        ),
+        high_frequency_flat_luma_residual_p95_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.high_frequency_flat_luma_residual_p95),
+        ),
+        high_frequency_flat_luma_residual_p95_max: max_optional(
+            frames
+                .iter()
+                .map(|frame| frame.high_frequency_flat_luma_residual_p95),
+        ),
+        high_frequency_flat_chroma_residual_p95_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.high_frequency_flat_chroma_residual_p95),
+        ),
+        high_frequency_flat_chroma_residual_p95_max: max_optional(
+            frames
+                .iter()
+                .map(|frame| frame.high_frequency_flat_chroma_residual_p95),
+        ),
+        high_frequency_flat_chroma_to_luma_p95_ratio_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.high_frequency_flat_chroma_to_luma_p95_ratio),
+        ),
+        high_frequency_flat_chroma_to_luma_p95_ratio_max: max_optional(
+            frames
+                .iter()
+                .map(|frame| frame.high_frequency_flat_chroma_to_luma_p95_ratio),
+        ),
+        noise_reduction_enabled_count: frames
+            .iter()
+            .filter(|frame| frame.noise_reduction_enabled == Some(true))
+            .count(),
+        noise_reduction_applied_ratio_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.noise_reduction_applied_ratio),
+        ),
+        noise_reduction_applied_ratio_max: max_optional(
+            frames
+                .iter()
+                .map(|frame| frame.noise_reduction_applied_ratio),
+        ),
+        noise_reduction_texture_limited_ratio_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.noise_reduction_texture_limited_ratio),
+        ),
+        noise_reduction_saturation_limited_ratio_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.noise_reduction_saturation_limited_ratio),
+        ),
+        noise_reduction_mean_abs_chroma_delta_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.noise_reduction_mean_abs_chroma_delta),
+        ),
+        noise_reduction_mean_abs_luma_delta_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.noise_reduction_mean_abs_luma_delta),
+        ),
+        noise_reduction_max_abs_chroma_delta_max: max_optional(
+            frames
+                .iter()
+                .map(|frame| frame.noise_reduction_max_abs_chroma_delta),
+        ),
+        noise_reduction_max_abs_luma_delta_max: max_optional(
+            frames
+                .iter()
+                .map(|frame| frame.noise_reduction_max_abs_luma_delta),
+        ),
+        colorspace_post_scale_preserved_ratio_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.colorspace_post_scale_preserved_ratio),
+        ),
+        colorspace_post_scale_preserved_ratio_min: min_optional(
+            frames
+                .iter()
+                .map(|frame| frame.colorspace_post_scale_preserved_ratio),
+        ),
+        render_luminance_range_p05_p95_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.render_luminance_range_p05_p95),
+        ),
+        render_luminance_range_p05_p95_min: min_optional(
+            frames
+                .iter()
+                .map(|frame| frame.render_luminance_range_p05_p95),
+        ),
+        render_luminance_range_p05_p95_max: max_optional(
+            frames
+                .iter()
+                .map(|frame| frame.render_luminance_range_p05_p95),
+        ),
+        midtone_luminance_p50_mean: mean_optional(
+            frames.iter().map(|frame| frame.midtone_luminance_p50),
+        ),
+        midtone_luminance_p50_min,
+        midtone_luminance_p50_max,
+        midtone_luminance_p50_range,
+        shadow_saturation_p95_mean: mean_optional(
+            frames.iter().map(|frame| frame.shadow_saturation_p95),
+        ),
+        shadow_saturation_p95_max: max_optional(
+            frames.iter().map(|frame| frame.shadow_saturation_p95),
+        ),
+        shadow_visible_saturation_p95_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.shadow_visible_saturation_p95),
+        ),
+        shadow_visible_saturation_p95_max: max_optional(
+            frames
+                .iter()
+                .map(|frame| frame.shadow_visible_saturation_p95),
+        ),
+        midtone_neutral_saturation_p95_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.midtone_neutral_saturation_p95),
+        ),
+        midtone_neutral_saturation_p95_max: max_optional(
+            frames
+                .iter()
+                .map(|frame| frame.midtone_neutral_saturation_p95),
+        ),
+        bright_neutral_saturation_p95_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.bright_neutral_saturation_p95),
+        ),
+        bright_neutral_saturation_p95_max: max_optional(
+            frames
+                .iter()
+                .map(|frame| frame.bright_neutral_saturation_p95),
+        ),
+        shadow_rgb_balance_delta_mean: mean_optional(
+            frames.iter().map(|frame| frame.shadow_rgb_balance_delta),
+        ),
+        shadow_rgb_balance_delta_max: max_optional(
+            frames.iter().map(|frame| frame.shadow_rgb_balance_delta),
+        ),
+        shadow_visible_rgb_balance_delta_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.shadow_visible_rgb_balance_delta),
+        ),
+        shadow_visible_rgb_balance_delta_max: max_optional(
+            frames
+                .iter()
+                .map(|frame| frame.shadow_visible_rgb_balance_delta),
+        ),
+        midtone_rgb_balance_delta_mean: mean_optional(
+            frames.iter().map(|frame| frame.midtone_rgb_balance_delta),
+        ),
+        midtone_rgb_balance_delta_max: max_optional(
+            frames.iter().map(|frame| frame.midtone_rgb_balance_delta),
+        ),
+        midtone_neutral_rgb_balance_delta_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.midtone_neutral_rgb_balance_delta),
+        ),
+        midtone_neutral_rgb_balance_delta_max: max_optional(
+            frames
+                .iter()
+                .map(|frame| frame.midtone_neutral_rgb_balance_delta),
+        ),
+        bright_neutral_rgb_balance_delta_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.bright_neutral_rgb_balance_delta),
+        ),
+        bright_neutral_rgb_balance_delta_max: max_optional(
+            frames
+                .iter()
+                .map(|frame| frame.bright_neutral_rgb_balance_delta),
+        ),
+        highlight_chroma_compressed_ratio_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.highlight_chroma_compressed_ratio),
+        ),
+        highlight_chroma_compressed_ratio_max: max_optional(
+            frames
+                .iter()
+                .map(|frame| frame.highlight_chroma_compressed_ratio),
+        ),
+        shadow_chroma_compressed_ratio_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.shadow_chroma_compressed_ratio),
+        ),
+        shadow_chroma_compressed_ratio_max: max_optional(
+            frames
+                .iter()
+                .map(|frame| frame.shadow_chroma_compressed_ratio),
+        ),
+        post_chroma_compression_clipped_high_max: max_optional(
+            frames
+                .iter()
+                .map(|frame| frame.post_chroma_compression_clipped_high_max),
+        ),
+        post_chroma_compression_clipped_low_max: max_optional(
+            frames
+                .iter()
+                .map(|frame| frame.post_chroma_compression_clipped_low_max),
+        ),
+    }
+}
+
+fn mean_optional(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for value in values.flatten().filter(|value| value.is_finite()) {
+        sum += value;
+        count += 1;
+    }
+    (count > 0).then_some(sum / count as f64)
+}
+
+fn max_optional(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    values
+        .flatten()
+        .filter(|value| value.is_finite())
+        .max_by(|a, b| a.total_cmp(b))
+}
+
+fn min_optional(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    values
+        .flatten()
+        .filter(|value| value.is_finite())
+        .min_by(|a, b| a.total_cmp(b))
+}
+
+fn compare_roll_suites(
+    baseline_path: String,
+    baseline: &serde_json::Value,
+    current: &serde_json::Value,
+) -> RollSuiteComparison {
+    const MIDTONE_MIN_DROP_THRESHOLD: f64 = -0.02;
+    const MIDTONE_RANGE_INCREASE_THRESHOLD: f64 = 0.02;
+    const CHROMA_MEAN_INCREASE_THRESHOLD: f64 = 0.005;
+    const CHROMA_MAX_INCREASE_THRESHOLD: f64 = 0.010;
+    const FLAT_CHROMA_MEAN_INCREASE_THRESHOLD: f64 = 0.003;
+    const BALANCE_MAX_INCREASE_THRESHOLD: f64 = 0.020;
+    const PRESERVED_MIN_DROP_THRESHOLD: f64 = -0.005;
+    const CLIP_HIGH_INCREASE_THRESHOLD: f64 = 0.001;
+    const RENDER_LUMINANCE_RANGE_DROP_THRESHOLD: f64 = -0.03;
+    const FRAME_MIDTONE_DROP_THRESHOLD: f64 = -0.03;
+    const FRAME_RENDER_LUMINANCE_RANGE_DROP_THRESHOLD: f64 = -0.05;
+    const FRAME_CHROMA_INCREASE_THRESHOLD: f64 = 0.02;
+    const FRAME_FLAT_CHROMA_INCREASE_THRESHOLD: f64 = 0.01;
+    const FRAME_BALANCE_INCREASE_THRESHOLD: f64 = 0.04;
+    const FRAME_PRESERVED_DROP_THRESHOLD: f64 = -0.01;
+
+    let baseline_frames = roll_suite_frames_by_name(baseline);
+    let current_frames = roll_suite_frames_by_name(current);
+    let baseline_names = baseline_frames.keys().cloned().collect::<BTreeSet<_>>();
+    let current_names = current_frames.keys().cloned().collect::<BTreeSet<_>>();
+    let baseline_only_frames = baseline_names
+        .difference(&current_names)
+        .cloned()
+        .collect::<Vec<_>>();
+    let current_only_frames = current_names
+        .difference(&baseline_names)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let quality = RollSuiteQualityComparison {
+        render_luminance_range_p05_p95_mean_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "render_luminance_range_p05_p95_mean",
+        ),
+        render_luminance_range_p05_p95_min_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "render_luminance_range_p05_p95_min",
+        ),
+        render_luminance_range_p05_p95_max_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "render_luminance_range_p05_p95_max",
+        ),
+        midtone_luminance_p50_mean_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "midtone_luminance_p50_mean",
+        ),
+        midtone_luminance_p50_min_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "midtone_luminance_p50_min",
+        ),
+        midtone_luminance_p50_max_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "midtone_luminance_p50_max",
+        ),
+        midtone_luminance_p50_range_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "midtone_luminance_p50_range",
+        ),
+        shadow_saturation_p95_mean_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "shadow_saturation_p95_mean",
+        ),
+        shadow_saturation_p95_max_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "shadow_saturation_p95_max",
+        ),
+        midtone_neutral_saturation_p95_mean_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "midtone_neutral_saturation_p95_mean",
+        ),
+        midtone_neutral_saturation_p95_max_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "midtone_neutral_saturation_p95_max",
+        ),
+        bright_neutral_saturation_p95_mean_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "bright_neutral_saturation_p95_mean",
+        ),
+        bright_neutral_saturation_p95_max_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "bright_neutral_saturation_p95_max",
+        ),
+        midtone_neutral_rgb_balance_delta_mean_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "midtone_neutral_rgb_balance_delta_mean",
+        ),
+        midtone_neutral_rgb_balance_delta_max_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "midtone_neutral_rgb_balance_delta_max",
+        ),
+        bright_neutral_rgb_balance_delta_mean_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "bright_neutral_rgb_balance_delta_mean",
+        ),
+        bright_neutral_rgb_balance_delta_max_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "bright_neutral_rgb_balance_delta_max",
+        ),
+        high_frequency_chroma_residual_p95_mean_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "high_frequency_chroma_residual_p95_mean",
+        ),
+        high_frequency_chroma_residual_p95_max_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "high_frequency_chroma_residual_p95_max",
+        ),
+        high_frequency_flat_chroma_residual_p95_mean_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "high_frequency_flat_chroma_residual_p95_mean",
+        ),
+        high_frequency_flat_chroma_residual_p95_max_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "high_frequency_flat_chroma_residual_p95_max",
+        ),
+        high_frequency_chroma_to_luma_p95_ratio_mean_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "high_frequency_chroma_to_luma_p95_ratio_mean",
+        ),
+        high_frequency_flat_chroma_to_luma_p95_ratio_mean_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "high_frequency_flat_chroma_to_luma_p95_ratio_mean",
+        ),
+        noise_reduction_saturation_limited_ratio_mean_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "noise_reduction_saturation_limited_ratio_mean",
+        ),
+        noise_reduction_mean_abs_chroma_delta_mean_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "noise_reduction_mean_abs_chroma_delta_mean",
+        ),
+        colorspace_post_scale_preserved_ratio_min_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "colorspace_post_scale_preserved_ratio_min",
+        ),
+        post_chroma_compression_clipped_high_max_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "post_chroma_compression_clipped_high_max",
+        ),
+        post_chroma_compression_clipped_low_max_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "post_chroma_compression_clipped_low_max",
+        ),
+    };
+
+    let mut issues = Vec::new();
+    let frame_count_delta =
+        roll_suite_isize_delta(baseline, current, "frame_count").unwrap_or_default();
+    let review_required_count_delta =
+        roll_suite_isize_delta(baseline, current, "review_required_count").unwrap_or_default();
+    let failed_count_delta =
+        roll_suite_isize_delta(baseline, current, "failed_count").unwrap_or_default();
+    let frame_set_changed = frame_count_delta != 0
+        || !baseline_only_frames.is_empty()
+        || !current_only_frames.is_empty();
+    if frame_set_changed {
+        issues.push("roll_suite_compare:frame_set_changed".to_string());
+    }
+    if failed_count_delta > 0 {
+        issues.push("roll_suite_compare:failed_count_increased".to_string());
+    }
+    if review_required_count_delta > 0 {
+        issues.push("roll_suite_compare:review_required_count_increased".to_string());
+    }
+    if !frame_set_changed {
+        if option_lt(
+            quality.midtone_luminance_p50_min_delta,
+            MIDTONE_MIN_DROP_THRESHOLD,
+        ) {
+            issues.push("roll_suite_compare:midtone_luminance_p50_min_dropped".to_string());
+        }
+        if option_gt(
+            quality.midtone_luminance_p50_range_delta,
+            MIDTONE_RANGE_INCREASE_THRESHOLD,
+        ) {
+            issues.push("roll_suite_compare:midtone_luminance_p50_range_increased".to_string());
+        }
+        if option_lt(
+            quality.render_luminance_range_p05_p95_mean_delta,
+            RENDER_LUMINANCE_RANGE_DROP_THRESHOLD,
+        ) {
+            issues.push("roll_suite_compare:render_luminance_range_mean_dropped".to_string());
+        }
+        if option_lt(
+            quality.render_luminance_range_p05_p95_min_delta,
+            RENDER_LUMINANCE_RANGE_DROP_THRESHOLD,
+        ) {
+            issues.push("roll_suite_compare:render_luminance_range_min_dropped".to_string());
+        }
+        if option_gt(
+            quality.high_frequency_chroma_residual_p95_mean_delta,
+            CHROMA_MEAN_INCREASE_THRESHOLD,
+        ) {
+            issues.push("roll_suite_compare:chroma_residual_p95_mean_increased".to_string());
+        }
+        if option_gt(
+            quality.high_frequency_chroma_residual_p95_max_delta,
+            CHROMA_MAX_INCREASE_THRESHOLD,
+        ) {
+            issues.push("roll_suite_compare:chroma_residual_p95_max_increased".to_string());
+        }
+        if option_gt(
+            quality.high_frequency_flat_chroma_residual_p95_mean_delta,
+            FLAT_CHROMA_MEAN_INCREASE_THRESHOLD,
+        ) {
+            issues.push("roll_suite_compare:flat_chroma_residual_p95_mean_increased".to_string());
+        }
+        if option_gt(
+            quality.midtone_neutral_rgb_balance_delta_max_delta,
+            BALANCE_MAX_INCREASE_THRESHOLD,
+        ) {
+            issues
+                .push("roll_suite_compare:midtone_neutral_balance_delta_max_increased".to_string());
+        }
+        if option_gt(
+            quality.bright_neutral_rgb_balance_delta_max_delta,
+            BALANCE_MAX_INCREASE_THRESHOLD,
+        ) {
+            issues
+                .push("roll_suite_compare:bright_neutral_balance_delta_max_increased".to_string());
+        }
+        if option_lt(
+            quality.colorspace_post_scale_preserved_ratio_min_delta,
+            PRESERVED_MIN_DROP_THRESHOLD,
+        ) {
+            issues.push("roll_suite_compare:preserved_gamut_min_dropped".to_string());
+        }
+        if option_gt(
+            quality.post_chroma_compression_clipped_high_max_delta,
+            CLIP_HIGH_INCREASE_THRESHOLD,
+        ) {
+            issues.push("roll_suite_compare:post_tone_high_clipping_increased".to_string());
+        }
+    }
+
+    let mut frame_comparisons = Vec::new();
+    for name in baseline_names.union(&current_names) {
+        let baseline_frame = baseline_frames.get(name);
+        let current_frame = current_frames.get(name);
+        let baseline_status = baseline_frame.and_then(|frame| roll_suite_string(frame, "status"));
+        let current_status = current_frame.and_then(|frame| roll_suite_string(frame, "status"));
+        let baseline_candidate_risk =
+            baseline_frame.and_then(|frame| roll_suite_string(frame, "candidate_risk"));
+        let current_candidate_risk =
+            current_frame.and_then(|frame| roll_suite_string(frame, "candidate_risk"));
+        let comparison = RollSuiteFrameComparison {
+            name: name.clone(),
+            status_changed: baseline_status != current_status,
+            baseline_status,
+            current_status,
+            candidate_risk_changed: baseline_candidate_risk != current_candidate_risk,
+            baseline_candidate_risk,
+            current_candidate_risk,
+            render_luminance_range_p05_p95_delta: roll_suite_frame_delta(
+                baseline_frame.copied(),
+                current_frame.copied(),
+                "render_luminance_range_p05_p95",
+            ),
+            midtone_luminance_p50_delta: roll_suite_frame_delta(
+                baseline_frame.copied(),
+                current_frame.copied(),
+                "midtone_luminance_p50",
+            ),
+            shadow_saturation_p95_delta: roll_suite_frame_delta(
+                baseline_frame.copied(),
+                current_frame.copied(),
+                "shadow_saturation_p95",
+            ),
+            midtone_neutral_saturation_p95_delta: roll_suite_frame_delta(
+                baseline_frame.copied(),
+                current_frame.copied(),
+                "midtone_neutral_saturation_p95",
+            ),
+            bright_neutral_saturation_p95_delta: roll_suite_frame_delta(
+                baseline_frame.copied(),
+                current_frame.copied(),
+                "bright_neutral_saturation_p95",
+            ),
+            midtone_neutral_rgb_balance_delta_delta: roll_suite_frame_delta(
+                baseline_frame.copied(),
+                current_frame.copied(),
+                "midtone_neutral_rgb_balance_delta",
+            ),
+            bright_neutral_rgb_balance_delta_delta: roll_suite_frame_delta(
+                baseline_frame.copied(),
+                current_frame.copied(),
+                "bright_neutral_rgb_balance_delta",
+            ),
+            high_frequency_chroma_residual_p95_delta: roll_suite_frame_delta(
+                baseline_frame.copied(),
+                current_frame.copied(),
+                "high_frequency_chroma_residual_p95",
+            ),
+            high_frequency_flat_chroma_residual_p95_delta: roll_suite_frame_delta(
+                baseline_frame.copied(),
+                current_frame.copied(),
+                "high_frequency_flat_chroma_residual_p95",
+            ),
+            colorspace_post_scale_preserved_ratio_delta: roll_suite_frame_delta(
+                baseline_frame.copied(),
+                current_frame.copied(),
+                "colorspace_post_scale_preserved_ratio",
+            ),
+            post_chroma_compression_clipped_high_max_delta: roll_suite_frame_delta(
+                baseline_frame.copied(),
+                current_frame.copied(),
+                "post_chroma_compression_clipped_high_max",
+            ),
+            post_chroma_compression_clipped_low_max_delta: roll_suite_frame_delta(
+                baseline_frame.copied(),
+                current_frame.copied(),
+                "post_chroma_compression_clipped_low_max",
+            ),
+        };
+
+        if comparison.current_status.as_deref() == Some("failed")
+            && comparison.baseline_status.as_deref() != Some("failed")
+        {
+            issues.push(format!(
+                "roll_suite_compare:{}:status_regressed_to_failed",
+                roll_frame_issue_token(name)
+            ));
+        }
+        if baseline_frame.is_some()
+            && current_frame.is_some()
+            && roll_suite_risk_rank(comparison.current_candidate_risk.as_deref())
+                > roll_suite_risk_rank(comparison.baseline_candidate_risk.as_deref())
+        {
+            issues.push(format!(
+                "roll_suite_compare:{}:candidate_risk_regressed",
+                roll_frame_issue_token(name)
+            ));
+        }
+        if option_lt(
+            comparison.midtone_luminance_p50_delta,
+            FRAME_MIDTONE_DROP_THRESHOLD,
+        ) {
+            issues.push(format!(
+                "roll_suite_compare:{}:midtone_luminance_p50_dropped",
+                roll_frame_issue_token(name)
+            ));
+        }
+        if option_lt(
+            comparison.render_luminance_range_p05_p95_delta,
+            FRAME_RENDER_LUMINANCE_RANGE_DROP_THRESHOLD,
+        ) {
+            issues.push(format!(
+                "roll_suite_compare:{}:render_luminance_range_dropped",
+                roll_frame_issue_token(name)
+            ));
+        }
+        if option_gt(
+            comparison.high_frequency_chroma_residual_p95_delta,
+            FRAME_CHROMA_INCREASE_THRESHOLD,
+        ) {
+            issues.push(format!(
+                "roll_suite_compare:{}:chroma_residual_p95_increased",
+                roll_frame_issue_token(name)
+            ));
+        }
+        if option_gt(
+            comparison.high_frequency_flat_chroma_residual_p95_delta,
+            FRAME_FLAT_CHROMA_INCREASE_THRESHOLD,
+        ) {
+            issues.push(format!(
+                "roll_suite_compare:{}:flat_chroma_residual_p95_increased",
+                roll_frame_issue_token(name)
+            ));
+        }
+        if option_gt(
+            comparison.midtone_neutral_rgb_balance_delta_delta,
+            FRAME_BALANCE_INCREASE_THRESHOLD,
+        ) || option_gt(
+            comparison.bright_neutral_rgb_balance_delta_delta,
+            FRAME_BALANCE_INCREASE_THRESHOLD,
+        ) {
+            issues.push(format!(
+                "roll_suite_compare:{}:neutral_balance_delta_increased",
+                roll_frame_issue_token(name)
+            ));
+        }
+        if option_lt(
+            comparison.colorspace_post_scale_preserved_ratio_delta,
+            FRAME_PRESERVED_DROP_THRESHOLD,
+        ) {
+            issues.push(format!(
+                "roll_suite_compare:{}:preserved_gamut_dropped",
+                roll_frame_issue_token(name)
+            ));
+        }
+        if option_gt(
+            comparison.post_chroma_compression_clipped_high_max_delta,
+            CLIP_HIGH_INCREASE_THRESHOLD,
+        ) {
+            issues.push(format!(
+                "roll_suite_compare:{}:post_tone_high_clipping_increased",
+                roll_frame_issue_token(name)
+            ));
+        }
+
+        frame_comparisons.push(comparison);
+    }
+
+    RollSuiteComparison {
+        baseline_path,
+        status: if issues.is_empty() {
+            "comparable".to_string()
+        } else {
+            "review_required".to_string()
+        },
+        issues,
+        frame_count_delta,
+        review_required_count_delta,
+        failed_count_delta,
+        baseline_only_frames,
+        current_only_frames,
+        quality,
+        frames: frame_comparisons,
+    }
+}
+
+fn roll_suite_frames_by_name(summary: &serde_json::Value) -> BTreeMap<String, &serde_json::Value> {
+    summary
+        .get("frames")
+        .and_then(|frames| frames.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|frame| Some((roll_suite_string(frame, "name")?, frame)))
+        .collect()
+}
+
+fn roll_suite_quality_delta(
+    baseline: &serde_json::Value,
+    current: &serde_json::Value,
+    field: &str,
+) -> Option<f64> {
+    f64_delta(
+        roll_suite_quality_value(baseline, field),
+        roll_suite_quality_value(current, field),
+    )
+}
+
+fn roll_suite_quality_value(summary: &serde_json::Value, field: &str) -> Option<f64> {
+    if let Some(value) = summary
+        .get("quality")
+        .and_then(|quality| quality.get(field))
+        .and_then(|value| value.as_f64())
+    {
+        return Some(value);
+    }
+
+    match field {
+        "midtone_luminance_p50_max" => {
+            roll_suite_frame_metric_extreme(summary, "midtone_luminance_p50", f64::max)
+        }
+        "midtone_luminance_p50_range" => {
+            let min = roll_suite_frame_metric_extreme(summary, "midtone_luminance_p50", f64::min)?;
+            let max = roll_suite_frame_metric_extreme(summary, "midtone_luminance_p50", f64::max)?;
+            Some(max - min)
+        }
+        _ => None,
+    }
+}
+
+fn roll_suite_frame_metric_extreme(
+    summary: &serde_json::Value,
+    field: &str,
+    combine: fn(f64, f64) -> f64,
+) -> Option<f64> {
+    let mut result = None::<f64>;
+    for value in summary
+        .get("frames")
+        .and_then(|frames| frames.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|frame| frame.get(field).and_then(|value| value.as_f64()))
+        .filter(|value| value.is_finite())
+    {
+        result = Some(match result {
+            Some(current) => combine(current, value),
+            None => value,
+        });
+    }
+    result
+}
+
+fn roll_suite_frame_delta(
+    baseline: Option<&serde_json::Value>,
+    current: Option<&serde_json::Value>,
+    field: &str,
+) -> Option<f64> {
+    f64_delta(
+        baseline?.get(field)?.as_f64(),
+        current?.get(field)?.as_f64(),
+    )
+}
+
+fn roll_suite_isize_delta(
+    baseline: &serde_json::Value,
+    current: &serde_json::Value,
+    field: &str,
+) -> Option<isize> {
+    Some(current.get(field)?.as_i64()? as isize - baseline.get(field)?.as_i64()? as isize)
+}
+
+fn roll_suite_string(value: &serde_json::Value, field: &str) -> Option<String> {
+    value.get(field)?.as_str().map(ToString::to_string)
+}
+
+fn f64_delta(baseline: Option<f64>, current: Option<f64>) -> Option<f64> {
+    Some(current? - baseline?)
+}
+
+fn option_gt(value: Option<f64>, threshold: f64) -> bool {
+    value.is_some_and(|value| value > threshold)
+}
+
+fn option_lt(value: Option<f64>, threshold: f64) -> bool {
+    value.is_some_and(|value| value < threshold)
+}
+
+fn roll_suite_risk_rank(risk: Option<&str>) -> u8 {
+    match risk {
+        Some("safe") => 0,
+        Some(risk) if risk.starts_with("review_") => 1,
+        Some(_) => 2,
+        None => 2,
+    }
+}
+
+fn roll_frame_issue_token(name: &str) -> String {
+    name.trim_end_matches(".tif")
+        .trim_end_matches(".tiff")
+        .to_ascii_lowercase()
+        .replace('_', "-")
+}
+
+fn max_f64_slice(values: Option<&[f64]>) -> Option<f64> {
+    values.and_then(|values| {
+        values
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .max_by(|a, b| a.total_cmp(b))
+    })
+}
+
+fn phase_f64_vec_metric(
+    report: &PipelineReport,
+    phase_name: &str,
+    metric: &str,
+) -> Option<Vec<f64>> {
+    let phase = report
+        .phases
+        .iter()
+        .find(|phase| phase.name == phase_name)?;
+    let values = phase.metrics.get(metric)?.as_array()?;
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        out.push(value.as_f64()?);
+    }
+    Some(out)
+}
+
+fn phase_usize_metric(report: &PipelineReport, phase_name: &str, metric: &str) -> Option<usize> {
+    let value = report
+        .phases
+        .iter()
+        .find(|phase| phase.name == phase_name)?
+        .metrics
+        .get(metric)?
+        .as_u64()?;
+    usize::try_from(value).ok()
+}
+
+fn rgb_balance_delta(values: &[f64]) -> Option<f64> {
+    if values.len() < 3 {
+        return None;
+    }
+    let rgb = [values[0], values[1], values[2]];
+    if !rgb.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    let max_value = rgb
+        .iter()
+        .copied()
+        .max_by(|a, b| a.total_cmp(b))
+        .unwrap_or(0.0);
+    let min_value = rgb
+        .iter()
+        .copied()
+        .min_by(|a, b| a.total_cmp(b))
+        .unwrap_or(0.0);
+    Some((max_value - min_value).max(0.0))
+}
+
+fn tone_rgb_balance_delta(report: &PipelineReport, metric: &str) -> Option<f64> {
+    let values = phase_f64_vec_metric(report, "tone_mapping", metric)?;
+    rgb_balance_delta(&values)
+}
+
+fn nth_f64_slice(values: Option<&[f64]>, index: usize) -> Option<f64> {
+    values
+        .and_then(|values| values.get(index))
+        .copied()
+        .filter(|value| value.is_finite())
+}
+
+fn derive_roll_base_estimate(
+    cli: &ValidationCli,
+    frames: &[RollFrameInspection],
+) -> Option<RollBaseEstimate> {
+    let mut candidates = Vec::<base_detect::RollBaseCandidate>::new();
+    for frame in frames.iter().filter(|frame| frame.usable) {
+        let path = PathBuf::from(&frame.path);
+        let Ok(loaded) = tiff_io::load_tiff_u16(&path, cli.bit_depth) else {
+            continue;
+        };
+        let prepass_image = roll_base_prepass_image(&loaded.image);
+        let cropped = border::remove_borders_with_diagnostics(&prepass_image, 2).cropped;
+        let detection = base_detect::detect_film_base(&cropped);
+        candidates.push(base_detect::RollBaseCandidate::from_detection(
+            frame.stem.clone(),
+            &detection,
+        ));
+    }
+
+    let consensus = base_detect::roll_consensus_base(&candidates)?;
+
+    Some(RollBaseEstimate {
+        color: consensus.color,
+        source: consensus.source.to_string(),
+        confidence: consensus.confidence,
+        frame_count: consensus.selected_cluster_frame_count,
+        candidate_count: consensus.candidate_count,
+        rejected_dark_candidate_count: consensus.rejected_dark_candidate_count,
+        high_transmittance_envelope: consensus.high_transmittance_envelope,
+        reason: consensus.reason,
+        clusters: consensus
+            .clusters
+            .into_iter()
+            .map(roll_base_cluster_summary)
+            .collect(),
+    })
+}
+
+fn roll_base_prepass_image(image: &Array3<u16>) -> Array3<u16> {
+    let (height, width, channels) = image.dim();
+    let max_dimension = height.max(width);
+    let stride = max_dimension.div_ceil(ROLL_BASE_PREPASS_MAX_DIMENSION);
+    if stride <= 1 {
+        return image.clone();
+    }
+
+    let out_height = height.div_ceil(stride);
+    let out_width = width.div_ceil(stride);
+    let mut sampled = Array3::<u16>::zeros((out_height, out_width, channels));
+    for out_y in 0..out_height {
+        let y = (out_y * stride).min(height.saturating_sub(1));
+        for out_x in 0..out_width {
+            let x = (out_x * stride).min(width.saturating_sub(1));
+            for channel in 0..channels {
+                sampled[[out_y, out_x, channel]] = image[[y, x, channel]];
+            }
+        }
+    }
+    sampled
+}
+
+fn roll_base_cluster_summary(cluster: base_detect::RollBaseCluster) -> RollBaseClusterSummary {
+    RollBaseClusterSummary {
+        color: cluster.color,
+        frame_count: cluster.frame_count,
+        mean_luminance: cluster.mean_luminance,
+        max_relative_luminance_spread: cluster.max_relative_luminance_spread,
+        source_counts: cluster
+            .source_counts
+            .into_iter()
+            .map(|(source, count)| RollBaseSourceCount { source, count })
+            .collect(),
+    }
+}
+
+fn format_base_color(color: [f64; 3]) -> String {
+    format!("{:.6},{:.6},{:.6}", color[0], color[1], color[2])
+}
+
+fn roll_suite_render_input(
+    input_mode: InputMode,
+    render_input: RenderInputMode,
+) -> RenderInputMode {
+    match (input_mode, render_input) {
+        (InputMode::Negative, RenderInputMode::Auto) => RenderInputMode::DirectDensity,
+        (_, explicit) => explicit,
+    }
+}
+
+fn run_roll_suite_pipeline_child(
+    pipeline_cli: &PipelineCli,
+) -> Result<PipelineReport, Box<dyn std::error::Error>> {
+    let report_path = pipeline_cli.output_dir.join("report.json");
+    if report_path.exists() {
+        std::fs::remove_file(&report_path)?;
+    }
+
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("--roll-suite-child")
+        .arg("--component1")
+        .arg(&pipeline_cli.component1)
+        .arg("--component2")
+        .arg(&pipeline_cli.component2)
+        .arg("--output-dir")
+        .arg(&pipeline_cli.output_dir)
+        .arg("--color-mode")
+        .arg(pipeline_cli.color_mode.as_str())
+        .arg("--render-input")
+        .arg(pipeline_cli.render_input.as_str())
+        .arg("--input-mode")
+        .arg(pipeline_cli.input_mode.as_str())
+        .arg("--render-intent")
+        .arg(pipeline_cli.render_intent.as_str())
+        .arg("--quality-mode")
+        .arg(pipeline_cli.quality_mode.as_str())
+        .arg("--transform")
+        .arg(&pipeline_cli.transform)
+        .arg("--ica-max-iter")
+        .arg(pipeline_cli.ica_max_iter.to_string())
+        .arg("--ica-tol")
+        .arg(pipeline_cli.ica_tol.to_string())
+        .arg("--bit-depth")
+        .arg(pipeline_cli.bit_depth.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    if let Some(path) = &pipeline_cli.calibration_profile {
+        command.arg("--calibration-profile").arg(path);
+    }
+    if let Some(path) = &pipeline_cli.calibration_library {
+        command.arg("--calibration-library").arg(path);
+    }
+    if let Some(profile) = &pipeline_cli.scanner_profile {
+        command.arg("--scanner-profile").arg(profile);
+    }
+    if let Some(profile) = &pipeline_cli.roll_profile {
+        command.arg("--roll-profile").arg(profile);
+    }
+    if let Some(film_stock) = &pipeline_cli.film_stock {
+        command.arg("--film-stock").arg(film_stock);
+    }
+    if let Some(base_color) = &pipeline_cli.base_color {
+        command.arg("--base-color").arg(base_color);
+    }
+    if let Some(source) = &pipeline_cli.base_color_source {
+        command.arg("--base-color-source").arg(source);
+    }
+    if let Some(confidence) = pipeline_cli.base_color_confidence {
+        command
+            .arg("--base-color-confidence")
+            .arg(format!("{confidence:.17}"));
+    }
+    if let Some(reason) = &pipeline_cli.base_color_reason {
+        command.arg("--base-color-reason").arg(reason);
+    }
+    if pipeline_cli.write_master {
+        command.arg("--write-master");
+    }
+    if let Some(path) = &pipeline_cli.review_sidecar {
+        command.arg("--review-sidecar").arg(path);
+    }
+    if let Some(path) = &pipeline_cli.write_review_sidecar {
+        command.arg("--write-review-sidecar").arg(path);
+    }
+    if pipeline_cli.debug {
+        command.arg("--debug");
+    }
+    if pipeline_cli.force_stitch {
+        command.arg("--force-stitch");
+    }
+    if pipeline_cli.force_no_stitch {
+        command.arg("--force-no-stitch");
+    }
+    if pipeline_cli.use_opencv {
+        command.arg("--use-opencv");
+    }
+
+    let output = command.output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        let detail = if detail.is_empty() {
+            format!("exit status {}", output.status)
+        } else {
+            format!("exit status {}; stderr: {detail}", output.status)
+        };
+        return Err(format!("roll-suite child pipeline failed: {detail}").into());
+    }
+
+    let contents = std::fs::read_to_string(&report_path)?;
+    Ok(serde_json::from_str::<PipelineReport>(&contents)?)
+}
+
+fn run_roll_suite_entry(
+    cli: &ValidationCli,
+    frame: &RollFrameInspection,
+    output_root: &Path,
+    base_color: Option<&String>,
+    roll_base_estimate: Option<&RollBaseEstimate>,
+) -> RollSuiteEntry {
+    let name = roll_frame_issue_label(frame);
+    let output_dir = output_root.join(roll_frame_slug(frame));
+    let mut entry = RollSuiteEntry {
+        name: frame.name.clone(),
+        source_path: frame.path.clone(),
+        status: "passed".to_string(),
+        output_dir: output_dir.display().to_string(),
+        source_width: frame.width,
+        source_height: frame.height,
+        source_color_type: frame.color_type.clone(),
+        source_bits_per_sample: frame.source_bits_per_sample,
+        output_path: None,
+        output_width: None,
+        output_height: None,
+        output_color_space: None,
+        output_file_icc_profile_matches_report: None,
+        stale_render_artifact_count: None,
+        report_path: None,
+        summary_json_path: None,
+        summary_md_path: None,
+        stitch_decision: None,
+        base_confidence: None,
+        raw_base_confidence: None,
+        base_estimate_source: None,
+        input_base_confidence: None,
+        render_review_status: None,
+        render_reviewable: None,
+        positive_input_likely_negative_like: None,
+        positive_input_accepted_high_warm_score: None,
+        positive_input_orange_mask_score: None,
+        positive_input_reason: None,
+        base_color_override_applied: None,
+        density_confidence: None,
+        render_input_source: None,
+        render_input_reason: None,
+        mapping_strategy: None,
+        selected_mapping_reason: None,
+        selected_candidate: None,
+        selected_candidate_rank: None,
+        selected_quality_score: None,
+        candidate_risk: None,
+        tone_color_trust_state: None,
+        colorspace_pre_scale_preserved_ratio: None,
+        colorspace_post_scale_preserved_ratio: None,
+        render_luminance_p05: None,
+        render_luminance_p50: None,
+        render_luminance_p95: None,
+        render_luminance_range_p05_p95: None,
+        midtone_luminance_p50: None,
+        shadow_saturation_p95: None,
+        shadow_visible_pixel_count: None,
+        shadow_visible_saturation_p95: None,
+        midtone_neutral_pixel_count: None,
+        midtone_neutral_saturation_p95: None,
+        bright_neutral_saturation_p95: None,
+        shadow_rgb_balance_delta: None,
+        shadow_visible_rgb_balance_delta: None,
+        midtone_rgb_balance_delta: None,
+        midtone_neutral_rgb_balance_delta: None,
+        bright_neutral_rgb_balance_delta: None,
+        highlight_chroma_compressed_ratio: None,
+        highlight_neutral_chroma_compressed_ratio: None,
+        shadow_chroma_compressed_ratio: None,
+        post_chroma_compression_clipped_high_max: None,
+        post_chroma_compression_clipped_low_max: None,
+        high_frequency_luma_residual_p95: None,
+        high_frequency_chroma_residual_p95: None,
+        high_frequency_chroma_to_luma_p95_ratio: None,
+        high_frequency_flat_sample_count: None,
+        high_frequency_flat_sample_ratio: None,
+        high_frequency_flat_luma_residual_p95: None,
+        high_frequency_flat_chroma_residual_p95: None,
+        high_frequency_flat_chroma_to_luma_p95_ratio: None,
+        noise_reduction_enabled: None,
+        noise_reduction_applied_ratio: None,
+        noise_reduction_texture_limited_ratio: None,
+        noise_reduction_saturation_limited_ratio: None,
+        noise_reduction_mean_abs_chroma_delta: None,
+        noise_reduction_max_abs_chroma_delta: None,
+        noise_reduction_mean_abs_luma_delta: None,
+        noise_reduction_max_abs_luma_delta: None,
+        calibration_status: None,
+        calibration_source: None,
+        calibration_acceptance_status: None,
+        calibration_confidence: None,
+        reference_patch_evaluation_present: None,
+        debug_artifact_count: None,
+        debug_artifact_invalid_count: None,
+        debug_artifact_kinds: Vec::new(),
+        issues: Vec::new(),
+        error: None,
+    };
+
+    if !frame.usable {
+        entry.status = "failed".to_string();
+        entry
+            .issues
+            .push(format!("roll_suite:{name}:unusable_frame"));
+        entry.error = frame.error.clone();
+        return entry;
+    }
+
+    let source_path = PathBuf::from(&frame.path);
+    let pipeline_cli = PipelineCli {
+        component1: source_path.clone(),
+        component2: source_path,
+        output_dir: output_dir.clone(),
+        calibration_profile: cli.calibration_profile.clone(),
+        calibration_library: cli.calibration_library.clone(),
+        scanner_profile: cli.scanner_profile.clone(),
+        roll_profile: cli.roll_profile.clone(),
+        film_stock: pipeline_film_stock(
+            cli.film_stock.as_ref(),
+            None,
+            cli.calibration_library.as_ref(),
+        ),
+        base_color: base_color.cloned(),
+        base_color_source: roll_base_estimate.map(|estimate| estimate.source.clone()),
+        base_color_confidence: roll_base_estimate.map(|estimate| estimate.confidence),
+        base_color_reason: roll_base_estimate.map(|estimate| estimate.reason.clone()),
+        color_mode: cli.color_mode,
+        render_input: roll_suite_render_input(cli.input_mode, cli.render_input),
+        input_mode: cli.input_mode,
+        render_intent: cli.render_intent,
+        quality_mode: cli.quality_mode,
+        write_master: cli.write_master,
+        review_sidecar: cli.review_sidecar.clone(),
+        write_review_sidecar: cli.write_review_sidecar.clone(),
+        debug: cli.debug,
+        force_stitch: false,
+        force_no_stitch: true,
+        transform: cli.transform.clone(),
+        ica_max_iter: cli.ica_max_iter,
+        ica_tol: cli.ica_tol,
+        bit_depth: cli.bit_depth,
+        use_opencv: cli.use_opencv,
+    };
+
+    let report = match run_roll_suite_pipeline_child(&pipeline_cli) {
+        Ok(report) => report,
+        Err(err) => {
+            entry.status = "failed".to_string();
+            entry
+                .issues
+                .push(format!("roll_suite:{name}:pipeline_failed"));
+            entry.error = Some(err.to_string());
+            return entry;
+        }
+    };
+
+    let report_path = pipeline_cli.output_dir.join("report.json");
+    if let Err(err) = report.save(&report_path) {
+        entry.status = "failed".to_string();
+        entry
+            .issues
+            .push(format!("roll_suite:{name}:report_write_failed"));
+        entry.error = Some(err.to_string());
+        return entry;
+    }
+    entry.report_path = Some(report_path.display().to_string());
+
+    let summary = summarize_report_with_source(frame.stem.clone(), &report, Some(&report_path));
+    entry.output_path = summary.render.output_path.clone();
+    entry.output_width = summary.render.output_width;
+    entry.output_height = summary.render.output_height;
+    entry.output_color_space = summary.render.output_color_space.clone();
+    entry.output_file_icc_profile_matches_report =
+        summary.render.output_file_icc_profile_matches_report;
+    entry.stale_render_artifact_count = summary.render.stale_render_artifact_count;
+    entry.stitch_decision = summary.stitch.decision.clone();
+    entry.base_confidence = summary.base_density.base_confidence;
+    entry.raw_base_confidence = summary.base_density.raw_base_confidence;
+    entry.base_estimate_source = summary.base_density.base_estimate_source.clone();
+    entry.input_base_confidence = summary.render.input_base_confidence;
+    entry.render_review_status = summary.render.render_review_status.clone();
+    entry.render_reviewable = summary.render.render_reviewable;
+    entry.positive_input_likely_negative_like = summary.render.positive_input_likely_negative_like;
+    entry.positive_input_accepted_high_warm_score =
+        summary.render.positive_input_accepted_high_warm_score;
+    entry.positive_input_orange_mask_score = summary.render.positive_input_orange_mask_score;
+    entry.positive_input_reason = summary.render.positive_input_reason.clone();
+    entry.base_color_override_applied = summary
+        .base_density
+        .base_estimate_source
+        .as_deref()
+        .map(|source| matches!(source, "manual_base_color_override" | "roll_consensus_base"));
+    entry.density_confidence = summary.base_density.density_confidence;
+    entry.render_input_source = summary.colorspace.render_input_source.clone();
+    entry.render_input_reason = summary.colorspace.render_input_reason.clone();
+    entry.mapping_strategy = summary.colorspace.mapping_strategy.clone();
+    entry.selected_mapping_reason = summary.colorspace.selected_mapping_reason.clone();
+    entry.selected_candidate = summary.colorspace.selected_candidate.clone();
+    entry.selected_candidate_rank = summary.colorspace.selected_candidate_rank;
+    entry.selected_quality_score = summary.colorspace.selected_quality_score;
+    entry.candidate_risk = summary.colorspace.candidate_risk.clone();
+    entry.tone_color_trust_state = summary.colorspace.tone_color_trust_state.clone();
+    entry.colorspace_pre_scale_preserved_ratio = summary.colorspace.pre_scale_preserved_ratio;
+    entry.colorspace_post_scale_preserved_ratio = summary.colorspace.post_scale_preserved_ratio;
+    entry.render_luminance_p05 =
+        nth_f64_slice(summary.tone.render_luminance_percentiles.as_deref(), 0);
+    entry.render_luminance_p50 =
+        nth_f64_slice(summary.tone.render_luminance_percentiles.as_deref(), 1);
+    entry.render_luminance_p95 =
+        nth_f64_slice(summary.tone.render_luminance_percentiles.as_deref(), 2);
+    entry.render_luminance_range_p05_p95 = summary
+        .tone
+        .render_luminance_range_p05_p95
+        .or_else(|| Some(entry.render_luminance_p95? - entry.render_luminance_p05?));
+    entry.midtone_luminance_p50 =
+        nth_f64_slice(summary.tone.midtone_luminance_percentiles.as_deref(), 1);
+    entry.shadow_saturation_p95 = summary.tone.shadow_saturation_p95;
+    entry.shadow_visible_pixel_count =
+        phase_usize_metric(&report, "tone_mapping", "shadow_visible_pixel_count");
+    if entry.shadow_visible_pixel_count.unwrap_or(0) > 0 {
+        entry.shadow_visible_saturation_p95 = summary.tone.shadow_visible_saturation_p95;
+        entry.shadow_visible_rgb_balance_delta =
+            tone_rgb_balance_delta(&report, "shadow_visible_rgb_median");
+    }
+    entry.midtone_neutral_pixel_count =
+        phase_usize_metric(&report, "tone_mapping", "midtone_neutral_pixel_count");
+    if entry.midtone_neutral_pixel_count.unwrap_or(0) > 0 {
+        entry.midtone_neutral_saturation_p95 = summary.tone.midtone_neutral_saturation_p95;
+        entry.midtone_neutral_rgb_balance_delta =
+            tone_rgb_balance_delta(&report, "midtone_neutral_rgb_median");
+    }
+    entry.bright_neutral_saturation_p95 = summary.tone.bright_neutral_saturation_p95;
+    entry.shadow_rgb_balance_delta = tone_rgb_balance_delta(&report, "shadow_rgb_median");
+    entry.midtone_rgb_balance_delta = tone_rgb_balance_delta(&report, "midtone_rgb_median");
+    entry.bright_neutral_rgb_balance_delta =
+        tone_rgb_balance_delta(&report, "bright_neutral_rgb_median");
+    entry.highlight_chroma_compressed_ratio = summary.tone.highlight_chroma_compressed_ratio;
+    entry.highlight_neutral_chroma_compressed_ratio =
+        summary.tone.highlight_neutral_chroma_compressed_ratio;
+    entry.shadow_chroma_compressed_ratio = summary.tone.shadow_chroma_compressed_ratio;
+    entry.post_chroma_compression_clipped_high_max = max_f64_slice(
+        summary
+            .tone
+            .post_chroma_compression_clipped_high_ratio
+            .as_deref(),
+    );
+    entry.post_chroma_compression_clipped_low_max = max_f64_slice(
+        summary
+            .tone
+            .post_chroma_compression_clipped_low_ratio
+            .as_deref(),
+    );
+    if let Some(grain) = &summary.tone.high_frequency_grain {
+        entry.high_frequency_luma_residual_p95 = grain.luma_residual_p95;
+        entry.high_frequency_chroma_residual_p95 = grain.chroma_residual_p95;
+        entry.high_frequency_chroma_to_luma_p95_ratio = grain.chroma_to_luma_p95_ratio;
+        entry.high_frequency_flat_sample_count = grain.flat_sample_count;
+        entry.high_frequency_flat_sample_ratio = grain.flat_sample_ratio;
+        entry.high_frequency_flat_luma_residual_p95 = grain.flat_luma_residual_p95;
+        entry.high_frequency_flat_chroma_residual_p95 = grain.flat_chroma_residual_p95;
+        entry.high_frequency_flat_chroma_to_luma_p95_ratio = grain.flat_chroma_to_luma_p95_ratio;
+    }
+    entry.noise_reduction_enabled = summary.tone.noise_reduction_enabled;
+    entry.noise_reduction_applied_ratio = summary.tone.noise_reduction_applied_ratio;
+    entry.noise_reduction_texture_limited_ratio =
+        summary.tone.noise_reduction_texture_limited_ratio;
+    entry.noise_reduction_saturation_limited_ratio =
+        summary.tone.noise_reduction_saturation_limited_ratio;
+    entry.noise_reduction_mean_abs_chroma_delta =
+        summary.tone.noise_reduction_mean_abs_chroma_delta;
+    entry.noise_reduction_max_abs_chroma_delta = summary.tone.noise_reduction_max_abs_chroma_delta;
+    entry.noise_reduction_mean_abs_luma_delta = summary.tone.noise_reduction_mean_abs_luma_delta;
+    entry.noise_reduction_max_abs_luma_delta = summary.tone.noise_reduction_max_abs_luma_delta;
+    entry.calibration_status = summary.colorspace.calibration_status.clone();
+    entry.calibration_source = summary.colorspace.calibration_source.clone();
+    entry.calibration_acceptance_status = summary
+        .colorspace
+        .calibration_acceptance
+        .as_ref()
+        .and_then(|acceptance| acceptance.status.clone());
+    entry.calibration_confidence = summary.colorspace.calibration_confidence;
+    entry.reference_patch_evaluation_present =
+        Some(summary.colorspace.reference_patch_evaluation.is_some());
+    let debug_artifact_issues = fixture_suite_debug_artifact_issues(&summary);
+    entry.debug_artifact_count = Some(summary.colorspace.debug_artifacts.len());
+    entry.debug_artifact_invalid_count = Some(debug_artifact_issues.len());
+    entry.debug_artifact_kinds = summary
+        .colorspace
+        .debug_artifacts
+        .iter()
+        .map(|artifact| artifact.kind.clone())
+        .collect();
+
+    validate_roll_suite_summary(
+        &name,
+        cli.input_mode,
+        positive_roll_suite_requires_calibration(cli),
+        &summary,
+        &debug_artifact_issues,
+        &mut entry,
+    );
+
+    let summary_json_path = output_dir.join("summary.json");
+    let summary_md_path = output_dir.join("summary.md");
+    let json_summary = match serde_json::to_string_pretty(&summary) {
+        Ok(json) => json,
+        Err(err) => {
+            entry.status = "failed".to_string();
+            entry
+                .issues
+                .push(format!("roll_suite:{name}:summary_serialize_failed"));
+            entry.error = Some(err.to_string());
+            return entry;
+        }
+    };
+    if let Err(err) = write_text(&summary_json_path, &json_summary) {
+        entry.status = "failed".to_string();
+        entry
+            .issues
+            .push(format!("roll_suite:{name}:summary_json_write_failed"));
+        entry.error = Some(err.to_string());
+        return entry;
+    }
+    if let Err(err) = write_text(&summary_md_path, &summary_to_markdown(&summary)) {
+        entry.status = "failed".to_string();
+        entry
+            .issues
+            .push(format!("roll_suite:{name}:summary_md_write_failed"));
+        entry.error = Some(err.to_string());
+        return entry;
+    }
+    entry.summary_json_path = Some(summary_json_path.display().to_string());
+    entry.summary_md_path = Some(summary_md_path.display().to_string());
+
+    if cli.debug {
+        if let Err(err) = prune_roll_suite_debug_artifacts(&output_dir) {
+            entry
+                .issues
+                .push(format!("roll_suite:{name}:debug_artifact_prune_failed"));
+            entry.error = Some(format!("failed to prune roll-suite debug artifacts: {err}"));
+        }
+    }
+
+    if entry.status != "failed" && !entry.issues.is_empty() {
+        entry.status = "review_required".to_string();
+    }
+    entry
+}
+
+fn prune_roll_suite_debug_artifacts(output_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    const KEEP_TIFFS: &[&str] = &[
+        "output.tiff",
+        "phase3_positive_passthrough.tiff",
+        "phase46_color_candidate_comparison.tiff",
+        "phase46_gamut_clipping_map.tiff",
+        "phase46_scene_referred_prophoto_float.tiff",
+    ];
+
+    for entry in std::fs::read_dir(output_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+            continue;
+        };
+        if !extension.eq_ignore_ascii_case("tif") && !extension.eq_ignore_ascii_case("tiff") {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if KEEP_TIFFS
+            .iter()
+            .any(|keep| file_name.eq_ignore_ascii_case(keep))
+        {
+            continue;
+        }
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn validate_roll_suite_summary(
+    name: &str,
+    input_mode: InputMode,
+    positive_calibration_required: bool,
+    summary: &ValidationSummary,
+    debug_artifact_issues: &[String],
+    entry: &mut RollSuiteEntry,
+) {
+    if summary.render.output_path.is_none() {
+        entry.status = "failed".to_string();
+        entry
+            .issues
+            .push(format!("roll_suite:{name}:output_path_missing"));
+    }
+    if summary.render.output_file_icc_profile_matches_report == Some(false) {
+        entry.status = "failed".to_string();
+        entry
+            .issues
+            .push(format!("roll_suite:{name}:output_icc_profile_mismatch"));
+    }
+    if summary
+        .render
+        .stale_render_artifact_count
+        .is_some_and(|count| count > 0)
+    {
+        entry.status = "failed".to_string();
+        entry
+            .issues
+            .push(format!("roll_suite:{name}:stale_render_artifacts"));
+    }
+    if !debug_artifact_issues.is_empty() {
+        entry.status = "failed".to_string();
+        entry.issues.extend(
+            debug_artifact_issues
+                .iter()
+                .map(|issue| format!("roll_suite:{name}:{issue}")),
+        );
+    }
+
+    if input_mode == InputMode::Positive
+        && summary.render.positive_input_likely_negative_like == Some(true)
+    {
+        entry
+            .issues
+            .push(format!("roll_suite:{name}:positive_input_negative_like"));
+    }
+
+    if input_mode == InputMode::Negative {
+        if summary
+            .base_density
+            .base_confidence
+            .map(|confidence| confidence < 0.5)
+            .unwrap_or(true)
+        {
+            entry
+                .issues
+                .push(format!("roll_suite:{name}:base_confidence_review_required"));
+        }
+        if summary
+            .base_density
+            .base_estimate_source
+            .as_deref()
+            .is_some_and(|source| source == "high_transmittance_fallback")
+        {
+            entry
+                .issues
+                .push(format!("roll_suite:{name}:base_estimate_fallback"));
+        }
+    }
+    if input_mode == InputMode::Negative || positive_calibration_required {
+        if summary.colorspace.calibration_status.as_deref() != Some("applied") {
+            entry
+                .issues
+                .push(format!("roll_suite:{name}:calibration_not_applied"));
+        }
+        if summary.colorspace.reference_patch_evaluation.is_none() {
+            entry.issues.push(format!(
+                "roll_suite:{name}:reference_patch_evaluation_missing"
+            ));
+        }
+    }
+    if summary.colorspace.candidate_risk.as_deref() != Some("safe") {
+        entry
+            .issues
+            .push(format!("roll_suite:{name}:candidate_risk_review_required"));
+    }
+    if summary.colorspace.tone_color_trust_state.as_deref() != Some("trusted") {
+        entry.issues.push(format!(
+            "roll_suite:{name}:tone_color_trust_review_required"
+        ));
+    }
+    if summary
+        .colorspace
+        .mapping_strategy
+        .as_deref()
+        .is_some_and(|strategy| strategy.to_ascii_lowercase().contains("fallback"))
+    {
+        entry
+            .issues
+            .push(format!("roll_suite:{name}:mapping_strategy_fallback"));
+    }
+    if summary
+        .colorspace
+        .selected_candidate
+        .as_deref()
+        .is_some_and(|candidate| candidate.to_ascii_lowercase().contains("fallback"))
+    {
+        entry
+            .issues
+            .push(format!("roll_suite:{name}:selected_candidate_fallback"));
+    }
+}
+
+fn positive_roll_suite_requires_calibration(cli: &ValidationCli) -> bool {
+    cli.input_mode == InputMode::Positive
+        && (cli.calibration_profile.is_some()
+            || cli.calibration_library.is_some()
+            || cli.scanner_profile.is_some()
+            || cli.roll_profile.is_some()
+            || cli.film_stock.is_some())
+}
+
+fn inspect_roll_frame(path: &Path, input_mode: InputMode, bit_depth: u8) -> RollFrameInspection {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_else(|| name.clone());
+    let file_size_bytes = std::fs::metadata(path).ok().map(|metadata| metadata.len());
+    let sequence = roll_sequence_parts(&stem);
+    let probe = probe_fixture_tiff(path);
+    let positive_input_probe = (input_mode == InputMode::Positive && probe.readable)
+        .then(|| inspect_positive_roll_input(path, bit_depth))
+        .and_then(Result::ok);
+    RollFrameInspection {
+        name,
+        stem,
+        path: path.display().to_string(),
+        file_size_bytes,
+        status: probe.status,
+        usable: probe.readable,
+        width: probe.width,
+        height: probe.height,
+        color_type: probe.color_type,
+        source_bits_per_sample: probe.source_bits_per_sample,
+        source_channel_count: probe.source_channel_count,
+        source_has_alpha: probe.source_has_alpha,
+        sequence_prefix: sequence.as_ref().map(|(prefix, _, _)| prefix.clone()),
+        sequence_number: sequence.as_ref().map(|(_, number, _)| *number),
+        sequence_width: sequence.as_ref().map(|(_, _, width)| *width),
+        positive_input_probe,
+        error: probe.error,
+    }
+}
+
+fn inspect_positive_roll_input(
+    path: &Path,
+    bit_depth: u8,
+) -> Result<positive_input::PositiveInputInspection, Box<dyn std::error::Error>> {
+    let loaded = tiff_io::load_tiff_u16(path, bit_depth)?;
+    Ok(positive_input::inspect_u16_image(&loaded.image, bit_depth))
+}
+
+fn roll_sequence_parts(stem: &str) -> Option<(String, usize, usize)> {
+    let end = stem.len();
+    let start = stem
+        .char_indices()
+        .rev()
+        .take_while(|(_, ch)| ch.is_ascii_digit())
+        .map(|(idx, _)| idx)
+        .last()?;
+    let digits = &stem[start..end];
+    if digits.is_empty() {
+        return None;
+    }
+    let number = digits.parse::<usize>().ok()?;
+    Some((stem[..start].to_string(), number, digits.len()))
+}
+
+fn roll_sequence_gaps(frames: &[RollFrameInspection]) -> Vec<RollSequenceGap> {
+    let mut groups: BTreeMap<(String, usize), Vec<usize>> = BTreeMap::new();
+    for frame in frames {
+        if let (Some(prefix), Some(number), Some(width)) = (
+            frame.sequence_prefix.as_ref(),
+            frame.sequence_number,
+            frame.sequence_width,
+        ) {
+            groups
+                .entry((prefix.clone(), width))
+                .or_default()
+                .push(number);
+        }
+    }
+
+    let mut gaps = Vec::new();
+    for ((prefix, width), mut numbers) in groups {
+        numbers.sort_unstable();
+        numbers.dedup();
+        for pair in numbers.windows(2) {
+            let previous = pair[0];
+            let next = pair[1];
+            if next > previous + 1 {
+                let start = previous + 1;
+                let end = next - 1;
+                let missing = (start..=end)
+                    .map(|number| format!("{prefix}{}", roll_padded_number(number, width)))
+                    .collect::<Vec<_>>();
+                gaps.push(RollSequenceGap {
+                    prefix: prefix.clone(),
+                    width,
+                    start,
+                    end,
+                    count: end - start + 1,
+                    missing,
+                });
+            }
+        }
+    }
+    gaps
+}
+
+fn roll_padded_number(number: usize, width: usize) -> String {
+    format!("{number:0width$}")
+}
+
+fn is_supported_roll_scan_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "dng" | "tif" | "tiff"
+            )
+        })
+}
+
+fn roll_name(roll_dir: &Path) -> String {
+    roll_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "roll".to_string())
+}
+
+fn roll_mode_output_dir(cli: &ValidationCli) -> PathBuf {
+    let default_output_dir = PathBuf::from("output/validation/logan");
+    if cli.output_dir == default_output_dir {
+        let roll_dir = cli
+            .roll_dir
+            .as_ref()
+            .expect("roll inputs should require --roll-dir");
+        PathBuf::from("output/validation").join(roll_name(roll_dir))
+    } else {
+        cli.output_dir.clone()
+    }
+}
+
+fn roll_frame_slug(frame: &RollFrameInspection) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+    for ch in frame.stem.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        "frame".to_string()
+    } else {
+        slug
+    }
+}
+
+fn roll_frame_issue_label(frame: &RollFrameInspection) -> String {
+    roll_frame_slug(frame)
+}
+
+fn roll_inventory_to_markdown(summary: &RollInventorySummary) -> String {
+    let mut md = String::new();
+    md.push_str(&format!("# Roll Inventory: {}\n\n", summary.roll_name));
+    md.push_str(&format!("- Status: `{}`\n", summary.status));
+    md.push_str(&format!("- Roll dir: `{}`\n", summary.roll_dir));
+    md.push_str(&format!(
+        "- Frames: {} total, {} usable, {} unreadable\n",
+        summary.frame_count, summary.usable_frame_count, summary.unreadable_frame_count
+    ));
+    md.push_str(&format!(
+        "- Sequence gaps: {}\n\n",
+        summary.sequence_gap_count
+    ));
+    if !summary.sequence_gaps.is_empty() {
+        md.push_str("## Sequence Gaps\n\n");
+        md.push_str("| Prefix | Missing | Count |\n");
+        md.push_str("| --- | --- | ---: |\n");
+        for gap in &summary.sequence_gaps {
+            md.push_str(&format!(
+                "| `{}` | `{}` | {} |\n",
+                markdown_cell(&gap.prefix),
+                markdown_cell(&gap.missing.join(", ")),
+                gap.count
+            ));
+        }
+        md.push('\n');
+    }
+    if !summary.issues.is_empty() {
+        md.push_str("## Issues\n\n");
+        for issue in &summary.issues {
+            md.push_str(&format!("- `{}`\n", markdown_cell(issue)));
+        }
+        md.push('\n');
+    }
+    md.push_str("## Frames\n\n");
+    let show_positive_probe = summary
+        .frames
+        .iter()
+        .any(|frame| frame.positive_input_probe.is_some());
+    if show_positive_probe {
+        md.push_str("| Frame | Status | Source | Dimensions | Bits | Size | Positive Input |\n");
+        md.push_str("| --- | --- | --- | --- | ---: | ---: | --- |\n");
+    } else {
+        md.push_str("| Frame | Status | Source | Dimensions | Bits | Size |\n");
+        md.push_str("| --- | --- | --- | --- | ---: | ---: |\n");
+    }
+    for frame in &summary.frames {
+        let base_columns = format!(
+            "| `{}` | `{}` | `{}` | `{}` | {} | {} |",
+            markdown_cell(&frame.name),
+            frame.status,
+            markdown_cell(frame.color_type.as_deref().unwrap_or("unknown")),
+            roll_dimensions_label(frame.width, frame.height),
+            frame
+                .source_bits_per_sample
+                .map(|bits| bits.to_string())
+                .unwrap_or_else(|| "n/a".to_string()),
+            frame
+                .file_size_bytes
+                .map(|size| size.to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        );
+        if show_positive_probe {
+            md.push_str(&format!(
+                "{} `{}` |\n",
+                base_columns,
+                markdown_cell(&positive_roll_probe_label(
+                    frame.positive_input_probe.as_ref()
+                ))
+            ));
+        } else {
+            md.push_str(&format!("{base_columns}\n"));
+        }
+    }
+    md
+}
+
+fn positive_roll_probe_label(probe: Option<&positive_input::PositiveInputInspection>) -> String {
+    match probe {
+        Some(probe) if probe.likely_negative_like => {
+            format!("negative-like score {:.3}", probe.orange_mask_score)
+        }
+        Some(probe) if probe.accepted_high_warm_score() => {
+            format!("ok warm score {:.3}", probe.orange_mask_score)
+        }
+        Some(probe) => format!("ok score {:.3}", probe.orange_mask_score),
+        None => "n/a".to_string(),
+    }
+}
+
+fn roll_suite_to_markdown(summary: &RollSuiteSummary) -> String {
+    let mut md = String::new();
+    md.push_str(&format!("# Roll Suite: {}\n\n", summary.roll_name));
+    md.push_str(&format!("- Status: `{}`\n", summary.status));
+    md.push_str(&format!("- Roll dir: `{}`\n", summary.roll_dir));
+    md.push_str(&format!("- Output dir: `{}`\n", summary.output_dir));
+    md.push_str(&format!(
+        "- Frames: {} total, {} passed, {} review required, {} failed\n",
+        summary.frame_count,
+        summary.passed_count,
+        summary.review_required_count,
+        summary.failed_count
+    ));
+    md.push_str(&format!(
+        "- Inventory status: `{}` with {} sequence gap(s)\n\n",
+        summary.inventory.status, summary.inventory.sequence_gap_count
+    ));
+    if let Some(base_color) = summary.roll_base_color {
+        md.push_str(&format!(
+            "- Roll base color: `{:.1},{:.1},{:.1}` from `{}` using {} agreeing frame(s), confidence `{}`\n",
+            base_color[0],
+            base_color[1],
+            base_color[2],
+            summary.roll_base_source.as_deref().unwrap_or("unknown"),
+            summary.roll_base_frame_count,
+            optional_f64(summary.roll_base_confidence)
+        ));
+        md.push_str(&format!(
+            "- Roll base candidates: `{}` total, `{}` rejected as dark against envelope\n",
+            summary.roll_base_candidate_count, summary.roll_base_rejected_dark_candidate_count
+        ));
+        if let Some(envelope) = summary.roll_base_high_transmittance_envelope {
+            md.push_str(&format!(
+                "- Roll high-transmittance envelope: `{:.1},{:.1},{:.1}`\n",
+                envelope[0], envelope[1], envelope[2]
+            ));
+        }
+        if let Some(reason) = &summary.roll_base_reason {
+            md.push_str(&format!(
+                "- Roll base reason: `{}`\n",
+                markdown_cell(reason)
+            ));
+        }
+        md.push('\n');
+    }
+    if !summary.roll_base_clusters.is_empty() {
+        md.push_str("## Roll Base Clusters\n\n");
+        md.push_str("| Rank | Frames | Luminance | Spread | Color | Sources |\n");
+        md.push_str("| ---: | ---: | ---: | ---: | --- | --- |\n");
+        for (idx, cluster) in summary.roll_base_clusters.iter().enumerate() {
+            let sources = cluster
+                .source_counts
+                .iter()
+                .map(|source| format!("{}:{}", source.source, source.count))
+                .collect::<Vec<_>>()
+                .join(", ");
+            md.push_str(&format!(
+                "| {} | {} | {:.1} | {:.3} | `{:.1},{:.1},{:.1}` | `{}` |\n",
+                idx + 1,
+                cluster.frame_count,
+                cluster.mean_luminance,
+                cluster.max_relative_luminance_spread,
+                cluster.color[0],
+                cluster.color[1],
+                cluster.color[2],
+                markdown_cell(&sources)
+            ));
+        }
+        md.push('\n');
+    }
+    md.push_str("## Roll Review Audit\n\n");
+    md.push_str(&format!(
+        "- Candidate risk safe/review/unknown: `{}` / `{}` / `{}`\n",
+        summary.review.candidate_safe_count,
+        summary.review.candidate_review_required_count,
+        summary.review.candidate_unknown_count
+    ));
+    md.push_str(&format!(
+        "- Candidate risk counts: `{}`\n",
+        markdown_cell(&roll_suite_counts_cell(
+            &summary.review.candidate_risk_counts
+        ))
+    ));
+    md.push_str(&format!(
+        "- Tone color trust trusted/review/unknown: `{}` / `{}` / `{}`\n",
+        summary.review.tone_color_trusted_count,
+        summary.review.tone_color_review_required_count,
+        summary.review.tone_color_unknown_count
+    ));
+    md.push_str(&format!(
+        "- Tone color trust counts: `{}`\n",
+        markdown_cell(&roll_suite_counts_cell(
+            &summary.review.tone_color_trust_state_counts
+        ))
+    ));
+    md.push_str(&format!(
+        "- Calibration status counts: `{}`\n",
+        markdown_cell(&roll_suite_counts_cell(
+            &summary.review.calibration_status_counts
+        ))
+    ));
+    md.push_str(&format!(
+        "- Reference patch evaluation present/missing/unknown: `{}` / `{}` / `{}`\n",
+        summary.review.reference_patch_evaluation_present_count,
+        summary.review.reference_patch_evaluation_missing_count,
+        summary.review.reference_patch_evaluation_unknown_count
+    ));
+    md.push_str(&format!(
+        "- Review issue counts: `{}`\n\n",
+        markdown_cell(&roll_suite_counts_cell(&summary.review.issue_counts))
+    ));
+    md.push_str("## Roll Quality Diagnostics\n\n");
+    md.push_str(&format!(
+        "- High-frequency residual frames: `{}` of `{}`\n",
+        summary.quality.high_frequency_frame_count, summary.quality.frame_count
+    ));
+    md.push_str(&format!(
+        "- Luma residual p95 mean/max: `{}` / `{}`\n",
+        optional_f64(summary.quality.high_frequency_luma_residual_p95_mean),
+        optional_f64(summary.quality.high_frequency_luma_residual_p95_max)
+    ));
+    md.push_str(&format!(
+        "- Chroma residual p95 mean/max: `{}` / `{}`\n",
+        optional_f64(summary.quality.high_frequency_chroma_residual_p95_mean),
+        optional_f64(summary.quality.high_frequency_chroma_residual_p95_max)
+    ));
+    md.push_str(&format!(
+        "- Chroma:luma residual p95 ratio mean/max: `{}` / `{}`\n",
+        optional_f64(summary.quality.high_frequency_chroma_to_luma_p95_ratio_mean),
+        optional_f64(summary.quality.high_frequency_chroma_to_luma_p95_ratio_max)
+    ));
+    md.push_str(&format!(
+        "- Flat residual frames: `{}` of `{}`; sample ratio mean: `{}`\n",
+        summary.quality.high_frequency_flat_frame_count,
+        summary.quality.frame_count,
+        optional_f64(summary.quality.high_frequency_flat_sample_ratio_mean)
+    ));
+    md.push_str(&format!(
+        "- Flat luma/chroma residual p95 mean/max: `{}` / `{}`; `{}` / `{}`\n",
+        optional_f64(summary.quality.high_frequency_flat_luma_residual_p95_mean),
+        optional_f64(summary.quality.high_frequency_flat_luma_residual_p95_max),
+        optional_f64(summary.quality.high_frequency_flat_chroma_residual_p95_mean),
+        optional_f64(summary.quality.high_frequency_flat_chroma_residual_p95_max)
+    ));
+    md.push_str(&format!(
+        "- Flat chroma:luma residual p95 ratio mean/max: `{}` / `{}`\n",
+        optional_f64(
+            summary
+                .quality
+                .high_frequency_flat_chroma_to_luma_p95_ratio_mean
+        ),
+        optional_f64(
+            summary
+                .quality
+                .high_frequency_flat_chroma_to_luma_p95_ratio_max
+        )
+    ));
+    md.push_str(&format!(
+        "- Denoise enabled frames: `{}`; applied ratio mean/max: `{}` / `{}`\n",
+        summary.quality.noise_reduction_enabled_count,
+        optional_f64(summary.quality.noise_reduction_applied_ratio_mean),
+        optional_f64(summary.quality.noise_reduction_applied_ratio_max)
+    ));
+    md.push_str(&format!(
+        "- Denoise texture/saturation limited mean: `{}` / `{}`; mean chroma/luma delta: `{}` / `{}`\n",
+        optional_f64(summary.quality.noise_reduction_texture_limited_ratio_mean),
+        optional_f64(summary.quality.noise_reduction_saturation_limited_ratio_mean),
+        optional_f64(summary.quality.noise_reduction_mean_abs_chroma_delta_mean),
+        optional_f64(summary.quality.noise_reduction_mean_abs_luma_delta_mean)
+    ));
+    md.push_str(&format!(
+        "- Post-scale preserved ratio mean/min: `{}` / `{}`\n",
+        optional_f64(summary.quality.colorspace_post_scale_preserved_ratio_mean),
+        optional_f64(summary.quality.colorspace_post_scale_preserved_ratio_min)
+    ));
+    md.push_str(&format!(
+        "- Render luminance p05-p95 range mean/min/max: `{}` / `{}` / `{}`\n",
+        optional_f64(summary.quality.render_luminance_range_p05_p95_mean),
+        optional_f64(summary.quality.render_luminance_range_p05_p95_min),
+        optional_f64(summary.quality.render_luminance_range_p05_p95_max)
+    ));
+    md.push_str(&format!(
+        "- Midtone luminance p50 mean/min/max/range: `{}` / `{}` / `{}` / `{}`\n",
+        optional_f64(summary.quality.midtone_luminance_p50_mean),
+        optional_f64(summary.quality.midtone_luminance_p50_min),
+        optional_f64(summary.quality.midtone_luminance_p50_max),
+        optional_f64(summary.quality.midtone_luminance_p50_range)
+    ));
+    md.push_str(&format!(
+        "- Shadow saturation p95 mean/max: `{}` / `{}`; midtone-neutral saturation p95 mean/max: `{}` / `{}`; bright-neutral saturation p95 mean/max: `{}` / `{}`\n",
+        optional_f64(summary.quality.shadow_saturation_p95_mean),
+        optional_f64(summary.quality.shadow_saturation_p95_max),
+        optional_f64(summary.quality.midtone_neutral_saturation_p95_mean),
+        optional_f64(summary.quality.midtone_neutral_saturation_p95_max),
+        optional_f64(summary.quality.bright_neutral_saturation_p95_mean),
+        optional_f64(summary.quality.bright_neutral_saturation_p95_max)
+    ));
+    md.push_str(&format!(
+        "- RGB balance delta mean/max: shadow `{}` / `{}`, midtone `{}` / `{}`, midtone-neutral `{}` / `{}`, bright-neutral `{}` / `{}`\n",
+        optional_f64(summary.quality.shadow_rgb_balance_delta_mean),
+        optional_f64(summary.quality.shadow_rgb_balance_delta_max),
+        optional_f64(summary.quality.midtone_rgb_balance_delta_mean),
+        optional_f64(summary.quality.midtone_rgb_balance_delta_max),
+        optional_f64(summary.quality.midtone_neutral_rgb_balance_delta_mean),
+        optional_f64(summary.quality.midtone_neutral_rgb_balance_delta_max),
+        optional_f64(summary.quality.bright_neutral_rgb_balance_delta_mean),
+        optional_f64(summary.quality.bright_neutral_rgb_balance_delta_max)
+    ));
+    md.push_str(&format!(
+        "- Highlight chroma compression mean/max: `{}` / `{}`; shadow chroma compression mean/max: `{}` / `{}`\n",
+        optional_f64(summary.quality.highlight_chroma_compressed_ratio_mean),
+        optional_f64(summary.quality.highlight_chroma_compressed_ratio_max),
+        optional_f64(summary.quality.shadow_chroma_compressed_ratio_mean),
+        optional_f64(summary.quality.shadow_chroma_compressed_ratio_max)
+    ));
+    md.push_str(&format!(
+        "- Post-tone clipped high/low max: `{}` / `{}`\n\n",
+        optional_f64(summary.quality.post_chroma_compression_clipped_high_max),
+        optional_f64(summary.quality.post_chroma_compression_clipped_low_max)
+    ));
+    if let Some(comparison) = &summary.comparison {
+        md.push_str("## Roll Suite Comparison\n\n");
+        md.push_str(&format!(
+            "- Baseline: `{}`\n",
+            markdown_cell(&comparison.baseline_path)
+        ));
+        md.push_str(&format!("- Status: `{}`\n", comparison.status));
+        md.push_str(&format!(
+            "- Frame/review/failed count deltas: `{:+}` / `{:+}` / `{:+}`\n\n",
+            comparison.frame_count_delta,
+            comparison.review_required_count_delta,
+            comparison.failed_count_delta
+        ));
+        if !comparison.issues.is_empty() {
+            md.push_str("### Comparison Issues\n\n");
+            for issue in &comparison.issues {
+                md.push_str(&format!("- `{}`\n", markdown_cell(issue)));
+            }
+            md.push('\n');
+        }
+        if !comparison.baseline_only_frames.is_empty() || !comparison.current_only_frames.is_empty()
+        {
+            md.push_str(&format!(
+                "- Baseline-only frames: `{}`\n",
+                markdown_cell(&comparison.baseline_only_frames.join(", "))
+            ));
+            md.push_str(&format!(
+                "- Current-only frames: `{}`\n\n",
+                markdown_cell(&comparison.current_only_frames.join(", "))
+            ));
+        }
+        md.push_str("| Metric | Delta |\n");
+        md.push_str("| --- | ---: |\n");
+        for (label, delta) in [
+            (
+                "render luminance range mean",
+                comparison.quality.render_luminance_range_p05_p95_mean_delta,
+            ),
+            (
+                "render luminance range min",
+                comparison.quality.render_luminance_range_p05_p95_min_delta,
+            ),
+            (
+                "render luminance range max",
+                comparison.quality.render_luminance_range_p05_p95_max_delta,
+            ),
+            (
+                "midtone p50 mean",
+                comparison.quality.midtone_luminance_p50_mean_delta,
+            ),
+            (
+                "midtone p50 min",
+                comparison.quality.midtone_luminance_p50_min_delta,
+            ),
+            (
+                "midtone p50 max",
+                comparison.quality.midtone_luminance_p50_max_delta,
+            ),
+            (
+                "midtone p50 range",
+                comparison.quality.midtone_luminance_p50_range_delta,
+            ),
+            (
+                "shadow saturation p95 mean",
+                comparison.quality.shadow_saturation_p95_mean_delta,
+            ),
+            (
+                "shadow saturation p95 max",
+                comparison.quality.shadow_saturation_p95_max_delta,
+            ),
+            (
+                "midtone-neutral saturation p95 mean",
+                comparison.quality.midtone_neutral_saturation_p95_mean_delta,
+            ),
+            (
+                "bright-neutral saturation p95 mean",
+                comparison.quality.bright_neutral_saturation_p95_mean_delta,
+            ),
+            (
+                "midtone-neutral RGB delta max",
+                comparison
+                    .quality
+                    .midtone_neutral_rgb_balance_delta_max_delta,
+            ),
+            (
+                "bright-neutral RGB delta max",
+                comparison
+                    .quality
+                    .bright_neutral_rgb_balance_delta_max_delta,
+            ),
+            (
+                "chroma residual p95 mean",
+                comparison
+                    .quality
+                    .high_frequency_chroma_residual_p95_mean_delta,
+            ),
+            (
+                "chroma residual p95 max",
+                comparison
+                    .quality
+                    .high_frequency_chroma_residual_p95_max_delta,
+            ),
+            (
+                "flat chroma residual p95 mean",
+                comparison
+                    .quality
+                    .high_frequency_flat_chroma_residual_p95_mean_delta,
+            ),
+            (
+                "flat chroma residual p95 max",
+                comparison
+                    .quality
+                    .high_frequency_flat_chroma_residual_p95_max_delta,
+            ),
+            (
+                "preserved gamut min",
+                comparison
+                    .quality
+                    .colorspace_post_scale_preserved_ratio_min_delta,
+            ),
+            (
+                "post-tone high clipping max",
+                comparison
+                    .quality
+                    .post_chroma_compression_clipped_high_max_delta,
+            ),
+        ] {
+            md.push_str(&format!("| {} | {} |\n", label, optional_delta_f64(delta)));
+        }
+        md.push_str("\n| Frame | Status | Risk | Render Range d | Midtone p50 d | Shadow Sat d | Mid Neutral Sat d | Bright Neutral Sat d | Chroma p95 d | Flat Chroma p95 d | Preserve d | Clip High d |\n");
+        md.push_str(
+            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        );
+        for frame in &comparison.frames {
+            let status = if frame.status_changed {
+                format!(
+                    "{} -> {}",
+                    frame.baseline_status.as_deref().unwrap_or(""),
+                    frame.current_status.as_deref().unwrap_or("")
+                )
+            } else {
+                frame.current_status.clone().unwrap_or_default()
+            };
+            let risk = if frame.candidate_risk_changed {
+                format!(
+                    "{} -> {}",
+                    frame.baseline_candidate_risk.as_deref().unwrap_or(""),
+                    frame.current_candidate_risk.as_deref().unwrap_or("")
+                )
+            } else {
+                frame.current_candidate_risk.clone().unwrap_or_default()
+            };
+            md.push_str(&format!(
+                "| `{}` | `{}` | `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                markdown_cell(&frame.name),
+                markdown_cell(&status),
+                markdown_cell(&risk),
+                optional_delta_f64(frame.render_luminance_range_p05_p95_delta),
+                optional_delta_f64(frame.midtone_luminance_p50_delta),
+                optional_delta_f64(frame.shadow_saturation_p95_delta),
+                optional_delta_f64(frame.midtone_neutral_saturation_p95_delta),
+                optional_delta_f64(frame.bright_neutral_saturation_p95_delta),
+                optional_delta_f64(frame.high_frequency_chroma_residual_p95_delta),
+                optional_delta_f64(frame.high_frequency_flat_chroma_residual_p95_delta),
+                optional_delta_f64(frame.colorspace_post_scale_preserved_ratio_delta),
+                optional_delta_f64(frame.post_chroma_compression_clipped_high_max_delta)
+            ));
+        }
+        md.push('\n');
+    }
+    if !summary.issues.is_empty() {
+        md.push_str("## Issues\n\n");
+        for issue in &summary.issues {
+            md.push_str(&format!("- `{}`\n", markdown_cell(issue)));
+        }
+        md.push('\n');
+    }
+    md.push_str("## Frames\n\n");
+    md.push_str("| Frame | Status | Review | Base | Mapping | Candidate | Risk | Trust | Calibration | Issues |\n");
+    md.push_str("| --- | --- | --- | --- | --- | --- | --- | --- | --- | ---: |\n");
+    for frame in &summary.frames {
+        md.push_str(&format!(
+            "| `{}` | `{}` | `{}` | `{}` | `{}` | `{}` | `{}` | `{}` | `{}` | {} |\n",
+            markdown_cell(&frame.name),
+            frame.status,
+            markdown_cell(frame.render_review_status.as_deref().unwrap_or("unknown")),
+            markdown_cell(frame.base_estimate_source.as_deref().unwrap_or("unknown")),
+            markdown_cell(frame.mapping_strategy.as_deref().unwrap_or("unknown")),
+            markdown_cell(frame.selected_candidate.as_deref().unwrap_or("unknown")),
+            markdown_cell(frame.candidate_risk.as_deref().unwrap_or("unknown")),
+            markdown_cell(frame.tone_color_trust_state.as_deref().unwrap_or("unknown")),
+            markdown_cell(frame.calibration_status.as_deref().unwrap_or("unknown")),
+            frame.issues.len()
+        ));
+    }
+    md.push_str("\n## Frame Quality Diagnostics\n\n");
+    md.push_str("| Frame | Render p05 | Render p50 | Render p95 | Render Range | Midtone p50 | Shadow Sat p95 | Mid Neutral Count | Mid Neutral Sat p95 | Bright Neutral Sat p95 | Shadow RGB Delta | Midtone RGB Delta | Mid Neutral RGB Delta | Bright RGB Delta | Luma p95 | Chroma p95 | Chroma:Luma | Flat % | Flat Luma p95 | Flat Chroma p95 | Flat C:L | Denoise | Texture Limit | Saturation Limit | Mean C Delta | Mean L Delta | Preserve | Highlight Comp | Shadow Comp | Clip High | Clip Low |\n");
+    md.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    for frame in &summary.frames {
+        md.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            markdown_cell(&frame.name),
+            optional_f64(frame.render_luminance_p05),
+            optional_f64(frame.render_luminance_p50),
+            optional_f64(frame.render_luminance_p95),
+            optional_f64(frame.render_luminance_range_p05_p95),
+            optional_f64(frame.midtone_luminance_p50),
+            optional_f64(frame.shadow_saturation_p95),
+            frame
+                .midtone_neutral_pixel_count
+                .map(|count| count.to_string())
+                .unwrap_or_default(),
+            optional_f64(frame.midtone_neutral_saturation_p95),
+            optional_f64(frame.bright_neutral_saturation_p95),
+            optional_f64(frame.shadow_rgb_balance_delta),
+            optional_f64(frame.midtone_rgb_balance_delta),
+            optional_f64(frame.midtone_neutral_rgb_balance_delta),
+            optional_f64(frame.bright_neutral_rgb_balance_delta),
+            optional_f64(frame.high_frequency_luma_residual_p95),
+            optional_f64(frame.high_frequency_chroma_residual_p95),
+            optional_f64(frame.high_frequency_chroma_to_luma_p95_ratio),
+            optional_f64(frame.high_frequency_flat_sample_ratio),
+            optional_f64(frame.high_frequency_flat_luma_residual_p95),
+            optional_f64(frame.high_frequency_flat_chroma_residual_p95),
+            optional_f64(frame.high_frequency_flat_chroma_to_luma_p95_ratio),
+            optional_f64(frame.noise_reduction_applied_ratio),
+            optional_f64(frame.noise_reduction_texture_limited_ratio),
+            optional_f64(frame.noise_reduction_saturation_limited_ratio),
+            optional_f64(frame.noise_reduction_mean_abs_chroma_delta),
+            optional_f64(frame.noise_reduction_mean_abs_luma_delta),
+            optional_f64(frame.colorspace_post_scale_preserved_ratio),
+            optional_f64(frame.highlight_chroma_compressed_ratio),
+            optional_f64(frame.shadow_chroma_compressed_ratio),
+            optional_f64(frame.post_chroma_compression_clipped_high_max),
+            optional_f64(frame.post_chroma_compression_clipped_low_max)
+        ));
+    }
+    md
+}
+
+fn roll_dimensions_label(width: Option<usize>, height: Option<usize>) -> String {
+    match (width, height) {
+        (Some(width), Some(height)) => format!("{width}x{height}"),
+        _ => "n/a".to_string(),
+    }
+}
+
+fn roll_suite_counts_cell(counts: &[RollSuiteValueCount]) -> String {
+    if counts.is_empty() {
+        return "none".to_string();
+    }
+    counts
+        .iter()
+        .map(|entry| format!("{}:{}", entry.value, entry.count))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn markdown_cell(value: &str) -> String {
+    value.replace('|', "\\|").replace('\n', " ")
+}
+
+fn run_fixture_suite(
+    cli: &ValidationCli,
+    fixtures: &BTreeMap<String, FixtureEntry>,
+    requirements: &FixtureCoverageRequirements,
+) -> FixtureSuiteSummary {
+    let coverage = fixture_coverage_summary(fixtures, requirements, cli.compute_fixture_hashes);
+    let coverage_by_fixture = coverage
+        .fixtures
+        .iter()
+        .map(|entry| {
+            (
+                entry.name.clone(),
+                FixtureSuiteCoverageContext {
+                    validation_ready: entry.validation_ready,
+                    issues: entry.issues.clone(),
+                    action_items: entry.action_items.clone(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let fixtures = fixtures
+        .iter()
+        .map(|(name, fixture)| {
+            run_fixture_suite_entry(
+                cli,
+                name,
+                fixture,
+                coverage_by_fixture.get(name).cloned().unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut issues = coverage.issues.clone();
+    issues.extend(
+        fixtures
+            .iter()
+            .flat_map(|fixture| fixture.issues.iter().cloned())
+            .collect::<Vec<_>>(),
+    );
+    let passed_count = fixtures
+        .iter()
+        .filter(|fixture| fixture.status == "passed")
+        .count();
+    let review_required_count = fixtures
+        .iter()
+        .filter(|fixture| fixture.status == "review_required")
+        .count();
+    let failed_count = fixtures
+        .iter()
+        .filter(|fixture| fixture.status == "failed")
+        .count();
+
+    FixtureSuiteSummary {
+        status: if failed_count > 0 {
+            "failed".to_string()
+        } else if review_required_count > 0 || !coverage.issues.is_empty() {
+            "review_required".to_string()
+        } else {
+            "passed".to_string()
+        },
+        fixture_count: fixtures.len(),
+        passed_count,
+        review_required_count,
+        failed_count,
+        coverage,
+        fixtures,
+        issues,
+    }
+}
+
+fn run_fixture_suite_entry(
+    cli: &ValidationCli,
+    name: &str,
+    fixture: &FixtureEntry,
+    coverage: FixtureSuiteCoverageContext,
+) -> FixtureSuiteEntry {
+    let output_dir = fixture_suite_output_dir(cli, name, fixture);
+    let mut entry = FixtureSuiteEntry {
+        name: name.to_string(),
+        status: "passed".to_string(),
+        coverage_validation_ready: coverage.validation_ready,
+        coverage_issues: coverage.issues,
+        coverage_action_items: coverage.action_items,
+        output_dir: output_dir.display().to_string(),
+        output_path: None,
+        output_modified_at: None,
+        output_color_space: None,
+        expected_output_color_space: None,
+        output_file_icc_profile_matches_report: None,
+        stale_render_artifact_count: None,
+        report_path: None,
+        summary_json_path: None,
+        summary_md_path: None,
+        summary_baseline_path: fixture
+            .summary_baseline
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        summary_baseline_status: None,
+        stitch_decision: None,
+        expected_stitch_decision: None,
+        base_estimate_source: None,
+        expected_base_estimate_source: None,
+        reference_evidence: fixture.reference_evidence.clone(),
+        render_input_source: None,
+        expected_render_input_source: None,
+        render_input_reason: None,
+        expected_render_input_reason_contains: None,
+        selected_mapping_reason: None,
+        expected_selected_mapping_reason_contains: None,
+        expected_calibration_source: None,
+        expected_calibration_scanner_profile: None,
+        expected_calibration_roll_profile: None,
+        expected_calibration_film_stock: None,
+        calibration_status: None,
+        calibration_source: None,
+        calibration_scanner_profile_status: None,
+        calibration_scanner_profile_id: None,
+        calibration_roll_profile_status: None,
+        calibration_roll_profile_id: None,
+        calibration_requested_film_stock: None,
+        calibration_acceptance_status: None,
+        calibration_confidence: None,
+        expected_calibration_confidence_min: None,
+        calibration_matrix_condition_number: None,
+        expected_calibration_matrix_condition_number_max: None,
+        calibration_rejection_details: Vec::new(),
+        expected_calibration_rejection_details_required: Vec::new(),
+        selected_candidate: None,
+        expected_selected_candidate: None,
+        selected_candidate_rank: None,
+        expected_selected_candidate_rank: None,
+        candidate_acceptance_signatures: Vec::new(),
+        expected_candidate_acceptance_signatures_required: Vec::new(),
+        selection_rejections: Vec::new(),
+        expected_selection_rejections_required: Vec::new(),
+        selected_quality_score: None,
+        expected_selected_quality_score_max: None,
+        selected_runner_up_quality_delta: None,
+        expected_selected_runner_up_quality_delta_min: None,
+        technical_safety_score: None,
+        expected_technical_safety_score_max: None,
+        color_fidelity_score: None,
+        expected_color_fidelity_score_max: None,
+        memory_color_penalty: None,
+        expected_memory_color_penalty_max: None,
+        spatial_consistency_penalty: None,
+        expected_spatial_consistency_penalty_max: None,
+        density_monotonicity_score: None,
+        expected_density_monotonicity_score_min: None,
+        hue_linearity_score: None,
+        expected_hue_linearity_score_min: None,
+        saturation_preservation_median_ratio: None,
+        expected_saturation_preservation_median_ratio_min: None,
+        spatial_neutral_delta_p95: None,
+        expected_spatial_neutral_delta_p95_max: None,
+        candidate_risk: None,
+        expected_candidate_risk: None,
+        tone_color_trust_state: None,
+        expected_tone_color_trust_state: None,
+        highlight_chroma_compressed_ratio: None,
+        expected_highlight_chroma_compressed_ratio_min: None,
+        expected_highlight_chroma_compressed_ratio_max: None,
+        highlight_neutral_chroma_compressed_ratio: None,
+        expected_highlight_neutral_chroma_compressed_ratio_max: None,
+        shadow_chroma_compressed_ratio: None,
+        expected_shadow_chroma_compressed_ratio_max: None,
+        mapping_strategy: None,
+        expected_mapping_strategy: None,
+        post_scale_preserved_ratio: None,
+        expected_post_scale_preserved_ratio_min: None,
+        reference_patch_evaluation_present: None,
+        reference_patch_patch_count: None,
+        reference_patch_selected_rms_delta_e: None,
+        reference_patch_selected_rms_delta_e2000: None,
+        reference_patch_delta_e2000_delta_vs_image_derived: None,
+        reference_patch_max_delta_vs_image_derived: None,
+        reference_patch_delta_e_max_delta_vs_image_derived: None,
+        reference_patch_delta_e2000_max_delta_vs_image_derived: None,
+        reference_patch_selected_regresses_image_derived: None,
+        reference_patch_hue_family_regressions: Vec::new(),
+        expected_reference_patch_evaluation_required: false,
+        expected_reference_patch_count_min: None,
+        expected_reference_patch_hue_family_regression_count_max: None,
+        expected_reference_patch_selected_regresses_image_derived: None,
+        expected_reference_patch_delta_e2000_delta_vs_image_derived_max: None,
+        expected_reference_patch_max_delta_vs_image_derived_max: None,
+        expected_reference_patch_delta_e_max_delta_vs_image_derived_max: None,
+        expected_reference_patch_delta_e2000_max_delta_vs_image_derived_max: None,
+        expected_reference_patch_rms_delta_e_max: None,
+        expected_reference_patch_rms_delta_e2000_max: None,
+        debug_artifact_count: None,
+        debug_artifact_invalid_count: None,
+        debug_artifact_kinds: Vec::new(),
+        expected_debug_artifacts_required: false,
+        expected_debug_artifact_kinds_required: Vec::new(),
+        issues: Vec::new(),
+        error: None,
+    };
+
+    let component1_missing = !fixture.component1.exists();
+    let component2_missing = !fixture.component2.exists();
+    if component1_missing {
+        entry
+            .issues
+            .push(format!("fixture_suite:{name}:component1_missing"));
+    }
+    if component2_missing {
+        entry
+            .issues
+            .push(format!("fixture_suite:{name}:component2_missing"));
+    }
+    if component1_missing || component2_missing {
+        entry.status = "failed".to_string();
+        entry.error = Some("component file missing".to_string());
+        return entry;
+    }
+    if !entry.coverage_validation_ready {
+        entry.issues.push(format!(
+            "fixture_suite:{name}:coverage_not_validation_ready"
+        ));
+    }
+
+    let calibration_profile = cli
+        .calibration_profile
+        .clone()
+        .or_else(|| fixture.calibration_profile.clone());
+    let calibration_library = cli
+        .calibration_library
+        .clone()
+        .or_else(|| fixture.calibration_library.clone());
+    let film_stock = pipeline_film_stock(
+        cli.film_stock.as_ref(),
+        Some(fixture),
+        calibration_library.as_ref(),
+    );
+
+    let pipeline_cli = PipelineCli {
+        component1: fixture.component1.clone(),
+        component2: fixture.component2.clone(),
+        output_dir: output_dir.clone(),
+        calibration_profile,
+        calibration_library,
+        scanner_profile: cli
+            .scanner_profile
+            .clone()
+            .or_else(|| fixture.scanner_profile.clone()),
+        roll_profile: cli
+            .roll_profile
+            .clone()
+            .or_else(|| fixture.roll_profile.clone()),
+        film_stock,
+        base_color: cli.base_color.clone(),
+        base_color_source: None,
+        base_color_confidence: None,
+        base_color_reason: None,
+        color_mode: cli.color_mode,
+        render_input: cli.render_input,
+        input_mode: cli.input_mode,
+        render_intent: cli.render_intent,
+        quality_mode: cli.quality_mode,
+        write_master: cli.write_master,
+        review_sidecar: cli.review_sidecar.clone(),
+        write_review_sidecar: cli.write_review_sidecar.clone(),
+        debug: cli.debug,
+        force_stitch: cli.force_stitch,
+        force_no_stitch: cli.force_no_stitch,
+        transform: cli.transform.clone(),
+        ica_max_iter: cli.ica_max_iter,
+        ica_tol: cli.ica_tol,
+        bit_depth: cli.bit_depth,
+        use_opencv: cli.use_opencv,
+    };
+    entry.expected_calibration_source =
+        expected_calibration_source(&pipeline_cli).map(str::to_string);
+    entry.expected_calibration_scanner_profile = pipeline_cli.scanner_profile.clone();
+    entry.expected_calibration_roll_profile = pipeline_cli.roll_profile.clone();
+    entry.expected_calibration_film_stock = pipeline_cli.film_stock.clone();
+    entry.expected_stitch_decision = fixture.expectations.stitch_decision.clone();
+    entry.expected_base_estimate_source = fixture.expectations.base_estimate_source.clone();
+    entry.expected_output_color_space = fixture.expectations.output_color_space.clone();
+    entry.expected_render_input_source = fixture.expectations.render_input_source.clone();
+    entry.expected_render_input_reason_contains =
+        fixture.expectations.render_input_reason_contains.clone();
+    entry.expected_selected_mapping_reason_contains = fixture
+        .expectations
+        .selected_mapping_reason_contains
+        .clone();
+    entry.expected_selected_candidate = fixture.expectations.selected_candidate.clone();
+    entry.expected_selected_candidate_rank = fixture.expectations.selected_candidate_rank;
+    entry.expected_candidate_acceptance_signatures_required = fixture
+        .expectations
+        .candidate_acceptance_signatures_required
+        .clone();
+    entry.expected_selection_rejections_required =
+        fixture.expectations.selection_rejections_required.clone();
+    entry.expected_calibration_rejection_details_required = fixture
+        .expectations
+        .calibration_rejection_details_required
+        .clone();
+    entry.expected_calibration_confidence_min = fixture.expectations.calibration_confidence_min;
+    entry.expected_calibration_matrix_condition_number_max =
+        fixture.expectations.calibration_matrix_condition_number_max;
+    entry.expected_selected_quality_score_max = fixture.expectations.selected_quality_score_max;
+    entry.expected_selected_runner_up_quality_delta_min =
+        fixture.expectations.selected_runner_up_quality_delta_min;
+    entry.expected_technical_safety_score_max = fixture.expectations.technical_safety_score_max;
+    entry.expected_color_fidelity_score_max = fixture.expectations.color_fidelity_score_max;
+    entry.expected_memory_color_penalty_max = fixture.expectations.memory_color_penalty_max;
+    entry.expected_spatial_consistency_penalty_max =
+        fixture.expectations.spatial_consistency_penalty_max;
+    entry.expected_density_monotonicity_score_min =
+        fixture.expectations.density_monotonicity_score_min;
+    entry.expected_hue_linearity_score_min = fixture.expectations.hue_linearity_score_min;
+    entry.expected_saturation_preservation_median_ratio_min = fixture
+        .expectations
+        .saturation_preservation_median_ratio_min;
+    entry.expected_spatial_neutral_delta_p95_max =
+        fixture.expectations.spatial_neutral_delta_p95_max;
+    entry.expected_candidate_risk = fixture.expectations.candidate_risk.clone();
+    entry.expected_tone_color_trust_state = fixture.expectations.tone_color_trust_state.clone();
+    entry.expected_highlight_chroma_compressed_ratio_min =
+        fixture.expectations.highlight_chroma_compressed_ratio_min;
+    entry.expected_highlight_chroma_compressed_ratio_max =
+        fixture.expectations.highlight_chroma_compressed_ratio_max;
+    entry.expected_highlight_neutral_chroma_compressed_ratio_max = fixture
+        .expectations
+        .highlight_neutral_chroma_compressed_ratio_max;
+    entry.expected_shadow_chroma_compressed_ratio_max =
+        fixture.expectations.shadow_chroma_compressed_ratio_max;
+    entry.expected_mapping_strategy = fixture.expectations.mapping_strategy.clone();
+    entry.expected_post_scale_preserved_ratio_min =
+        fixture.expectations.post_scale_preserved_ratio_min;
+    entry.expected_reference_patch_evaluation_required =
+        fixture.expectations.reference_patch_evaluation_required;
+    entry.expected_reference_patch_count_min = fixture.expectations.reference_patch_count_min;
+    entry.expected_reference_patch_hue_family_regression_count_max = fixture
+        .expectations
+        .reference_patch_hue_family_regression_count_max;
+    entry.expected_reference_patch_selected_regresses_image_derived = fixture
+        .expectations
+        .reference_patch_selected_regresses_image_derived;
+    entry.expected_reference_patch_delta_e2000_delta_vs_image_derived_max = fixture
+        .expectations
+        .reference_patch_delta_e2000_delta_vs_image_derived_max;
+    entry.expected_reference_patch_max_delta_vs_image_derived_max = fixture
+        .expectations
+        .reference_patch_max_delta_vs_image_derived_max;
+    entry.expected_reference_patch_delta_e_max_delta_vs_image_derived_max = fixture
+        .expectations
+        .reference_patch_delta_e_max_delta_vs_image_derived_max;
+    entry.expected_reference_patch_delta_e2000_max_delta_vs_image_derived_max = fixture
+        .expectations
+        .reference_patch_delta_e2000_max_delta_vs_image_derived_max;
+    entry.expected_reference_patch_rms_delta_e_max =
+        fixture.expectations.reference_patch_rms_delta_e_max;
+    entry.expected_reference_patch_rms_delta_e2000_max =
+        fixture.expectations.reference_patch_rms_delta_e2000_max;
+    entry.expected_debug_artifacts_required = fixture.expectations.debug_artifacts_required;
+    entry.expected_debug_artifact_kinds_required =
+        fixture.expectations.debug_artifact_kinds_required.clone();
+
+    let report = match scanstitch::pipeline::run(&pipeline_cli) {
+        Ok(report) => report,
+        Err(err) => {
+            entry.status = "failed".to_string();
+            entry
+                .issues
+                .push(format!("fixture_suite:{name}:pipeline_failed"));
+            entry.error = Some(err.to_string());
+            return entry;
+        }
+    };
+
+    let report_path = pipeline_cli.output_dir.join("report.json");
+    if let Err(err) = report.save(&report_path) {
+        entry.status = "failed".to_string();
+        entry
+            .issues
+            .push(format!("fixture_suite:{name}:report_write_failed"));
+        entry.error = Some(err.to_string());
+        return entry;
+    }
+    entry.report_path = Some(report_path.display().to_string());
+
+    let mut summary = summarize_report_with_source(name.to_string(), &report, Some(&report_path));
+    apply_fixture_suite_summary_baseline(name, fixture, &mut summary, &mut entry);
+
+    entry.output_path = summary.render.output_path.clone();
+    entry.output_modified_at = summary.render.output_modified_at.clone();
+    entry.output_color_space = summary.render.output_color_space.clone();
+    entry.output_file_icc_profile_matches_report =
+        summary.render.output_file_icc_profile_matches_report;
+    entry.stale_render_artifact_count = summary.render.stale_render_artifact_count;
+    entry.stitch_decision = summary.stitch.decision.clone();
+    entry.base_estimate_source = summary.base_density.base_estimate_source.clone();
+    entry.render_input_source = summary.colorspace.render_input_source.clone();
+    entry.render_input_reason = summary.colorspace.render_input_reason.clone();
+    entry.selected_mapping_reason = summary.colorspace.selected_mapping_reason.clone();
+    entry.calibration_status = summary.colorspace.calibration_status.clone();
+    entry.calibration_source = summary.colorspace.calibration_source.clone();
+    entry.calibration_scanner_profile_status = summary
+        .colorspace
+        .calibration_scanner_profile_status
+        .clone();
+    entry.calibration_scanner_profile_id =
+        summary.colorspace.calibration_scanner_profile_id.clone();
+    entry.calibration_roll_profile_status =
+        summary.colorspace.calibration_roll_profile_status.clone();
+    entry.calibration_roll_profile_id = summary.colorspace.calibration_roll_profile_id.clone();
+    entry.calibration_requested_film_stock =
+        summary.colorspace.calibration_requested_film_stock.clone();
+    entry.calibration_acceptance_status = summary
+        .colorspace
+        .calibration_acceptance
+        .as_ref()
+        .and_then(|acceptance| acceptance.status.clone());
+    entry.calibration_confidence = summary.colorspace.calibration_confidence;
+    entry.calibration_matrix_condition_number =
+        summary.colorspace.calibration_matrix_condition_number;
+    entry.calibration_rejection_details = summary.colorspace.calibration_rejection_details.clone();
+    entry.selected_candidate = summary.colorspace.selected_candidate.clone();
+    entry.selected_candidate_rank = summary.colorspace.selected_candidate_rank;
+    entry.candidate_acceptance_signatures =
+        fixture_suite_candidate_acceptance_signatures(&summary.colorspace.candidate_acceptance);
+    entry.selection_rejections = summary.colorspace.selection_rejections.clone();
+    entry.selected_quality_score = summary.colorspace.selected_quality_score;
+    entry.selected_runner_up_quality_delta = summary.colorspace.selected_runner_up_quality_delta;
+    entry.technical_safety_score = summary.colorspace.technical_safety_score;
+    entry.color_fidelity_score = summary.colorspace.color_fidelity_score;
+    entry.memory_color_penalty = summary.render.colorspace_memory_color_penalty;
+    entry.spatial_consistency_penalty = summary.render.colorspace_spatial_consistency_penalty;
+    entry.density_monotonicity_score = summary.render.colorspace_density_monotonicity_score;
+    entry.hue_linearity_score = summary.render.colorspace_hue_linearity_score;
+    entry.saturation_preservation_median_ratio = summary
+        .render
+        .colorspace_saturation_preservation_median_ratio;
+    entry.spatial_neutral_delta_p95 = summary.render.colorspace_spatial_neutral_delta_p95;
+    entry.candidate_risk = summary.colorspace.candidate_risk.clone();
+    entry.tone_color_trust_state = summary.colorspace.tone_color_trust_state.clone();
+    entry.highlight_chroma_compressed_ratio = summary.tone.highlight_chroma_compressed_ratio;
+    entry.highlight_neutral_chroma_compressed_ratio =
+        summary.tone.highlight_neutral_chroma_compressed_ratio;
+    entry.shadow_chroma_compressed_ratio = summary.tone.shadow_chroma_compressed_ratio;
+    entry.mapping_strategy = summary.colorspace.mapping_strategy.clone();
+    entry.post_scale_preserved_ratio = summary.colorspace.post_scale_preserved_ratio;
+    entry.reference_patch_evaluation_present =
+        Some(summary.colorspace.reference_patch_evaluation.is_some());
+    entry.reference_patch_patch_count = summary
+        .colorspace
+        .reference_patch_evaluation
+        .as_ref()
+        .and_then(|evaluation| evaluation.patch_count);
+    entry.reference_patch_selected_rms_delta_e = summary
+        .colorspace
+        .reference_patch_evaluation
+        .as_ref()
+        .and_then(|evaluation| evaluation.selected_rms_delta_e);
+    entry.reference_patch_selected_rms_delta_e2000 = summary
+        .colorspace
+        .reference_patch_evaluation
+        .as_ref()
+        .and_then(|evaluation| evaluation.selected_rms_delta_e2000);
+    entry.reference_patch_delta_e2000_delta_vs_image_derived = summary
+        .colorspace
+        .reference_patch_evaluation
+        .as_ref()
+        .and_then(|evaluation| evaluation.delta_e2000_rms_delta_vs_image_derived);
+    entry.reference_patch_max_delta_vs_image_derived = summary
+        .colorspace
+        .reference_patch_evaluation
+        .as_ref()
+        .and_then(|evaluation| evaluation.max_error_delta_vs_image_derived);
+    entry.reference_patch_delta_e_max_delta_vs_image_derived = summary
+        .colorspace
+        .reference_patch_evaluation
+        .as_ref()
+        .and_then(|evaluation| evaluation.delta_e_max_delta_vs_image_derived);
+    entry.reference_patch_delta_e2000_max_delta_vs_image_derived = summary
+        .colorspace
+        .reference_patch_evaluation
+        .as_ref()
+        .and_then(|evaluation| evaluation.delta_e2000_max_delta_vs_image_derived);
+    entry.reference_patch_selected_regresses_image_derived = summary
+        .colorspace
+        .reference_patch_evaluation
+        .as_ref()
+        .and_then(|evaluation| evaluation.selected_regresses_image_derived);
+    entry.reference_patch_hue_family_regressions = summary
+        .colorspace
+        .reference_patch_evaluation
+        .as_ref()
+        .map(|evaluation| evaluation.hue_family_regressions.clone())
+        .unwrap_or_default();
+    let debug_artifact_issues = fixture_suite_debug_artifact_issues(&summary);
+    entry.debug_artifact_count = Some(summary.colorspace.debug_artifacts.len());
+    entry.debug_artifact_invalid_count = Some(debug_artifact_issues.len());
+    entry.debug_artifact_kinds = summary
+        .colorspace
+        .debug_artifacts
+        .iter()
+        .map(|artifact| artifact.kind.clone())
+        .collect();
+    validate_fixture_suite_output_guardrails(name, &summary, &mut entry);
+    validate_fixture_suite_calibration_expectations(name, &pipeline_cli, &summary, &mut entry);
+    validate_fixture_suite_color_expectations(
+        name,
+        &fixture.expectations,
+        &summary,
+        &debug_artifact_issues,
+        &mut entry,
+    );
+
+    let summary_json_path = output_dir.join("summary.json");
+    let summary_md_path = output_dir.join("summary.md");
+    let json_summary = match serde_json::to_string_pretty(&summary) {
+        Ok(json) => json,
+        Err(err) => {
+            entry.status = "failed".to_string();
+            entry
+                .issues
+                .push(format!("fixture_suite:{name}:summary_serialize_failed"));
+            entry.error = Some(err.to_string());
+            return entry;
+        }
+    };
+    if let Err(err) = write_text(&summary_json_path, &json_summary) {
+        entry.status = "failed".to_string();
+        entry
+            .issues
+            .push(format!("fixture_suite:{name}:summary_json_write_failed"));
+        entry.error = Some(err.to_string());
+        return entry;
+    }
+    if let Err(err) = write_text(&summary_md_path, &summary_to_markdown(&summary)) {
+        entry.status = "failed".to_string();
+        entry
+            .issues
+            .push(format!("fixture_suite:{name}:summary_md_write_failed"));
+        entry.error = Some(err.to_string());
+        return entry;
+    }
+    entry.summary_json_path = Some(summary_json_path.display().to_string());
+    entry.summary_md_path = Some(summary_md_path.display().to_string());
+
+    if entry.status != "failed" && !entry.issues.is_empty() {
+        entry.status = "review_required".to_string();
+    }
+    entry
+}
+
+fn validate_fixture_suite_color_expectations(
+    name: &str,
+    expectations: &FixtureExpectations,
+    summary: &ValidationSummary,
+    debug_artifact_issues: &[String],
+    entry: &mut FixtureSuiteEntry,
+) {
+    push_fixture_suite_expected_string_issue(
+        name,
+        "stitch_decision",
+        expectations.stitch_decision.as_deref(),
+        summary.stitch.decision.as_deref(),
+        entry,
+    );
+    push_fixture_suite_expected_string_issue(
+        name,
+        "base_estimate_source",
+        expectations.base_estimate_source.as_deref(),
+        summary.base_density.base_estimate_source.as_deref(),
+        entry,
+    );
+    push_fixture_suite_expected_string_issue(
+        name,
+        "output_color_space",
+        expectations.output_color_space.as_deref(),
+        summary.render.output_color_space.as_deref(),
+        entry,
+    );
+    push_fixture_suite_expected_string_issue(
+        name,
+        "render_input_source",
+        expectations.render_input_source.as_deref(),
+        summary.colorspace.render_input_source.as_deref(),
+        entry,
+    );
+    push_fixture_suite_expected_contains_issue(
+        name,
+        "render_input_reason",
+        expectations.render_input_reason_contains.as_deref(),
+        summary.colorspace.render_input_reason.as_deref(),
+        entry,
+    );
+    push_fixture_suite_expected_string_issue(
+        name,
+        "mapping_strategy",
+        expectations.mapping_strategy.as_deref(),
+        summary.colorspace.mapping_strategy.as_deref(),
+        entry,
+    );
+    push_fixture_suite_expected_contains_issue(
+        name,
+        "selected_mapping_reason",
+        expectations.selected_mapping_reason_contains.as_deref(),
+        summary.colorspace.selected_mapping_reason.as_deref(),
+        entry,
+    );
+    push_fixture_suite_expected_string_issue(
+        name,
+        "selected_candidate",
+        expectations.selected_candidate.as_deref(),
+        summary.colorspace.selected_candidate.as_deref(),
+        entry,
+    );
+    if expectations.selected_candidate_rank.is_some()
+        && expectations.selected_candidate_rank != summary.colorspace.selected_candidate_rank
+    {
+        entry.issues.push(format!(
+            "fixture_suite:{name}:selected_candidate_rank_mismatch"
+        ));
+    }
+    let candidate_acceptance_signatures =
+        fixture_suite_candidate_acceptance_signatures(&summary.colorspace.candidate_acceptance);
+    for required_signature in &expectations.candidate_acceptance_signatures_required {
+        if !candidate_acceptance_signatures.contains(required_signature) {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:candidate_acceptance_signature_missing:{required_signature}"
+            ));
+        }
+    }
+    push_fixture_suite_expected_string_issue(
+        name,
+        "calibration_acceptance_status",
+        expectations.calibration_acceptance_status.as_deref(),
+        summary
+            .colorspace
+            .calibration_acceptance
+            .as_ref()
+            .and_then(|acceptance| acceptance.status.as_deref()),
+        entry,
+    );
+    for required_detail in &expectations.calibration_rejection_details_required {
+        if !summary
+            .colorspace
+            .calibration_rejection_details
+            .contains(required_detail)
+        {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:calibration_rejection_detail_missing:{required_detail}"
+            ));
+        }
+    }
+    for required_rejection in &expectations.selection_rejections_required {
+        if !summary
+            .colorspace
+            .selection_rejections
+            .contains(required_rejection)
+        {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:selection_rejection_missing:{required_rejection}"
+            ));
+        }
+    }
+    push_fixture_suite_expected_min_issue(
+        name,
+        "calibration_confidence",
+        expectations.calibration_confidence_min,
+        summary.colorspace.calibration_confidence,
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "calibration_matrix_condition_number",
+        expectations.calibration_matrix_condition_number_max,
+        summary.colorspace.calibration_matrix_condition_number,
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "selected_quality_score",
+        expectations.selected_quality_score_max,
+        summary.colorspace.selected_quality_score,
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "technical_safety_score",
+        expectations.technical_safety_score_max,
+        summary.colorspace.technical_safety_score,
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "color_fidelity_score",
+        expectations.color_fidelity_score_max,
+        summary.colorspace.color_fidelity_score,
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "memory_color_penalty",
+        expectations.memory_color_penalty_max,
+        summary.render.colorspace_memory_color_penalty,
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "spatial_consistency_penalty",
+        expectations.spatial_consistency_penalty_max,
+        summary.render.colorspace_spatial_consistency_penalty,
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "selected_runner_up_quality_delta",
+        expectations.selected_runner_up_quality_delta_min,
+        summary.colorspace.selected_runner_up_quality_delta,
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "density_monotonicity_score",
+        expectations.density_monotonicity_score_min,
+        summary.render.colorspace_density_monotonicity_score,
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "hue_linearity_score",
+        expectations.hue_linearity_score_min,
+        summary.render.colorspace_hue_linearity_score,
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "saturation_preservation_median_ratio",
+        expectations.saturation_preservation_median_ratio_min,
+        summary
+            .render
+            .colorspace_saturation_preservation_median_ratio,
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "spatial_neutral_delta_p95",
+        expectations.spatial_neutral_delta_p95_max,
+        summary.render.colorspace_spatial_neutral_delta_p95,
+        entry,
+    );
+    push_fixture_suite_expected_string_issue(
+        name,
+        "candidate_risk",
+        expectations.candidate_risk.as_deref(),
+        summary.colorspace.candidate_risk.as_deref(),
+        entry,
+    );
+    push_fixture_suite_expected_string_issue(
+        name,
+        "tone_color_trust_state",
+        expectations.tone_color_trust_state.as_deref(),
+        summary.colorspace.tone_color_trust_state.as_deref(),
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "highlight_chroma_compressed_ratio",
+        expectations.highlight_chroma_compressed_ratio_min,
+        summary.tone.highlight_chroma_compressed_ratio,
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "highlight_chroma_compressed_ratio",
+        expectations.highlight_chroma_compressed_ratio_max,
+        summary.tone.highlight_chroma_compressed_ratio,
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "highlight_neutral_chroma_compressed_ratio",
+        expectations.highlight_neutral_chroma_compressed_ratio_max,
+        summary.tone.highlight_neutral_chroma_compressed_ratio,
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "shadow_chroma_compressed_ratio",
+        expectations.shadow_chroma_compressed_ratio_max,
+        summary.tone.shadow_chroma_compressed_ratio,
+        entry,
+    );
+    if let Some(minimum) = expectations.post_scale_preserved_ratio_min {
+        if !summary
+            .colorspace
+            .post_scale_preserved_ratio
+            .is_some_and(|actual| actual >= minimum)
+        {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:post_scale_preserved_ratio_below_expected"
+            ));
+        }
+    }
+    if expectations.reference_patch_evaluation_required
+        && summary.colorspace.reference_patch_evaluation.is_none()
+    {
+        entry.issues.push(format!(
+            "fixture_suite:{name}:reference_patch_evaluation_missing"
+        ));
+    }
+    if let Some(minimum) = expectations.reference_patch_count_min {
+        let actual = summary
+            .colorspace
+            .reference_patch_evaluation
+            .as_ref()
+            .and_then(|evaluation| evaluation.patch_count)
+            .unwrap_or(0);
+        if actual < minimum {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:reference_patch_count_below_expected"
+            ));
+        }
+    }
+    if let Some(maximum) = expectations.reference_patch_hue_family_regression_count_max {
+        let actual = summary
+            .colorspace
+            .reference_patch_evaluation
+            .as_ref()
+            .map(|evaluation| evaluation.hue_family_regressions.len());
+        if actual.is_none_or(|actual| actual > maximum) {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:reference_patch_hue_family_regression_count_above_expected"
+            ));
+        }
+    }
+    if let Some(expected) = expectations.reference_patch_selected_regresses_image_derived {
+        let actual = summary
+            .colorspace
+            .reference_patch_evaluation
+            .as_ref()
+            .and_then(|evaluation| evaluation.selected_regresses_image_derived);
+        if actual != Some(expected) {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:reference_patch_selected_regression_mismatch"
+            ));
+        }
+    }
+    if let Some(maximum) = expectations.reference_patch_delta_e2000_delta_vs_image_derived_max {
+        let actual = summary
+            .colorspace
+            .reference_patch_evaluation
+            .as_ref()
+            .and_then(|evaluation| evaluation.delta_e2000_rms_delta_vs_image_derived);
+        if actual.is_none_or(|actual| actual > maximum) {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:reference_patch_delta_e2000_delta_vs_image_derived_above_expected"
+            ));
+        }
+    }
+    if let Some(maximum) = expectations.reference_patch_max_delta_vs_image_derived_max {
+        let actual = summary
+            .colorspace
+            .reference_patch_evaluation
+            .as_ref()
+            .and_then(|evaluation| evaluation.max_error_delta_vs_image_derived);
+        if actual.is_none_or(|actual| actual > maximum) {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:reference_patch_max_delta_vs_image_derived_above_expected"
+            ));
+        }
+    }
+    if let Some(maximum) = expectations.reference_patch_delta_e_max_delta_vs_image_derived_max {
+        let actual = summary
+            .colorspace
+            .reference_patch_evaluation
+            .as_ref()
+            .and_then(|evaluation| evaluation.delta_e_max_delta_vs_image_derived);
+        if actual.is_none_or(|actual| actual > maximum) {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:reference_patch_delta_e_max_delta_vs_image_derived_above_expected"
+            ));
+        }
+    }
+    if let Some(maximum) = expectations.reference_patch_delta_e2000_max_delta_vs_image_derived_max {
+        let actual = summary
+            .colorspace
+            .reference_patch_evaluation
+            .as_ref()
+            .and_then(|evaluation| evaluation.delta_e2000_max_delta_vs_image_derived);
+        if actual.is_none_or(|actual| actual > maximum) {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:reference_patch_delta_e2000_max_delta_vs_image_derived_above_expected"
+            ));
+        }
+    }
+    if let Some(maximum) = expectations.reference_patch_rms_delta_e_max {
+        let actual = summary
+            .colorspace
+            .reference_patch_evaluation
+            .as_ref()
+            .and_then(|evaluation| evaluation.selected_rms_delta_e);
+        if !actual.is_some_and(|actual| actual <= maximum) {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:reference_patch_rms_delta_e_above_expected"
+            ));
+        }
+    }
+    if let Some(maximum) = expectations.reference_patch_rms_delta_e2000_max {
+        let actual = summary
+            .colorspace
+            .reference_patch_evaluation
+            .as_ref()
+            .and_then(|evaluation| evaluation.selected_rms_delta_e2000);
+        if !actual.is_some_and(|actual| actual <= maximum) {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:reference_patch_rms_delta_e2000_above_expected"
+            ));
+        }
+    }
+    if expectations.debug_artifacts_required {
+        if summary.colorspace.debug_artifacts.is_empty() {
+            entry
+                .issues
+                .push(format!("fixture_suite:{name}:debug_artifacts_missing"));
+        }
+        entry.issues.extend(
+            debug_artifact_issues
+                .iter()
+                .map(|issue| format!("fixture_suite:{name}:{issue}")),
+        );
+    }
+    for required_kind in &expectations.debug_artifact_kinds_required {
+        let required_kind = required_kind.trim();
+        if required_kind.is_empty() {
+            continue;
+        }
+        let Some(artifact) = summary
+            .colorspace
+            .debug_artifacts
+            .iter()
+            .find(|artifact| artifact.kind == required_kind)
+        else {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:debug_artifact_kind_missing:{required_kind}"
+            ));
+            continue;
+        };
+        if !expectations.debug_artifacts_required && artifact.status != "fresh" {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:colorspace_debug_artifact_invalid:{}:{}",
+                artifact.kind, artifact.status
+            ));
+        }
+    }
+}
+
+fn fixture_suite_debug_artifact_issues(summary: &ValidationSummary) -> Vec<String> {
+    summary
+        .colorspace
+        .debug_artifacts
+        .iter()
+        .filter(|artifact| artifact.status != "fresh")
+        .map(|artifact| {
+            format!(
+                "colorspace_debug_artifact_invalid:{}:{}",
+                artifact.kind, artifact.status
+            )
+        })
+        .collect()
+}
+
+fn fixture_suite_candidate_acceptance_signatures(
+    candidates: &[ColorCandidateAcceptanceSummary],
+) -> Vec<String> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "{}|kind={}|strategy={}|status={}|rank={}|selected={}|eligible={}|rejected={}",
+                candidate.candidate.as_deref().unwrap_or("unknown"),
+                candidate.candidate_kind.as_deref().unwrap_or("unknown"),
+                candidate.mapping_strategy.as_deref().unwrap_or("unknown"),
+                candidate.status.as_deref().unwrap_or("unknown"),
+                candidate
+                    .rank
+                    .map(|rank| rank.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                candidate
+                    .selected
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                candidate
+                    .eligible_in_color_mode
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                candidate
+                    .rejected
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+            )
+        })
+        .collect()
+}
+
+fn push_fixture_suite_expected_string_issue(
+    name: &str,
+    field: &str,
+    expected: Option<&str>,
+    actual: Option<&str>,
+    entry: &mut FixtureSuiteEntry,
+) {
+    if expected.is_some() && expected != actual {
+        entry
+            .issues
+            .push(format!("fixture_suite:{name}:{field}_mismatch"));
+    }
+}
+
+fn push_fixture_suite_expected_contains_issue(
+    name: &str,
+    field: &str,
+    expected: Option<&str>,
+    actual: Option<&str>,
+    entry: &mut FixtureSuiteEntry,
+) {
+    if let Some(expected) = expected {
+        if !actual.is_some_and(|actual| actual.contains(expected)) {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:{field}_missing_expected_text"
+            ));
+        }
+    }
+}
+
+fn push_fixture_suite_expected_max_issue(
+    name: &str,
+    field: &str,
+    maximum: Option<f64>,
+    actual: Option<f64>,
+    entry: &mut FixtureSuiteEntry,
+) {
+    if let Some(maximum) = maximum {
+        if !actual.is_some_and(|actual| actual <= maximum) {
+            entry
+                .issues
+                .push(format!("fixture_suite:{name}:{field}_above_expected"));
+        }
+    }
+}
+
+fn push_fixture_suite_expected_min_issue(
+    name: &str,
+    field: &str,
+    minimum: Option<f64>,
+    actual: Option<f64>,
+    entry: &mut FixtureSuiteEntry,
+) {
+    if let Some(minimum) = minimum {
+        if !actual.is_some_and(|actual| actual >= minimum) {
+            entry
+                .issues
+                .push(format!("fixture_suite:{name}:{field}_below_expected"));
+        }
+    }
+}
+
+fn validate_fixture_suite_output_guardrails(
+    name: &str,
+    summary: &ValidationSummary,
+    entry: &mut FixtureSuiteEntry,
+) {
+    if summary.render.output_file_icc_profile_matches_report == Some(false) {
+        entry
+            .issues
+            .push(format!("fixture_suite:{name}:output_icc_profile_mismatch"));
+    }
+    if summary.render.stale_render_artifact_count.unwrap_or(0) > 0 {
+        entry
+            .issues
+            .push(format!("fixture_suite:{name}:stale_render_artifacts"));
+    }
+}
+
+fn validate_fixture_suite_calibration_expectations(
+    name: &str,
+    pipeline_cli: &PipelineCli,
+    summary: &ValidationSummary,
+    entry: &mut FixtureSuiteEntry,
+) {
+    let Some(expected_source) = expected_calibration_source(pipeline_cli) else {
+        return;
+    };
+
+    if summary.colorspace.calibration_status.as_deref() != Some("applied") {
+        entry.issues.push(format!(
+            "fixture_suite:{name}:declared_calibration_not_applied"
+        ));
+        return;
+    }
+    if summary.colorspace.calibration_source.as_deref() != Some(expected_source) {
+        entry
+            .issues
+            .push(format!("fixture_suite:{name}:calibration_source_mismatch"));
+    }
+    if let Some(expected_scanner) = pipeline_cli.scanner_profile.as_deref() {
+        if summary.colorspace.calibration_scanner_profile_id.as_deref() != Some(expected_scanner) {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:calibration_scanner_profile_mismatch"
+            ));
+        }
+    }
+    if let Some(expected_roll) = pipeline_cli.roll_profile.as_deref() {
+        if summary.colorspace.calibration_roll_profile_id.as_deref() != Some(expected_roll) {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:calibration_roll_profile_mismatch"
+            ));
+        }
+    }
+    if pipeline_cli.calibration_library.is_some() {
+        if let Some(expected_stock) = pipeline_cli.film_stock.as_deref() {
+            if summary
+                .colorspace
+                .calibration_requested_film_stock
+                .as_deref()
+                != Some(expected_stock)
+            {
+                entry.issues.push(format!(
+                    "fixture_suite:{name}:calibration_film_stock_mismatch"
+                ));
+            }
+        }
+    }
+}
+
+fn expected_calibration_source(pipeline_cli: &PipelineCli) -> Option<&'static str> {
+    if pipeline_cli.calibration_library.is_some()
+        || pipeline_cli.scanner_profile.is_some()
+        || pipeline_cli.roll_profile.is_some()
+        || pipeline_cli.film_stock.is_some()
+    {
+        Some("calibration_library")
+    } else if pipeline_cli.calibration_profile.is_some() {
+        Some("external_calibration_profile")
+    } else {
+        None
+    }
+}
+
+fn apply_fixture_suite_summary_baseline(
+    name: &str,
+    fixture: &FixtureEntry,
+    summary: &mut ValidationSummary,
+    entry: &mut FixtureSuiteEntry,
+) {
+    let Some(compare_summary_path) = &fixture.summary_baseline else {
+        entry.issues.push(format!(
+            "fixture_suite:{name}:summary_baseline_not_declared"
+        ));
+        return;
+    };
+
+    let contents = match std::fs::read_to_string(compare_summary_path) {
+        Ok(contents) => contents,
+        Err(err) => {
+            entry
+                .issues
+                .push(format!("fixture_suite:{name}:summary_baseline_read_failed"));
+            entry.status = "failed".to_string();
+            entry.error = Some(err.to_string());
+            return;
+        }
+    };
+    let baseline = match serde_json::from_str::<TrackedValidationBaseline>(&contents) {
+        Ok(baseline) => baseline,
+        Err(err) => {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:summary_baseline_parse_failed"
+            ));
+            entry.status = "failed".to_string();
+            entry.error = Some(err.to_string());
+            return;
+        }
+    };
+    entry.issues.extend(
+        summary_baseline_contract_issues(&baseline)
+            .into_iter()
+            .map(|field| format!("fixture_suite:{name}:summary_baseline_incomplete:{field}")),
+    );
+    let comparison = compare_summary_baseline(
+        compare_summary_path.to_string_lossy().to_string(),
+        &baseline,
+        summary,
+    );
+    entry.summary_baseline_status = Some(comparison.status.clone());
+    entry.issues.extend(
+        comparison
+            .issues
+            .iter()
+            .map(|issue| format!("fixture_suite:{name}:{issue}")),
+    );
+    summary.summary_baseline_comparison = Some(comparison);
+}
+
+fn summary_baseline_contract_issues(baseline: &TrackedValidationBaseline) -> Vec<&'static str> {
+    let mut issues = Vec::new();
+
+    if baseline.stitch.decision.is_none() {
+        issues.push("stitch.decision");
+    }
+    if baseline.render.output_width.is_none() {
+        issues.push("render.output_width");
+    }
+    if baseline.render.output_height.is_none() {
+        issues.push("render.output_height");
+    }
+    if baseline.render.output_color_space.is_none() {
+        issues.push("render.output_color_space");
+    }
+    if baseline
+        .render
+        .output_file_icc_profile_matches_report
+        .is_none()
+    {
+        issues.push("render.output_file_icc_profile_matches_report");
+    }
+    if baseline.render.base_estimate_source.is_none() {
+        issues.push("render.base_estimate_source");
+    }
+    if baseline.render.render_input_source.is_none() {
+        issues.push("render.render_input_source");
+    }
+    if baseline.render.colorspace_mapping_strategy.is_none() {
+        issues.push("render.colorspace_mapping_strategy");
+    }
+    if baseline.colorspace.calibration_status.is_none() {
+        issues.push("colorspace.calibration_status");
+    }
+    if baseline.colorspace.selected_candidate.is_none() {
+        issues.push("colorspace.selected_candidate");
+    }
+    if baseline.colorspace.calibration_acceptance_status.is_none() {
+        issues.push("colorspace.calibration_acceptance_status");
+    }
+    if baseline.colorspace.candidate_risk.is_none() {
+        issues.push("colorspace.candidate_risk");
+    }
+    if baseline.colorspace.tone_color_trust_state.is_none() {
+        issues.push("colorspace.tone_color_trust_state");
+    }
+    if baseline.colorspace.selected_quality_score.is_none() {
+        issues.push("colorspace.selected_quality_score");
+    }
+    if baseline.colorspace.technical_safety_score.is_none() {
+        issues.push("colorspace.technical_safety_score");
+    }
+    if baseline.colorspace.color_fidelity_score.is_none() {
+        issues.push("colorspace.color_fidelity_score");
+    }
+    if baseline.colorspace.post_scale_preserved_ratio.is_none() {
+        issues.push("colorspace.post_scale_preserved_ratio");
+    }
+    if baseline.colorspace.neutral_estimate_score.is_none() {
+        issues.push("colorspace.neutral_estimate_score");
+    }
+    if baseline.colorspace.dominant_anchor_accepted.is_none() {
+        issues.push("colorspace.dominant_anchor_accepted");
+    }
+    if baseline.colorspace.channel_anchor_min_count.is_none() {
+        issues.push("colorspace.channel_anchor_min_count");
+    }
+    if baseline.colorspace.weak_anchor_fallback_used.is_none() {
+        issues.push("colorspace.weak_anchor_fallback_used");
+    }
+    if baseline.colorspace.gamut_fallback_used.is_none() {
+        issues.push("colorspace.gamut_fallback_used");
+    }
+    if baseline.colorspace.neutral_trim_applied.is_none() {
+        issues.push("colorspace.neutral_trim_applied");
+    }
+    if baseline
+        .colorspace
+        .candidate_acceptance_signatures
+        .is_empty()
+    {
+        issues.push("colorspace.candidate_acceptance_signatures");
+    }
+    if baseline.tone.highlight_chroma_compressed_ratio.is_none() {
+        issues.push("tone.highlight_chroma_compressed_ratio");
+    }
+
+    issues
+}
+
+fn fixture_suite_output_dir(cli: &ValidationCli, name: &str, fixture: &FixtureEntry) -> PathBuf {
+    let default_output = PathBuf::from("output/validation/logan");
+    if cli.output_dir == default_output {
+        fixture
+            .output_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("output/validation").join(name))
+    } else {
+        cli.output_dir.join(name)
+    }
+}
+
+fn fixture_suite_to_markdown(summary: &FixtureSuiteSummary) -> String {
+    let mut out = String::new();
+    out.push_str("# Fixture Suite\n\n");
+    out.push_str(&format!("- status: `{}`\n", summary.status));
+    out.push_str(&format!("- fixtures: `{}`\n", summary.fixture_count));
+    out.push_str(&format!("- passed: `{}`\n", summary.passed_count));
+    out.push_str(&format!(
+        "- review required: `{}`\n",
+        summary.review_required_count
+    ));
+    out.push_str(&format!("- failed: `{}`\n", summary.failed_count));
+    out.push_str(&format!(
+        "- coverage status: `{}`\n",
+        summary.coverage.status
+    ));
+    out.push_str(&format!(
+        "- coverage issues: `{}`\n\n",
+        if summary.coverage.issues.is_empty() {
+            "none".to_string()
+        } else {
+            summary.coverage.issues.join(", ")
+        }
+    ));
+    if !summary.coverage.action_items.is_empty() {
+        out.push_str("## Coverage Action Items\n\n");
+        for action in &summary.coverage.action_items {
+            out.push_str(&format!("- `{action}`\n"));
+        }
+        out.push('\n');
+    }
+    out.push_str("| Fixture | Status | Coverage | Coverage actions | Baseline | Stitch | Base | Output space | Reference evidence | Render input | Calibration | Candidate | Quality scores | Risk | Tone trust | Tone protection | Gamut preserved | Reference patch fit | Debug artifacts | ICC | Stale artifacts | Issues |\n");
+    out.push_str("|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|\n");
+    for fixture in &summary.fixtures {
+        let coverage = if fixture.coverage_validation_ready {
+            "ready".to_string()
+        } else if fixture.coverage_issues.is_empty() {
+            "blocked".to_string()
+        } else {
+            format!("blocked: {}", fixture.coverage_issues.join(", "))
+        };
+        let coverage_actions = fixture.coverage_action_items.join(", ");
+        let baseline = fixture.summary_baseline_status.as_deref().unwrap_or("none");
+        let stitch = expected_actual_label(
+            fixture.expected_stitch_decision.as_deref(),
+            fixture.stitch_decision.as_deref(),
+        );
+        let base = expected_actual_label(
+            fixture.expected_base_estimate_source.as_deref(),
+            fixture.base_estimate_source.as_deref(),
+        );
+        let output_space = expected_actual_label(
+            fixture.expected_output_color_space.as_deref(),
+            fixture.output_color_space.as_deref(),
+        );
+        let reference_evidence = fixture.reference_evidence.join(", ");
+        let render_input = expected_actual_label(
+            fixture.expected_render_input_source.as_deref(),
+            fixture.render_input_source.as_deref(),
+        );
+        let render_input_reason = fixture_suite_contains_label(
+            "reason",
+            fixture.expected_render_input_reason_contains.as_deref(),
+            fixture.render_input_reason.as_deref(),
+        );
+        let render_input = [render_input, render_input_reason]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let calibration = match (&fixture.calibration_status, &fixture.calibration_source) {
+            (Some(status), Some(source)) => format!("{status} / {source}"),
+            (Some(status), None) => status.clone(),
+            _ => String::new(),
+        };
+        let calibration = if let Some(expected) = &fixture.expected_calibration_source {
+            format!("expected {expected}; actual {calibration}")
+        } else {
+            calibration
+        };
+        let scanner_profile = match (
+            &fixture.expected_calibration_scanner_profile,
+            &fixture.calibration_scanner_profile_id,
+        ) {
+            (Some(expected), Some(actual)) => format!("scanner {actual} (expected {expected})"),
+            (Some(expected), None) => format!("scanner missing (expected {expected})"),
+            (None, Some(actual)) => format!("scanner {actual}"),
+            (None, None) => String::new(),
+        };
+        let roll_profile = match (
+            &fixture.expected_calibration_roll_profile,
+            &fixture.calibration_roll_profile_id,
+        ) {
+            (Some(expected), Some(actual)) => format!("roll {actual} (expected {expected})"),
+            (Some(expected), None) => format!("roll missing (expected {expected})"),
+            (None, Some(actual)) => format!("roll {actual}"),
+            (None, None) => String::new(),
+        };
+        let calibration_rejections = fixture_suite_required_count_label(
+            "rejection details",
+            &fixture.expected_calibration_rejection_details_required,
+            &fixture.calibration_rejection_details,
+        );
+        let calibration_diagnostics = fixture_suite_calibration_diagnostic_label(fixture);
+        let calibration = [
+            calibration,
+            scanner_profile,
+            roll_profile,
+            calibration_diagnostics,
+            calibration_rejections,
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+        let candidate = fixture_suite_candidate_label(fixture);
+        let quality_scores = fixture_suite_quality_score_label(fixture);
+        let risk = expected_actual_label(
+            fixture.expected_candidate_risk.as_deref(),
+            fixture.candidate_risk.as_deref(),
+        );
+        let tone_trust = expected_actual_label(
+            fixture.expected_tone_color_trust_state.as_deref(),
+            fixture.tone_color_trust_state.as_deref(),
+        );
+        let tone_protection = fixture_suite_tone_protection_label(fixture);
+        let preserved = fixture
+            .post_scale_preserved_ratio
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_default();
+        let preserved = if let Some(minimum) = fixture.expected_post_scale_preserved_ratio_min {
+            format!("min {minimum:.6}; actual {preserved}")
+        } else {
+            preserved
+        };
+        let reference_patch_fit = fixture_suite_reference_patch_label(fixture);
+        let debug_artifacts = fixture_suite_debug_artifact_label(fixture);
+        let icc = fixture
+            .output_file_icc_profile_matches_report
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let stale = fixture
+            .stale_render_artifact_count
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let issues = if fixture.issues.is_empty() {
+            "none".to_string()
+        } else {
+            fixture.issues.join(", ")
+        };
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            fixture.name,
+            fixture.status,
+            coverage,
+            coverage_actions,
+            baseline,
+            stitch,
+            base,
+            output_space,
+            reference_evidence,
+            render_input,
+            calibration,
+            candidate,
+            quality_scores,
+            risk,
+            tone_trust,
+            tone_protection,
+            preserved,
+            reference_patch_fit,
+            debug_artifacts,
+            icc,
+            stale,
+            issues
+        ));
+    }
+    if !summary.issues.is_empty() {
+        out.push_str("\n## Issues\n\n");
+        for issue in &summary.issues {
+            out.push_str(&format!("- `{issue}`\n"));
+        }
+    }
+    out
+}
+
+fn fixture_suite_quality_score_label(fixture: &FixtureSuiteEntry) -> String {
+    let mut parts = Vec::new();
+    push_fixture_suite_max_label(
+        &mut parts,
+        "selected",
+        fixture.expected_selected_quality_score_max,
+        fixture.selected_quality_score,
+    );
+    push_fixture_suite_max_label(
+        &mut parts,
+        "safety",
+        fixture.expected_technical_safety_score_max,
+        fixture.technical_safety_score,
+    );
+    push_fixture_suite_max_label(
+        &mut parts,
+        "fidelity",
+        fixture.expected_color_fidelity_score_max,
+        fixture.color_fidelity_score,
+    );
+    push_fixture_suite_max_label(
+        &mut parts,
+        "memory",
+        fixture.expected_memory_color_penalty_max,
+        fixture.memory_color_penalty,
+    );
+    push_fixture_suite_max_label(
+        &mut parts,
+        "spatial consistency",
+        fixture.expected_spatial_consistency_penalty_max,
+        fixture.spatial_consistency_penalty,
+    );
+    push_fixture_suite_min_label(
+        &mut parts,
+        "runner-up",
+        fixture.expected_selected_runner_up_quality_delta_min,
+        fixture.selected_runner_up_quality_delta,
+    );
+    push_fixture_suite_min_label(
+        &mut parts,
+        "density",
+        fixture.expected_density_monotonicity_score_min,
+        fixture.density_monotonicity_score,
+    );
+    push_fixture_suite_min_label(
+        &mut parts,
+        "hue",
+        fixture.expected_hue_linearity_score_min,
+        fixture.hue_linearity_score,
+    );
+    push_fixture_suite_min_label(
+        &mut parts,
+        "saturation",
+        fixture.expected_saturation_preservation_median_ratio_min,
+        fixture.saturation_preservation_median_ratio,
+    );
+    push_fixture_suite_max_label(
+        &mut parts,
+        "spatial neutral",
+        fixture.expected_spatial_neutral_delta_p95_max,
+        fixture.spatial_neutral_delta_p95,
+    );
+    parts.join("; ")
+}
+
+fn fixture_suite_tone_protection_label(fixture: &FixtureSuiteEntry) -> String {
+    let mut parts = Vec::new();
+    push_fixture_suite_min_label(
+        &mut parts,
+        "highlight chroma",
+        fixture.expected_highlight_chroma_compressed_ratio_min,
+        fixture.highlight_chroma_compressed_ratio,
+    );
+    push_fixture_suite_max_label(
+        &mut parts,
+        "highlight chroma",
+        fixture.expected_highlight_chroma_compressed_ratio_max,
+        fixture.highlight_chroma_compressed_ratio,
+    );
+    push_fixture_suite_max_label(
+        &mut parts,
+        "neutral highlight",
+        fixture.expected_highlight_neutral_chroma_compressed_ratio_max,
+        fixture.highlight_neutral_chroma_compressed_ratio,
+    );
+    push_fixture_suite_max_label(
+        &mut parts,
+        "shadow chroma",
+        fixture.expected_shadow_chroma_compressed_ratio_max,
+        fixture.shadow_chroma_compressed_ratio,
+    );
+    parts.join("; ")
+}
+
+fn fixture_suite_candidate_label(fixture: &FixtureSuiteEntry) -> String {
+    let candidate = match (&fixture.selected_candidate, fixture.selected_quality_score) {
+        (Some(candidate), Some(score)) => format!("{candidate} ({score:.6})"),
+        (Some(candidate), None) => candidate.clone(),
+        _ => String::new(),
+    };
+    let candidate = if let Some(expected) = &fixture.expected_selected_candidate {
+        format!("expected {expected}; actual {candidate}")
+    } else {
+        candidate
+    };
+    let mut parts = Vec::new();
+    if !candidate.is_empty() {
+        parts.push(candidate);
+    }
+    match (
+        fixture.expected_selected_candidate_rank,
+        fixture.selected_candidate_rank,
+    ) {
+        (Some(expected), Some(actual)) => {
+            parts.push(format!("rank expected {expected}; actual {actual}"));
+        }
+        (Some(expected), None) => {
+            parts.push(format!("rank expected {expected}; actual missing"));
+        }
+        (None, Some(actual)) => {
+            parts.push(format!("rank {actual}"));
+        }
+        (None, None) => {}
+    }
+    if !fixture
+        .expected_candidate_acceptance_signatures_required
+        .is_empty()
+    {
+        parts.push(format!(
+            "required signatures {}",
+            fixture
+                .expected_candidate_acceptance_signatures_required
+                .len()
+        ));
+    }
+    if !fixture.candidate_acceptance_signatures.is_empty() {
+        parts.push(format!(
+            "acceptance signatures {}",
+            fixture.candidate_acceptance_signatures.len()
+        ));
+    }
+    let mapping_reason = fixture_suite_contains_label(
+        "mapping reason",
+        fixture.expected_selected_mapping_reason_contains.as_deref(),
+        fixture.selected_mapping_reason.as_deref(),
+    );
+    if !mapping_reason.is_empty() {
+        parts.push(mapping_reason);
+    }
+    let selection_rejections = fixture_suite_required_count_label(
+        "selection rejections",
+        &fixture.expected_selection_rejections_required,
+        &fixture.selection_rejections,
+    );
+    if !selection_rejections.is_empty() {
+        parts.push(selection_rejections);
+    }
+    parts.join("; ")
+}
+
+fn fixture_suite_contains_label(
+    label: &str,
+    expected: Option<&str>,
+    actual: Option<&str>,
+) -> String {
+    match (expected, actual) {
+        (Some(expected), Some(actual)) => {
+            format!("{label} contains {expected}; actual {actual}")
+        }
+        (Some(expected), None) => {
+            format!("{label} contains {expected}; actual missing")
+        }
+        (None, Some(actual)) => format!("{label} {actual}"),
+        (None, None) => String::new(),
+    }
+}
+
+fn fixture_suite_calibration_diagnostic_label(fixture: &FixtureSuiteEntry) -> String {
+    let mut parts = Vec::new();
+    push_fixture_suite_min_label(
+        &mut parts,
+        "confidence",
+        fixture.expected_calibration_confidence_min,
+        fixture.calibration_confidence,
+    );
+    push_fixture_suite_max_label(
+        &mut parts,
+        "condition",
+        fixture.expected_calibration_matrix_condition_number_max,
+        fixture.calibration_matrix_condition_number,
+    );
+    parts.join("; ")
+}
+
+fn fixture_suite_required_count_label(
+    label: &str,
+    expected: &[String],
+    actual: &[String],
+) -> String {
+    if !expected.is_empty() {
+        return format!(
+            "required {label} {}; actual {}",
+            expected.len(),
+            actual.len()
+        );
+    }
+    if !actual.is_empty() {
+        return format!("{label} {}", actual.len());
+    }
+    String::new()
+}
+
+fn push_fixture_suite_max_label(
+    parts: &mut Vec<String>,
+    label: &str,
+    maximum: Option<f64>,
+    actual: Option<f64>,
+) {
+    match (maximum, actual) {
+        (Some(maximum), Some(actual)) => {
+            parts.push(format!("{label} max {maximum:.6}; actual {actual:.6}"));
+        }
+        (Some(maximum), None) => {
+            parts.push(format!("{label} max {maximum:.6}; actual missing"));
+        }
+        (None, Some(actual)) => parts.push(format!("{label} {actual:.6}")),
+        (None, None) => {}
+    }
+}
+
+fn push_fixture_suite_min_label(
+    parts: &mut Vec<String>,
+    label: &str,
+    minimum: Option<f64>,
+    actual: Option<f64>,
+) {
+    match (minimum, actual) {
+        (Some(minimum), Some(actual)) => {
+            parts.push(format!("{label} min {minimum:.6}; actual {actual:.6}"));
+        }
+        (Some(minimum), None) => {
+            parts.push(format!("{label} min {minimum:.6}; actual missing"));
+        }
+        (None, Some(actual)) => parts.push(format!("{label} {actual:.6}")),
+        (None, None) => {}
+    }
+}
+
+fn fixture_suite_debug_artifact_label(fixture: &FixtureSuiteEntry) -> String {
+    let count = fixture.debug_artifact_count.unwrap_or(0);
+    let invalid_count = fixture.debug_artifact_invalid_count.unwrap_or(0);
+    let mut parts = Vec::new();
+    if fixture.expected_debug_artifacts_required {
+        if count == 0 {
+            parts.push("required; actual missing".to_string());
+        } else {
+            parts.push(format!("required; actual {count}; invalid {invalid_count}"));
+        }
+    } else if count > 0 {
+        parts.push(format!("{count}; invalid {invalid_count}"));
+    }
+    if !fixture.expected_debug_artifact_kinds_required.is_empty() {
+        parts.push(format!(
+            "required kinds {}",
+            fixture.expected_debug_artifact_kinds_required.join(", ")
+        ));
+        if fixture.debug_artifact_kinds.is_empty() {
+            parts.push("actual kinds missing".to_string());
+        }
+    }
+    if !fixture.debug_artifact_kinds.is_empty() {
+        parts.push(format!(
+            "actual kinds {}",
+            fixture.debug_artifact_kinds.join(", ")
+        ));
+    }
+    parts.join("; ")
+}
+
+fn fixture_suite_reference_patch_label(fixture: &FixtureSuiteEntry) -> String {
+    let mut actual_parts = Vec::new();
+    if let Some(count) = fixture.reference_patch_patch_count {
+        actual_parts.push(format!("{count} patches"));
+    }
+    if let Some(delta_e) = fixture.reference_patch_selected_rms_delta_e {
+        actual_parts.push(format!("rms dE {delta_e:.6}"));
+    }
+    if let Some(delta_e2000) = fixture.reference_patch_selected_rms_delta_e2000 {
+        actual_parts.push(format!("rms dE2000 {delta_e2000:.6}"));
+    }
+    if let Some(delta_e2000_delta) = fixture.reference_patch_delta_e2000_delta_vs_image_derived {
+        actual_parts.push(format!("rms dE2000 vs image {delta_e2000_delta:.6}"));
+    }
+    if let Some(max_delta) = fixture.reference_patch_max_delta_vs_image_derived {
+        actual_parts.push(format!("max XYZ vs image {max_delta:.6}"));
+    }
+    if let Some(max_delta) = fixture.reference_patch_delta_e_max_delta_vs_image_derived {
+        actual_parts.push(format!("max dE vs image {max_delta:.6}"));
+    }
+    if let Some(max_delta) = fixture.reference_patch_delta_e2000_max_delta_vs_image_derived {
+        actual_parts.push(format!("max dE2000 vs image {max_delta:.6}"));
+    }
+    if let Some(regresses) = fixture.reference_patch_selected_regresses_image_derived {
+        actual_parts.push(format!("selected regresses {regresses}"));
+    }
+    if !fixture.reference_patch_hue_family_regressions.is_empty() {
+        actual_parts.push(format!(
+            "hue regressions {}",
+            fixture.reference_patch_hue_family_regressions.join(", ")
+        ));
+    }
+    let actual =
+        if actual_parts.is_empty() && fixture.reference_patch_evaluation_present == Some(false) {
+            "missing".to_string()
+        } else {
+            actual_parts.join("; ")
+        };
+    let actual = if fixture.expected_reference_patch_evaluation_required {
+        if actual.is_empty() {
+            "required; actual missing".to_string()
+        } else {
+            format!("required; actual {actual}")
+        }
+    } else {
+        actual
+    };
+    let mut parts = Vec::new();
+    if let Some(minimum) = fixture.expected_reference_patch_count_min {
+        parts.push(format!("min patches {minimum}"));
+    }
+    if let Some(maximum) = fixture.expected_reference_patch_hue_family_regression_count_max {
+        parts.push(format!("max hue regressions {maximum}"));
+    }
+    if let Some(expected) = fixture.expected_reference_patch_selected_regresses_image_derived {
+        parts.push(format!("selected regresses {expected}"));
+    }
+    if let Some(maximum) = fixture.expected_reference_patch_delta_e2000_delta_vs_image_derived_max {
+        parts.push(format!("max rms dE2000 vs image {maximum:.6}"));
+    }
+    if let Some(maximum) = fixture.expected_reference_patch_max_delta_vs_image_derived_max {
+        parts.push(format!("max XYZ vs image {maximum:.6}"));
+    }
+    if let Some(maximum) = fixture.expected_reference_patch_delta_e_max_delta_vs_image_derived_max {
+        parts.push(format!("max dE vs image {maximum:.6}"));
+    }
+    if let Some(maximum) =
+        fixture.expected_reference_patch_delta_e2000_max_delta_vs_image_derived_max
+    {
+        parts.push(format!("max dE2000 vs image {maximum:.6}"));
+    }
+    if let Some(maximum) = fixture.expected_reference_patch_rms_delta_e_max {
+        parts.push(format!("max rms dE {maximum:.6}"));
+    }
+    if let Some(maximum) = fixture.expected_reference_patch_rms_delta_e2000_max {
+        parts.push(format!("max rms dE2000 {maximum:.6}"));
+    }
+    if actual.is_empty() && !parts.is_empty() {
+        parts.push("actual missing".to_string());
+    } else if !actual.is_empty() {
+        parts.push(actual);
+    }
+    parts.join("; ")
+}
+
+fn expected_actual_label(expected: Option<&str>, actual: Option<&str>) -> String {
+    match (expected, actual) {
+        (Some(expected), Some(actual)) => format!("expected {expected}; actual {actual}"),
+        (Some(expected), None) => format!("expected {expected}; actual missing"),
+        (None, Some(actual)) => actual.to_string(),
+        (None, None) => String::new(),
+    }
+}
+
 fn resolve_components(
     cli: &ValidationCli,
+    fixtures: &BTreeMap<String, FixtureEntry>,
 ) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
     if let (Some(component1), Some(component2)) = (&cli.component1, &cli.component2) {
         return Ok((component1.clone(), component2.clone()));
@@ -140,18 +9735,15 @@ fn resolve_components(
         );
     }
 
-    let pair = match cli.fixture.as_str() {
-        "logan" => Some((PathBuf::from("LOGAN043.tif"), PathBuf::from("LOGAN044.tif"))),
-        _ => None,
-    };
-
-    let Some((component1, component2)) = pair else {
+    let Some(fixture) = fixtures.get(&cli.fixture) else {
         return Err(format!(
-            "unknown fixture `{}`; pass --component1 and --component2 or use --report",
+            "unknown fixture `{}`; pass --component1 and --component2, use --report, or inspect --list-fixtures",
             cli.fixture
         )
         .into());
     };
+    let component1 = fixture.component1.clone();
+    let component2 = fixture.component2.clone();
 
     if !component1.exists() || !component2.exists() {
         return Err(format!(
@@ -164,6 +9756,192 @@ fn resolve_components(
     }
 
     Ok((component1, component2))
+}
+
+fn print_summary_table(summary: &scanstitch::validation::ValidationSummary) {
+    println!("{:<12} {:<34} Value", "Area", "Field");
+    println!("{:-<12} {:-<34} {:-<1}", "", "", "");
+    print_row(
+        "report",
+        "generated_at",
+        summary.report.generated_at.as_deref().unwrap_or(""),
+    );
+    print_row(
+        "render",
+        "output_path",
+        summary.render.output_path.as_deref().unwrap_or(""),
+    );
+    print_row(
+        "render",
+        "dimensions",
+        &format!(
+            "{}x{}",
+            summary.render.output_width.unwrap_or(0),
+            summary.render.output_height.unwrap_or(0)
+        ),
+    );
+    print_row(
+        "render",
+        "review_status",
+        summary.render.render_review_status.as_deref().unwrap_or(""),
+    );
+    print_row(
+        "render",
+        "reviewable",
+        &summary
+            .render
+            .render_reviewable
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    );
+    print_row(
+        "stitch",
+        "decision",
+        summary.stitch.decision.as_deref().unwrap_or(""),
+    );
+    print_row(
+        "colorspace",
+        "calibration_status",
+        summary
+            .colorspace
+            .calibration_status
+            .as_deref()
+            .unwrap_or(""),
+    );
+    print_row(
+        "colorspace",
+        "mapping_strategy",
+        summary.colorspace.mapping_strategy.as_deref().unwrap_or(""),
+    );
+    print_row(
+        "colorspace",
+        "selected_candidate",
+        summary
+            .colorspace
+            .selected_candidate
+            .as_deref()
+            .unwrap_or(""),
+    );
+    print_row(
+        "colorspace",
+        "selected_quality_score",
+        &summary
+            .colorspace
+            .selected_quality_score
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_default(),
+    );
+    print_row(
+        "colorspace",
+        "calibration_acceptance",
+        summary
+            .colorspace
+            .calibration_acceptance
+            .as_ref()
+            .and_then(|acceptance| acceptance.status.as_deref())
+            .unwrap_or(""),
+    );
+    print_row(
+        "colorspace",
+        "neutral_estimate_quality",
+        &summary
+            .colorspace
+            .neutral_estimate_quality
+            .as_ref()
+            .and_then(|quality| quality.score)
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_default(),
+    );
+    print_row(
+        "colorspace",
+        "post_scale_preserved_ratio",
+        &summary
+            .colorspace
+            .post_scale_preserved_ratio
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_default(),
+    );
+    print_row(
+        "colorspace",
+        "neutral_trim_applied",
+        &summary
+            .colorspace
+            .neutral_trim_applied
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    );
+    print_row(
+        "colorspace",
+        "tone_color_trust_state",
+        summary
+            .colorspace
+            .tone_color_trust_state
+            .as_deref()
+            .unwrap_or(""),
+    );
+    print_row(
+        "tone",
+        "color_trust_state",
+        summary.tone.color_trust_state.as_deref().unwrap_or(""),
+    );
+    print_row(
+        "tone",
+        "luma_residual_p95",
+        &summary
+            .tone
+            .high_frequency_grain
+            .as_ref()
+            .and_then(|grain| grain.luma_residual_p95)
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_default(),
+    );
+}
+
+fn print_row(area: &str, field: &str, value: &str) {
+    println!("{area:<12} {field:<34} {value}");
+}
+
+fn selected_failures(issues: &[String], selectors: &[String]) -> Vec<String> {
+    if selectors.is_empty() {
+        return Vec::new();
+    }
+    issues
+        .iter()
+        .filter(|issue| {
+            selectors
+                .iter()
+                .any(|selector| issue_matches(issue, selector))
+        })
+        .cloned()
+        .collect()
+}
+
+fn issue_matches(issue: &str, selector: &str) -> bool {
+    let selector = selector.trim().to_ascii_lowercase();
+    match selector.as_str() {
+        "any" => true,
+        "stale-output" => issue.contains("stale_render_artifacts"),
+        "dimensions" => issue.contains("output_dimensions"),
+        "stitch-change" => issue.contains("stitch_decision"),
+        "base-source" => issue.contains("base_estimate_source"),
+        "render-input-change" => issue.contains("render_input_source"),
+        "colorspace-strategy" => issue.contains("colorspace_mapping_strategy"),
+        "colorspace-quality" | "quality" => issue.contains("colorspace_quality"),
+        "calibration" => issue.contains("calibration_"),
+        "gamut" => issue.contains("gamut") || issue.contains("preservation"),
+        "grain" => issue.contains("residual_p95"),
+        "tone" => issue.contains("chroma_compression"),
+        "debug-artifact" | "debug-artifacts" => issue.contains("debug_artifact"),
+        "summary-baseline" => issue.contains("summary_baseline_"),
+        "fixture-coverage" => {
+            issue.starts_with("fixture_coverage_")
+                || (issue.contains(':') && !issue.starts_with("fixture_suite:"))
+        }
+        "fixture-suite" => issue.starts_with("fixture_suite:"),
+        "roll-inventory" => issue.starts_with("roll_inventory:"),
+        "roll-suite" => issue.starts_with("roll_suite:"),
+        exact => issue == exact,
+    }
 }
 
 fn write_text(path: &PathBuf, contents: &str) -> Result<(), Box<dyn std::error::Error>> {

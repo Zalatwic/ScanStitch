@@ -1,0 +1,691 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/scanstitch/report-schema.schema.json",
+  "title": "ScanStitch Report",
+  "type": "object",
+  "required": ["phases"],
+  "additionalProperties": true,
+  "properties": {
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "report_schema_version": { "type": "integer" },
+        "pipeline_schema_version": { "type": "integer" },
+        "generated_at": { "type": "string" },
+        "generated_at_unix_ms": { "type": "integer" },
+        "package_name": { "type": "string" },
+        "package_version": { "type": "string" },
+        "binary_name": { "type": "string" },
+        "working_directory": { "type": "string" },
+        "cli_args": { "type": "array", "items": { "type": "string" } },
+        "output_dir": { "type": "string" },
+        "output_path": { "type": "string" }
+      }
+    },
+    "phases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "additionalProperties": true,
+        "properties": {
+          "name": { "type": "string" },
+          "success": { "type": "boolean" },
+          "confidence": { "type": "number" },
+          "duration_ms": { "type": "integer" },
+          "metrics": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "warnings": { "type": "array", "items": { "type": "string" } },
+          "errors": { "type": "array", "items": { "type": "string" } }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": { "name": { "const": "colorspace_mapping" } },
+              "required": ["name"]
+            },
+            "then": {
+              "properties": {
+                "metrics": { "$ref": "#/$defs/colorspaceMappingMetrics" }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": { "name": { "const": "working_image_select" } },
+              "required": ["name"]
+            },
+            "then": {
+              "properties": {
+                "metrics": { "$ref": "#/$defs/workingImageSelectMetrics" }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": { "name": { "const": "tone_mapping" } },
+              "required": ["name"]
+            },
+            "then": {
+              "properties": {
+                "metrics": { "$ref": "#/$defs/toneMappingMetrics" }
+              }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "nullableNumber": { "type": ["number", "null"] },
+    "nullableInteger": { "type": ["integer", "null"] },
+    "nullableString": { "type": ["string", "null"] },
+    "nullableBoolean": { "type": ["boolean", "null"] },
+    "numberVector3": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "$ref": "#/$defs/nullableNumber" }
+    },
+    "integerVector3": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "$ref": "#/$defs/nullableInteger" }
+    },
+    "booleanVector3": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "$ref": "#/$defs/nullableBoolean" }
+    },
+    "workingImageSelectMetrics": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "input_mode": { "enum": ["negative", "positive"] },
+        "base_required": { "$ref": "#/$defs/nullableBoolean" },
+        "base_estimate_source": { "$ref": "#/$defs/nullableString" },
+        "base_estimate_reason": { "$ref": "#/$defs/nullableString" },
+        "positive_input_inspection": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "sample_count": { "$ref": "#/$defs/nullableInteger" },
+            "sample_stride": { "$ref": "#/$defs/nullableInteger" },
+            "channel_median": { "$ref": "#/$defs/numberVector3" },
+            "red_green_ratio": { "$ref": "#/$defs/nullableNumber" },
+            "green_blue_ratio": { "$ref": "#/$defs/nullableNumber" },
+            "red_blue_delta": { "$ref": "#/$defs/nullableNumber" },
+            "orange_mask_score": { "$ref": "#/$defs/nullableNumber" },
+            "likely_negative_like": { "$ref": "#/$defs/nullableBoolean" },
+            "accepted_high_warm_score": { "$ref": "#/$defs/nullableBoolean" },
+            "reason": { "$ref": "#/$defs/nullableString" },
+            "thresholds": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "red_green_ratio": { "$ref": "#/$defs/nullableNumber" },
+                "green_blue_ratio": { "$ref": "#/$defs/nullableNumber" },
+                "red_blue_delta": { "$ref": "#/$defs/nullableNumber" },
+                "min_red_median": { "$ref": "#/$defs/nullableNumber" },
+                "orange_mask_score_warning": { "$ref": "#/$defs/nullableNumber" },
+                "score_min_red_green_ratio": { "$ref": "#/$defs/nullableNumber" },
+                "score_min_green_blue_ratio": { "$ref": "#/$defs/nullableNumber" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "qualityComponents": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "low_gamut_clip_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "high_gamut_clip_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "preserved_gamut_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "exposure_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "neutral_balance_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "neutral_estimate_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "anchor_support_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "anchor_stability_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "condition_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "calibration_confidence_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "target_residual_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "rendered_tone_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "tone_chroma_cleanup_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "density_monotonicity_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "hue_linearity_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "saturation_preservation_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "memory_color_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "spatial_consistency_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "fallback_penalty": { "$ref": "#/$defs/nullableNumber" }
+      }
+    },
+    "colorModelQuality": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "sample_count": { "$ref": "#/$defs/nullableInteger" },
+        "sample_stride": { "$ref": "#/$defs/nullableInteger" },
+        "density_monotonicity_score": { "$ref": "#/$defs/nullableNumber" },
+        "density_monotonicity_violation_ratio": { "$ref": "#/$defs/nullableNumber" },
+        "density_monotonicity_populated_bins": { "$ref": "#/$defs/nullableInteger" },
+        "hue_linearity_score": { "$ref": "#/$defs/nullableNumber" },
+        "hue_linearity_channel_samples": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nullableInteger" }
+        },
+        "hue_linearity_channel_resultant": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nullableNumber" }
+        },
+        "saturation_preservation_sample_count": { "$ref": "#/$defs/nullableInteger" },
+        "saturation_preservation_p05_ratio": { "$ref": "#/$defs/nullableNumber" },
+        "saturation_preservation_median_ratio": { "$ref": "#/$defs/nullableNumber" },
+        "saturation_preservation_p95_ratio": { "$ref": "#/$defs/nullableNumber" },
+        "memory_color": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "spatial_consistency": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "neutral_sample_count": { "$ref": "#/$defs/nullableInteger" },
+            "populated_tile_count": { "$ref": "#/$defs/nullableInteger" },
+            "tile_grid": { "$ref": "#/$defs/nullableInteger" },
+            "neutral_delta_median": { "$ref": "#/$defs/nullableNumber" },
+            "neutral_delta_p95": { "$ref": "#/$defs/nullableNumber" },
+            "penalty": { "$ref": "#/$defs/nullableNumber" },
+            "reason": { "$ref": "#/$defs/nullableString" }
+          }
+        },
+        "density_monotonicity_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "hue_linearity_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "saturation_preservation_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "memory_color_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "spatial_consistency_penalty": { "$ref": "#/$defs/nullableNumber" }
+      }
+    },
+    "renderedToneQuality": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "sample_count": { "$ref": "#/$defs/nullableInteger" },
+        "sample_stride": { "$ref": "#/$defs/nullableInteger" },
+        "tone_fit_domain": { "$ref": "#/$defs/nullableString" },
+        "pre_tone_shadow_saturation_p95": { "$ref": "#/$defs/nullableNumber" },
+        "pre_tone_midtone_saturation_p95": { "$ref": "#/$defs/nullableNumber" },
+        "pre_tone_bright_neutral_saturation_p95": { "$ref": "#/$defs/nullableNumber" },
+        "pre_tone_bright_saturated_saturation_median": { "$ref": "#/$defs/nullableNumber" },
+        "shadow_saturation_median": { "$ref": "#/$defs/nullableNumber" },
+        "shadow_saturation_p95": { "$ref": "#/$defs/nullableNumber" },
+        "midtone_saturation_median": { "$ref": "#/$defs/nullableNumber" },
+        "midtone_saturation_p95": { "$ref": "#/$defs/nullableNumber" },
+        "bright_neutral_pixel_count": { "$ref": "#/$defs/nullableInteger" },
+        "bright_neutral_saturation_median": { "$ref": "#/$defs/nullableNumber" },
+        "bright_neutral_saturation_p95": { "$ref": "#/$defs/nullableNumber" },
+        "bright_saturated_pixel_count": { "$ref": "#/$defs/nullableInteger" },
+        "bright_saturated_saturation_median": { "$ref": "#/$defs/nullableNumber" },
+        "bright_saturated_saturation_p95": { "$ref": "#/$defs/nullableNumber" },
+        "saturated_highlight_saturation_loss": { "$ref": "#/$defs/nullableNumber" },
+        "rendered_tone_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "tone_chroma_cleanup_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "tone_highlight_chroma_compressed_ratio": { "$ref": "#/$defs/nullableNumber" },
+        "tone_highlight_neutral_chroma_compressed_ratio": { "$ref": "#/$defs/nullableNumber" },
+        "tone_shadow_chroma_compressed_ratio": { "$ref": "#/$defs/nullableNumber" },
+        "tone_pre_chroma_clipped_high_total": { "$ref": "#/$defs/nullableNumber" },
+        "tone_post_chroma_clipped_high_total": { "$ref": "#/$defs/nullableNumber" },
+        "tone_post_chroma_clipped_low_total": { "$ref": "#/$defs/nullableNumber" }
+      }
+    },
+    "toneMappingMetrics": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "render_quality_sample_count": { "$ref": "#/$defs/nullableInteger" },
+        "render_quality_sample_stride": { "$ref": "#/$defs/nullableInteger" },
+        "render_luminance_percentiles": { "$ref": "#/$defs/numberVector3" },
+        "render_luminance_range_p05_p95": { "$ref": "#/$defs/nullableNumber" },
+        "shadow_saturation_median": { "$ref": "#/$defs/nullableNumber" },
+        "shadow_saturation_p95": { "$ref": "#/$defs/nullableNumber" },
+        "midtone_luminance_percentiles": { "$ref": "#/$defs/numberVector3" },
+        "midtone_saturation_median": { "$ref": "#/$defs/nullableNumber" },
+        "midtone_saturation_p95": { "$ref": "#/$defs/nullableNumber" },
+        "bright_neutral_saturation_median": { "$ref": "#/$defs/nullableNumber" },
+        "bright_neutral_saturation_p95": { "$ref": "#/$defs/nullableNumber" },
+        "render_quality_bands": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "candidateQualityScore": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "candidate": { "type": "string" },
+        "mapping_strategy": { "type": "string" },
+        "rank": { "$ref": "#/$defs/nullableInteger" },
+        "selected": { "type": "boolean" },
+        "selected_quality_delta": { "$ref": "#/$defs/nullableNumber" },
+        "score": { "$ref": "#/$defs/nullableNumber" },
+        "quality_score": { "$ref": "#/$defs/nullableNumber" },
+        "technical_safety_score": { "$ref": "#/$defs/nullableNumber" },
+        "color_fidelity_score": { "$ref": "#/$defs/nullableNumber" },
+        "rejected": { "type": "boolean" },
+        "rejection_reason": { "$ref": "#/$defs/nullableString" },
+        "pre_scale_clipped_low_ratio": { "$ref": "#/$defs/numberVector3" },
+        "pre_scale_clipped_low_total": { "$ref": "#/$defs/nullableNumber" },
+        "pre_scale_clipped_low_max": { "$ref": "#/$defs/nullableNumber" },
+        "pre_scale_clipped_high_ratio": { "$ref": "#/$defs/numberVector3" },
+        "pre_scale_clipped_high_total": { "$ref": "#/$defs/nullableNumber" },
+        "pre_scale_clipped_high_max": { "$ref": "#/$defs/nullableNumber" },
+        "pre_scale_channel_min": { "$ref": "#/$defs/numberVector3" },
+        "pre_scale_channel_max": { "$ref": "#/$defs/numberVector3" },
+        "pre_scale_max_low_excursion": { "$ref": "#/$defs/numberVector3" },
+        "pre_scale_max_high_excursion": { "$ref": "#/$defs/numberVector3" },
+        "pre_scale_preserved_ratio": { "$ref": "#/$defs/nullableNumber" },
+        "exposure_scale": { "$ref": "#/$defs/nullableNumber" },
+        "neutral_balance_delta": { "$ref": "#/$defs/numberVector3" },
+        "neutral_delta_magnitude": { "$ref": "#/$defs/nullableNumber" },
+        "neutral_estimate_quality_score": { "$ref": "#/$defs/nullableNumber" },
+        "channel_anchor_counts": { "$ref": "#/$defs/integerVector3" },
+        "channel_anchor_low_support": { "$ref": "#/$defs/booleanVector3" },
+        "dominant_anchor_quality_score": { "$ref": "#/$defs/nullableNumber" },
+        "dominant_anchor_unstable_channels": { "$ref": "#/$defs/booleanVector3" },
+        "condition_number": { "$ref": "#/$defs/nullableNumber" },
+        "profile_confidence": { "$ref": "#/$defs/nullableNumber" },
+        "target_residual_rms": { "$ref": "#/$defs/nullableNumber" },
+        "target_residual_max": { "$ref": "#/$defs/nullableNumber" },
+        "reference_patch_rms_error": { "$ref": "#/$defs/nullableNumber" },
+        "reference_patch_max_error": { "$ref": "#/$defs/nullableNumber" },
+        "reference_patch_mean_delta_e": { "$ref": "#/$defs/nullableNumber" },
+        "reference_patch_rms_delta_e": { "$ref": "#/$defs/nullableNumber" },
+        "reference_patch_max_delta_e": { "$ref": "#/$defs/nullableNumber" },
+        "reference_patch_mean_delta_e2000": { "$ref": "#/$defs/nullableNumber" },
+        "reference_patch_rms_delta_e2000": { "$ref": "#/$defs/nullableNumber" },
+        "reference_patch_max_delta_e2000": { "$ref": "#/$defs/nullableNumber" },
+        "reference_patch_delta_vs_image_derived": { "$ref": "#/$defs/nullableNumber" },
+        "reference_patch_max_delta_vs_image_derived": { "$ref": "#/$defs/nullableNumber" },
+        "reference_patch_delta_e_delta_vs_image_derived": { "$ref": "#/$defs/nullableNumber" },
+        "reference_patch_delta_e_max_delta_vs_image_derived": { "$ref": "#/$defs/nullableNumber" },
+        "reference_patch_delta_e2000_delta_vs_image_derived": { "$ref": "#/$defs/nullableNumber" },
+        "reference_patch_delta_e2000_max_delta_vs_image_derived": { "$ref": "#/$defs/nullableNumber" },
+        "reference_patch_regresses_image_derived": { "$ref": "#/$defs/nullableBoolean" },
+        "rendered_tone_quality": { "$ref": "#/$defs/renderedToneQuality" },
+        "color_model_quality": { "$ref": "#/$defs/colorModelQuality" },
+        "quality_components": { "$ref": "#/$defs/qualityComponents" }
+      }
+    },
+    "candidateAcceptance": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "candidate": { "type": "string" },
+        "candidate_kind": {
+          "enum": [
+            "calibrated_direct",
+            "scanner_prior",
+            "image_derived",
+            "neutral_fallback"
+          ]
+        },
+        "mapping_strategy": { "type": "string" },
+        "source_label": { "type": "string" },
+        "status": {
+          "enum": [
+            "selected",
+            "rejected_mode",
+            "rejected_safety",
+            "rejected_reference_fit",
+            "rejected_neutral",
+            "rejected_quality",
+            "available_fallback",
+            "accepted_runner_up"
+          ]
+        },
+        "reason": { "type": "string" },
+        "rank": { "$ref": "#/$defs/nullableInteger" },
+        "selected": { "type": "boolean" },
+        "eligible_in_color_mode": { "type": "boolean" },
+        "quality_score": { "$ref": "#/$defs/nullableNumber" },
+        "selected_quality_delta": { "$ref": "#/$defs/nullableNumber" },
+        "rejected": { "type": "boolean" },
+        "rejection_reason": { "$ref": "#/$defs/nullableString" },
+        "beats_image_derived": { "$ref": "#/$defs/nullableBoolean" },
+        "within_negative_gamut_limits": { "$ref": "#/$defs/nullableBoolean" }
+      }
+    },
+    "calibrationMetrics": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "status": {
+          "enum": ["not_configured", "applied", "rejected"]
+        },
+        "source": { "type": "string" },
+        "external_profile": {
+          "oneOf": [
+            { "$ref": "#/$defs/nullableString" },
+            {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "path": { "$ref": "#/$defs/nullableString" },
+                "profile_id": { "$ref": "#/$defs/nullableString" }
+              }
+            }
+          ]
+        },
+        "profile_schema_version": { "$ref": "#/$defs/nullableInteger" },
+        "confidence": { "$ref": "#/$defs/nullableNumber" },
+        "reason": { "$ref": "#/$defs/nullableString" },
+        "matrix_condition_number": { "$ref": "#/$defs/nullableNumber" },
+        "whitepoint": { "$ref": "#/$defs/numberVector3" },
+        "calibration_upgrade_available": { "$ref": "#/$defs/nullableBoolean" },
+        "calibration_upgrade_reason": { "$ref": "#/$defs/nullableString" },
+        "rejection_details": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "scanner_profile": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "roll_profile": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "requested_film_stock": { "$ref": "#/$defs/nullableString" },
+        "film_stock": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "nearest_roll_candidates": { "type": "array" },
+        "nearest_film_candidates": { "type": "array" },
+        "library": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "referencePatchEvaluation": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "patch_count": { "$ref": "#/$defs/nullableInteger" },
+        "selected_candidate": { "$ref": "#/$defs/nullableString" },
+        "selected_rms_error": { "$ref": "#/$defs/nullableNumber" },
+        "selected_rms_delta_e": { "$ref": "#/$defs/nullableNumber" },
+        "selected_max_delta_e": { "$ref": "#/$defs/nullableNumber" },
+        "selected_rms_delta_e2000": { "$ref": "#/$defs/nullableNumber" },
+        "selected_max_delta_e2000": { "$ref": "#/$defs/nullableNumber" },
+        "image_derived_rms_error": { "$ref": "#/$defs/nullableNumber" },
+        "image_derived_rms_delta_e": { "$ref": "#/$defs/nullableNumber" },
+        "image_derived_max_delta_e": { "$ref": "#/$defs/nullableNumber" },
+        "image_derived_rms_delta_e2000": { "$ref": "#/$defs/nullableNumber" },
+        "image_derived_max_delta_e2000": { "$ref": "#/$defs/nullableNumber" },
+        "rms_error_delta_vs_image_derived": { "$ref": "#/$defs/nullableNumber" },
+        "max_error_delta_vs_image_derived": { "$ref": "#/$defs/nullableNumber" },
+        "delta_e_rms_delta_vs_image_derived": { "$ref": "#/$defs/nullableNumber" },
+        "delta_e_max_delta_vs_image_derived": { "$ref": "#/$defs/nullableNumber" },
+        "delta_e2000_rms_delta_vs_image_derived": { "$ref": "#/$defs/nullableNumber" },
+        "delta_e2000_max_delta_vs_image_derived": { "$ref": "#/$defs/nullableNumber" },
+        "selected_improves_image_derived": { "$ref": "#/$defs/nullableBoolean" },
+        "selected_regresses_image_derived": { "$ref": "#/$defs/nullableBoolean" },
+        "worst_hue_families": { "type": "array" },
+        "selected_hue_family_regressions": { "type": "array" },
+        "hue_family_regressions": { "type": "array" },
+        "per_patch": { "type": "array" },
+        "candidate_evaluations": { "type": "array" },
+        "regressed_candidates": { "type": "array" }
+      }
+    },
+    "calibrationAcceptance": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "status": {
+          "enum": [
+            "not_applicable",
+            "forced",
+            "accepted",
+            "rejected_unsafe",
+            "rejected_reference_fit",
+            "rejected_neutral",
+            "rejected_quality",
+            "not_selected"
+          ]
+        },
+        "reason": { "$ref": "#/$defs/nullableString" },
+        "color_mode": { "$ref": "#/$defs/nullableString" },
+        "preferred_candidate": { "$ref": "#/$defs/nullableString" },
+        "preferred_candidate_quality_score": { "$ref": "#/$defs/nullableNumber" },
+        "image_derived_quality_score": { "$ref": "#/$defs/nullableNumber" },
+        "beats_image_derived": { "$ref": "#/$defs/nullableBoolean" },
+        "within_negative_gamut_limits": { "$ref": "#/$defs/nullableBoolean" },
+        "forced_by_color_mode": { "$ref": "#/$defs/nullableBoolean" }
+      }
+    },
+    "neutralEstimateQuality": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "score": { "$ref": "#/$defs/nullableNumber" },
+        "accepted": { "$ref": "#/$defs/nullableBoolean" },
+        "broad_support": { "$ref": "#/$defs/nullableBoolean" },
+        "reason": { "$ref": "#/$defs/nullableString" },
+        "sample_count": { "$ref": "#/$defs/nullableInteger" },
+        "sample_fraction": { "$ref": "#/$defs/nullableNumber" },
+        "band_counts": { "$ref": "#/$defs/integerVector3" },
+        "populated_band_count": { "$ref": "#/$defs/nullableInteger" },
+        "dominant_band_fraction": { "$ref": "#/$defs/nullableNumber" },
+        "minimum_samples": { "$ref": "#/$defs/nullableInteger" },
+        "minimum_bands": { "$ref": "#/$defs/nullableInteger" }
+      }
+    },
+    "neutralSampleRejections": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "total_pixels": { "$ref": "#/$defs/nullableInteger" },
+        "accepted_neutral_samples": { "$ref": "#/$defs/nullableInteger" },
+        "non_finite": { "$ref": "#/$defs/nullableInteger" },
+        "clipped": { "$ref": "#/$defs/nullableInteger" },
+        "border": { "$ref": "#/$defs/nullableInteger" },
+        "film_base_like_edge": { "$ref": "#/$defs/nullableInteger" },
+        "dust": { "$ref": "#/$defs/nullableInteger" },
+        "luma_out_of_range": { "$ref": "#/$defs/nullableInteger" },
+        "chroma_threshold": { "$ref": "#/$defs/nullableInteger" }
+      }
+    },
+    "dominantAnchorSampleRejections": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "total_pixels": { "$ref": "#/$defs/nullableInteger" },
+        "accepted_anchor_samples": { "$ref": "#/$defs/nullableInteger" },
+        "non_finite": { "$ref": "#/$defs/nullableInteger" },
+        "clipped": { "$ref": "#/$defs/nullableInteger" },
+        "border": { "$ref": "#/$defs/nullableInteger" },
+        "film_base_like_edge": { "$ref": "#/$defs/nullableInteger" },
+        "dust": { "$ref": "#/$defs/nullableInteger" },
+        "luma_out_of_range": { "$ref": "#/$defs/nullableInteger" },
+        "low_saturation": { "$ref": "#/$defs/nullableInteger" },
+        "weak_dominance": { "$ref": "#/$defs/nullableInteger" }
+      }
+    },
+    "dominantAnchorQuality": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "score": { "$ref": "#/$defs/nullableNumber" },
+        "accepted": { "$ref": "#/$defs/nullableBoolean" },
+        "reason": { "$ref": "#/$defs/nullableString" },
+        "channel_populated_band_count": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nullableInteger" }
+        },
+        "channel_dominant_band_fraction": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nullableNumber" }
+        },
+        "channel_mean_dominance_margin": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nullableNumber" }
+        },
+        "channel_stability_score": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nullableNumber" }
+        },
+        "channel_unstable": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nullableBoolean" }
+        },
+        "unstable_channel_count": { "$ref": "#/$defs/nullableInteger" }
+      }
+    },
+    "colorspaceMappingMetrics": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "calibration": { "$ref": "#/$defs/calibrationMetrics" },
+        "input_mode": { "enum": ["negative", "positive"] },
+        "render_input_mode": { "enum": ["auto", "ica", "direct-density"] },
+        "render_intent": {
+          "enum": ["modern-clean", "natural-neutral", "film-faithful"]
+        },
+        "quality_mode": { "enum": ["perfect", "balanced", "fast"] },
+        "render_input_source": { "type": "string" },
+        "render_input_reason": { "$ref": "#/$defs/nullableString" },
+        "direct_density_candidate_evaluated": { "type": "boolean" },
+        "direct_density_render_density_scale": { "$ref": "#/$defs/nullableNumber" },
+        "direct_density_render_normalization": { "$ref": "#/$defs/nullableString" },
+        "color_mode": { "type": "string" },
+        "exposure_scale": { "$ref": "#/$defs/nullableNumber" },
+        "mapping_strategy": {
+          "enum": [
+            "positive_rgb_passthrough",
+            "calibrated_profile",
+            "scanner_constrained_image_derived_matrix",
+            "image_derived_matrix",
+            "gamut_safe_image_matrix_blend",
+            "gamut_trusted_image_matrix_blend",
+            "neutral_balance_fallback",
+            "neutral_balance_gamut_fallback",
+            "neutral_balance_forced",
+            "neutral_balance_weak_anchor_fallback"
+          ]
+        },
+        "selected_mapping_reason": { "type": "string" },
+        "selected_candidate": { "type": "string" },
+        "selected_candidate_rank": { "$ref": "#/$defs/nullableInteger" },
+        "selected_candidate_score": { "$ref": "#/$defs/nullableNumber" },
+        "selected_quality_score": { "$ref": "#/$defs/nullableNumber" },
+        "technical_safety_score": { "$ref": "#/$defs/nullableNumber" },
+        "color_fidelity_score": { "$ref": "#/$defs/nullableNumber" },
+        "quality_components": { "$ref": "#/$defs/qualityComponents" },
+        "selected_quality_components": { "$ref": "#/$defs/qualityComponents" },
+        "candidate_risk": { "type": "string" },
+        "tone_color_trust_state": { "type": "string" },
+        "selected_runner_up_quality_delta": { "$ref": "#/$defs/nullableNumber" },
+        "candidate_score_order": { "type": "string" },
+        "candidate_scores": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/candidateQualityScore" }
+        },
+        "candidate_quality_scores": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/candidateQualityScore" }
+        },
+        "candidate_acceptance": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/candidateAcceptance" }
+        },
+        "calibration_acceptance": { "$ref": "#/$defs/calibrationAcceptance" },
+        "selection_rejections": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "reference_patch_evaluation": { "$ref": "#/$defs/referencePatchEvaluation" },
+        "neutral_estimate_quality": { "$ref": "#/$defs/neutralEstimateQuality" },
+        "neutral_sample_rejections": { "$ref": "#/$defs/neutralSampleRejections" },
+        "dominant_anchor_quality": { "$ref": "#/$defs/dominantAnchorQuality" },
+        "dominant_anchor_sample_rejections": {
+          "$ref": "#/$defs/dominantAnchorSampleRejections"
+        },
+        "regularization_lambda": { "$ref": "#/$defs/nullableNumber" },
+        "neutral_sample_bands": { "$ref": "#/$defs/integerVector3" },
+        "dominant_anchor_bands": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/integerVector3" }
+        },
+        "neutral_trim_scale": { "$ref": "#/$defs/numberVector3" },
+        "neutral_trim_applied": { "$ref": "#/$defs/nullableBoolean" },
+        "neutral_trim_before_after": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "channel_anchor_counts": { "$ref": "#/$defs/integerVector3" },
+        "channel_anchor_min_count": { "$ref": "#/$defs/nullableInteger" },
+        "channel_anchor_low_support_threshold": { "$ref": "#/$defs/nullableInteger" },
+        "channel_anchor_low_support": { "$ref": "#/$defs/booleanVector3" },
+        "weak_anchor_fallback_used": { "$ref": "#/$defs/nullableBoolean" },
+        "weak_anchor_fallback_reason": { "$ref": "#/$defs/nullableString" },
+        "gamut_fallback_used": { "type": "boolean" },
+        "gamut_fallback_reason": { "$ref": "#/$defs/nullableString" },
+        "image_matrix_pre_scale_clipped_low_ratio": { "$ref": "#/$defs/numberVector3" },
+        "image_matrix_pre_scale_clipped_low_max": { "$ref": "#/$defs/nullableNumber" },
+        "image_matrix_pre_scale_clipped_low_total": { "$ref": "#/$defs/nullableNumber" },
+        "image_matrix_pre_scale_clipped_high_ratio": { "$ref": "#/$defs/numberVector3" },
+        "image_matrix_exposure_scale": { "$ref": "#/$defs/nullableNumber" },
+        "image_matrix_pre_scale_preserved_ratio": { "$ref": "#/$defs/nullableNumber" },
+        "image_matrix_neutral_balance_delta": { "$ref": "#/$defs/numberVector3" },
+        "calibrated_profile_pre_scale_clipped_low_ratio": {
+          "oneOf": [{ "$ref": "#/$defs/numberVector3" }, { "type": "null" }]
+        },
+        "calibrated_profile_pre_scale_clipped_high_ratio": {
+          "oneOf": [{ "$ref": "#/$defs/numberVector3" }, { "type": "null" }]
+        },
+        "calibrated_profile_exposure_scale": { "$ref": "#/$defs/nullableNumber" },
+        "calibrated_profile_pre_scale_preserved_ratio": {
+          "$ref": "#/$defs/nullableNumber"
+        },
+        "calibrated_profile_neutral_balance_delta": {
+          "oneOf": [{ "$ref": "#/$defs/numberVector3" }, { "type": "null" }]
+        },
+        "pre_scale_clipped_high_ratio": { "$ref": "#/$defs/numberVector3" },
+        "pre_scale_clipped_low_ratio": { "$ref": "#/$defs/numberVector3" },
+        "pre_scale_preserved_ratio": { "$ref": "#/$defs/nullableNumber" },
+        "post_scale_clipped_high_ratio": { "$ref": "#/$defs/numberVector3" },
+        "post_scale_clipped_low_ratio": { "$ref": "#/$defs/numberVector3" },
+        "post_scale_preserved_ratio": { "$ref": "#/$defs/nullableNumber" },
+        "color_decision_summary": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "color_processing_substeps": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "color_candidate_comparison_artifact": { "$ref": "#/$defs/nullableString" },
+        "gamut_clipping_map_artifact": { "$ref": "#/$defs/nullableString" },
+        "scene_referred_prophoto_float_artifact": { "$ref": "#/$defs/nullableString" },
+        "scene_referred_prophoto_float_artifact_diagnostics": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "gamut_clipping_map_diagnostics": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    }
+  }
+}

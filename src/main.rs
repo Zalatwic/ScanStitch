@@ -7,6 +7,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let cli = Cli::parse();
+    cli.validate()
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
     log::info!("scanstitch v{}", env!("CARGO_PKG_VERSION"));
     log::debug!("CLI args: {:?}", cli);
 
