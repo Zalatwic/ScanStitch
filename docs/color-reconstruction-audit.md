@@ -86,6 +86,13 @@ selected because the ICA path had the better selected quality and trust state. T
 unbordered-frame fallback evidence, but it is not calibrated roll proof without scanner/roll records
 or reference target evidence, and the base estimate remains untrusted.
 
+On 2026-05-26, roll inventory checks found additional local scan evidence but not a complete
+validation corpus. `TESTROLL/` contains 12 readable RGBA16 TIFF frames at `5959x3946` with no
+sequence gaps. `OLD_TESTROLL/` contains 39 readable `DNG_LINEAR_RAW16` frames at `5952x3944`, with
+one sequence gap covering `RAW_0030` through `RAW_0046`. These rolls can supply more real-image
+smoke coverage, but inventory alone does not prove film stock, scene/exposure labels, calibration
+records, reference patches, compact baselines, or fixture-suite expectations.
+
 The fixture coverage hash gate
 `cargo run --bin scanstitch-validate -- --fixture-registry docs\validation-fixtures.example.json --fixture-coverage --compute-fixture-hashes --write-fixture-hash-registry output\validation\validation-fixtures.with-hashes.json --summary-json output\validation\fixture-coverage-hashes.json --summary-md output\validation\fixture-coverage-hashes.md`
 completed with `fixture_coverage_status=review_required`. It inspected 3 registry entries, found

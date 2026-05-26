@@ -99,6 +99,46 @@ fn test_direct_density_render_transmittance_normalizes_optical_density_range() {
 }
 
 #[test]
+fn test_phase3_uses_shared_robust_dmax_for_all_channels() {
+    let mut img = Array3::<u16>::zeros((1, 256, 3));
+    let base = [12_000u16, 8_000, 4_000];
+    for x in 0..256 {
+        let t = x as f64 / 255.0;
+        img[[0, x, 0]] = (base[0] as f64 * (0.80 - 0.50 * t)).round().max(1.0) as u16;
+        img[[0, x, 1]] = (base[1] as f64 * (0.85 - 0.25 * t)).round().max(1.0) as u16;
+        img[[0, x, 2]] = (base[2] as f64 * (0.90 - 0.10 * t)).round().max(1.0) as u16;
+    }
+
+    let result = scanstitch::density::phase3_invert_with_diagnostics(
+        &img,
+        &[base[0] as f64, base[1] as f64, base[2] as f64],
+        14,
+    );
+    let max_channel_dmax = result
+        .diagnostics
+        .robust_d_max
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    assert_relative_eq!(
+        result.diagnostics.shared_robust_d_max,
+        max_channel_dmax,
+        epsilon = 1e-12
+    );
+    assert!(
+        result.diagnostics.robust_d_max[0] > result.diagnostics.robust_d_max[1]
+            && result.diagnostics.robust_d_max[1] > result.diagnostics.robust_d_max[2],
+        "fixture should exercise uneven per-channel density ranges: {:?}",
+        result.diagnostics.robust_d_max
+    );
+    assert!(
+        result.positive_density[[0, 0, 2]] > result.positive_density[[0, 255, 2]],
+        "blue channel should be inverted against shared Dmax instead of its smaller channel-local Dmax"
+    );
+}
+
+#[test]
 fn test_base_subtraction_in_density() {
     let base_t = [0.7, 0.4, 0.2];
     let base_d: Vec<f64> = base_t

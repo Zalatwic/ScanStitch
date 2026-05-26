@@ -8023,6 +8023,46 @@ fn test_validation_docs_map_local_corpus_scaffold_to_registry_actions() {
 }
 
 #[test]
+fn test_color_reconstruction_policy_documents_scoring_and_constant_invariants() {
+    let policy = include_str!("../docs/color-reconstruction-policy.md");
+    let readme = include_str!("../README.md");
+    let report_schema = include_str!("../docs/report-schema.md");
+
+    for required in [
+        "shared_robust_d_max",
+        "per-channel orange-mask removal",
+        "Direct-density render input also divides by the same `shared_robust_d_max`",
+        "Changing this to per-channel Dmax is a colour-model change",
+        "lower_is_better",
+        "technical_safety_score",
+        "color_fidelity_score",
+        "Hard gates run before score wins are accepted",
+        "Neutral fallback carries a large fidelity penalty",
+        "Weights in `colorspace.rs` are decision policy",
+        "Physical encoding constants",
+        "Density and render-domain constants",
+        "Anchor and sample filters",
+        "Candidate quality weights and review thresholds",
+        "Tone cleanup thresholds",
+        "multi-scene, multi-film-stock CoolScan corpus",
+    ] {
+        assert!(
+            policy.contains(required),
+            "colour policy missing `{required}`"
+        );
+    }
+
+    assert!(
+        readme.contains("docs/color-reconstruction-policy.md"),
+        "README should link the colour reconstruction policy"
+    );
+    assert!(
+        report_schema.contains("Scores are ordered `lower_is_better`"),
+        "report schema should keep score ordering visible"
+    );
+}
+
+#[test]
 fn test_color_calibration_library_record_schema_and_examples_cover_contract() {
     let examples: serde_json::Value = serde_json::from_str(include_str!(
         "../docs/color-calibration-library-record.examples.json"
@@ -8243,6 +8283,9 @@ fn test_color_reconstruction_audit_maps_goal_to_artifacts_and_gap() {
         "RGBA8 5959x3670",
         "fixture_suite_status=failed",
         "fixture_suite:logan:declared_calibration_not_applied",
+        "TESTROLL/` contains 12 readable RGBA16 TIFF frames",
+        "OLD_TESTROLL/` contains 39 readable `DNG_LINEAR_RAW16` frames",
+        "inventory alone does not prove film stock",
         "CoolScan requirement",
     ] {
         assert!(

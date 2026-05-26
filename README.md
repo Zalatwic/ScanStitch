@@ -141,7 +141,8 @@ requested film-stock evidence ranks roll/film candidates and rejects mismatched 
 profiles, and weak auto-matches are reported as advisory instead of being silently applied. The older
 `--calibration-profile` path remains available for one-off scanner/film profiles. See
 `docs/color-calibration.md` for library record examples, the calibration-library record schema, and
-`scanstitch-calibrate` usage.
+`scanstitch-calibrate` usage. See `docs/color-reconstruction-policy.md` for the density, candidate
+scoring, and constant-change policy behind those decisions.
 
 Create or update local calibration records with `scanstitch-calibrate`:
 
