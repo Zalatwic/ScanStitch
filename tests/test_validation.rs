@@ -3713,7 +3713,7 @@ fn test_validate_cli_fixture_coverage_reports_tiff_pair_mismatches() {
     let summary_json = tmp.path().join("coverage.json");
 
     let left = synthetic::constant_image(4, 4, [12000, 7000, 3000]);
-    let right = synthetic::constant_image(5, 4, [12000, 7000, 3000]);
+    let right = synthetic::constant_image(7, 4, [12000, 7000, 3000]);
     scanstitch::tiff_io::save_tiff_u16(&left, &path1).unwrap();
     scanstitch::tiff_io::save_tiff_u16(&right, &path2).unwrap();
     std::fs::write(
@@ -3787,6 +3787,11 @@ fn test_validate_cli_fixture_coverage_reports_tiff_pair_mismatches() {
         summary["fixtures"][0]["tiff_pair"]["dimensions_match"],
         false
     );
+    assert_eq!(
+        summary["fixtures"][0]["tiff_pair"]["dimensions_compatible"],
+        false
+    );
+    assert_eq!(summary["fixtures"][0]["tiff_pair"]["height_delta"], 3);
     assert!(summary["issues"]
         .as_array()
         .unwrap()
@@ -3817,6 +3822,93 @@ fn test_validate_cli_fixture_coverage_reports_tiff_pair_mismatches() {
         .iter()
         .any(|action| action
             == "replace_component_pair_with_dimension_matched_tiffs_for_fixture:logan"));
+}
+
+#[test]
+fn test_validate_cli_fixture_coverage_accepts_one_row_stitch_compatible_pair() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path1 = tmp.path().join("left.tiff");
+    let path2 = tmp.path().join("right.tiff");
+    let baseline_path = tmp.path().join("baseline.json");
+    let registry_path = tmp.path().join("fixtures.json");
+    let summary_json = tmp.path().join("coverage.json");
+
+    let left = synthetic::constant_image(4, 4, [12000, 7000, 3000]);
+    let right = synthetic::constant_image(5, 4, [12000, 7000, 3000]);
+    scanstitch::tiff_io::save_tiff_u16(&left, &path1).unwrap();
+    scanstitch::tiff_io::save_tiff_u16(&right, &path2).unwrap();
+    std::fs::write(
+        &baseline_path,
+        serde_json::to_string_pretty(&fixture_summary_baseline()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &registry_path,
+        serde_json::json!({
+            "coverage_requirements": {
+                "min_fixtures": 1,
+                "min_component_pairs": 1,
+                "min_readable_tiff_pairs": 1,
+                "min_tiff_layout_consistent_pairs": 1,
+                "min_tiff_dimension_matched_pairs": 1,
+                "min_summary_baselines": 1,
+                "min_uncalibrated_fixtures": 1
+            },
+            "fixtures": {
+                "logan": {
+                    "component1": path1,
+                    "component2": path2,
+                    "summary_baseline": baseline_path,
+                    "film_stock": "Synthetic negative",
+                    "scene_tags": ["neutral-target"],
+                    "exposure_tags": ["normal-exposure"],
+                    "calibration_case": "uncalibrated-image-derived"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture-coverage")
+        .arg("--strict")
+        .arg("--quiet")
+        .arg("--summary-json")
+        .arg(&summary_json)
+        .output()
+        .expect("run scanstitch-validate fixture coverage with one-row TIFF delta");
+
+    assert!(
+        output.status.success(),
+        "one-row TIFF pair should be accepted as stitch-compatible: status={} stderr={} stdout={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&summary_json).unwrap()).unwrap();
+    assert_eq!(summary["status"], "passed");
+    assert_eq!(summary["tiff_dimension_matched_pair_count"], 1);
+    assert_eq!(summary["validation_ready_fixture_count"], 1);
+    assert_eq!(summary["uncalibrated_fixture_count"], 1);
+    assert_eq!(
+        summary["fixtures"][0]["tiff_pair"]["dimensions_match"],
+        false
+    );
+    assert_eq!(
+        summary["fixtures"][0]["tiff_pair"]["dimensions_compatible"],
+        true
+    );
+    assert_eq!(
+        summary["fixtures"][0]["tiff_pair"]["dimension_matched"],
+        true
+    );
+    assert_eq!(summary["fixtures"][0]["tiff_pair"]["width_delta"], 0);
+    assert_eq!(summary["fixtures"][0]["tiff_pair"]["height_delta"], 1);
+    assert!(summary["issues"].as_array().unwrap().is_empty());
 }
 
 #[test]
@@ -7068,7 +7160,7 @@ fn test_tracked_logan_baseline_has_required_regression_fields() {
         (baseline["colorspace"]["technical_safety_score"]
             .as_f64()
             .expect("technical safety score")
-            - 1.283516)
+            - 1.283527)
             .abs()
             < 0.000001
     );
@@ -7076,7 +7168,7 @@ fn test_tracked_logan_baseline_has_required_regression_fields() {
         (baseline["colorspace"]["color_fidelity_score"]
             .as_f64()
             .expect("color fidelity score")
-            - 0.510881)
+            - 0.457071)
             .abs()
             < 0.000001
     );
@@ -7084,7 +7176,7 @@ fn test_tracked_logan_baseline_has_required_regression_fields() {
         (baseline["colorspace"]["hue_linearity_score"]
             .as_f64()
             .expect("hue linearity baseline")
-            - 0.835048)
+            - 0.835089)
             .abs()
             < 0.000001
     );
@@ -7880,6 +7972,7 @@ fn test_validation_docs_map_local_corpus_scaffold_to_registry_actions() {
         "repair_component2_tiff_for_fixture:logan",
         "replace_component1_with_minimum_bit_depth_tiff_for_fixture:logan",
         "replace_component2_with_minimum_bit_depth_tiff_for_fixture:logan",
+        "stitch-compatible regression evidence",
         "replace_component_pair_with_dimension_matched_tiffs_for_fixture:logan",
         "replace_component_pair_with_layout_matched_tiffs_for_fixture:<name>",
         "RGBA8 5959x3670",
@@ -8138,20 +8231,17 @@ fn test_color_reconstruction_audit_maps_goal_to_artifacts_and_gap() {
         "debug_artifact_invalid_count=0",
         "fixture coverage hash gate",
         "fixture_coverage_status=review_required",
-        "validation_ready_fixture_count=0",
+        "no validation-ready fixtures",
+        "built-in LOGAN fixture coverage gate now passes",
         "validation-fixtures.with-hashes.json",
         "Local Corpus Scaffold",
         "calibration/scanners/coolscan-4000-vuescan-raw.json",
         "local-fixtures/my-split-left.tif",
         "repair_component1_tiff_for_fixture:logan",
         "replace_component1_with_minimum_bit_depth_tiff_for_fixture:logan",
-        "replace_component_pair_with_dimension_matched_tiffs_for_fixture:logan",
+        "stitch-compatible by the built-in LOGAN regression gate",
         "RGBA8 5959x3670",
         "fixture_suite_status=failed",
-        "passed=0",
-        "review_required=1",
-        "failed=2",
-        "fixture_suite:logan:coverage_not_validation_ready",
         "fixture_suite:logan:declared_calibration_not_applied",
         "CoolScan requirement",
     ] {

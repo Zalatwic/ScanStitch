@@ -88,14 +88,16 @@ or reference target evidence, and the base estimate remains untrusted.
 
 The fixture coverage hash gate
 `cargo run --bin scanstitch-validate -- --fixture-registry docs\validation-fixtures.example.json --fixture-coverage --compute-fixture-hashes --write-fixture-hash-registry output\validation\validation-fixtures.with-hashes.json --summary-json output\validation\fixture-coverage-hashes.json --summary-md output\validation\fixture-coverage-hashes.md`
-completed with `fixture_coverage_status=review_required` and 70 issues. It inspected 3 registry entries, found
-`validation_ready_fixture_count=0`, computed one LOGAN component SHA-256 pair and one LOGAN summary
+completed with `fixture_coverage_status=review_required`. It inspected 3 registry entries, found
+no validation-ready fixtures for the stricter local CoolScan corpus, computed one LOGAN component SHA-256 pair and one LOGAN summary
 baseline SHA-256, computed no calibration evidence SHA-256, and emitted non-empty `action_items`
 and fixture-level repair actions. The generated `validation-fixtures.with-hashes.json` records the
 current LOGAN component and summary-baseline hashes, but it is not a passing strict corpus snapshot.
+By contrast, the built-in LOGAN fixture coverage gate now passes as one uncalibrated,
+validation-ready regression fixture with pinned component and summary-baseline hashes.
 The required debug artifact kinds are now `candidate_comparison`, `gamut_clipping_map`, and
 `scene_referred_prophoto_float`, and all remain missing from validation-ready fixture coverage
-because there are no validation-ready fixtures yet.
+for the stricter example registry because there are no validation-ready local CoolScan fixtures yet.
 The `Local Corpus Scaffold` section in `docs/validation.md` maps those actions to the expected
 ignored local paths, including `calibration/scanners/coolscan-4000-vuescan-raw.json`,
 `calibration/rolls/logan-roll-2026-05.json`, `local-fixtures/my-split-left.tif`, and
@@ -103,18 +105,16 @@ ignored local paths, including `calibration/scanners/coolscan-4000-vuescan-raw.j
 `RGBA8 5959x3670` and `RGBA8 5959x3669`, so `repair_component1_tiff_for_fixture:logan` and
 `repair_component2_tiff_for_fixture:logan` now have narrower companion actions:
 `replace_component1_with_minimum_bit_depth_tiff_for_fixture:logan`,
-`replace_component2_with_minimum_bit_depth_tiff_for_fixture:logan`, and
-`replace_component_pair_with_dimension_matched_tiffs_for_fixture:logan`. Those actions mean
-replacing the pair with matching high-bit CoolScan RAW components or explicitly changing the
-coverage requirements with rationale.
+`replace_component2_with_minimum_bit_depth_tiff_for_fixture:logan`. The one-row height delta is
+accepted as stitch-compatible by the built-in LOGAN regression gate; exact-dimension replacements
+are still preferred for a strict CoolScan RAW corpus unless a registry documents the rationale.
 
 The current registry fixture suite can be run without `--strict` to inspect all fixture outcomes:
 `cargo run --release --bin scanstitch-validate -- --fixture-registry docs\validation-fixtures.example.json --fixture-suite --debug --summary-json output\validation\fixture-suite-current.json --summary-md output\validation\fixture-suite-current.md`.
-That run completed with `fixture_suite_status=failed`, `passed=0`, `review_required=1`,
-`failed=2`, and `coverage status=review_required`. LOGAN produced fresh debug artifacts but remained
-review-required because its embedded coverage entry is not validation-ready
-(`fixture_suite:logan:coverage_not_validation_ready`) and because the registry declares calibration
-evidence that is missing locally (`fixture_suite:logan:declared_calibration_not_applied`);
+That run completed with `fixture_suite_status=failed` and `coverage status=review_required`.
+LOGAN produced fresh debug artifacts but remained review-required for the example registry because
+the registry declares calibration evidence that is missing locally
+(`fixture_suite:logan:declared_calibration_not_applied`);
 `my-split-frame` and `uncalibrated-night` failed because their component TIFFs are missing.
 
 This is useful real-fixture regression evidence for LOGAN, but it is not calibrated corpus proof and

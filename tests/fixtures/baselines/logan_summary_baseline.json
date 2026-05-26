@@ -37,17 +37,17 @@
     "calibration_acceptance_beats_image_derived": null,
     "candidate_risk": "review_neutral_support",
     "tone_color_trust_state": "review_required",
-    "selected_quality_score": 1.7943972545917872,
-    "technical_safety_score": 1.2835161201583536,
-    "color_fidelity_score": 0.5108811344334336,
-    "selected_runner_up_quality_delta": 2.869312015537537,
+    "selected_quality_score": 1.7405977800456125,
+    "technical_safety_score": 1.2835269013659978,
+    "color_fidelity_score": 0.4570708786796148,
+    "selected_runner_up_quality_delta": 2.9224545097793255,
     "density_monotonicity_score": 1.0,
-    "hue_linearity_score": 0.8350480729286961,
-    "saturation_preservation_median_ratio": 1.1588019126792988,
-    "spatial_neutral_delta_p95": 0.07391728966682196,
+    "hue_linearity_score": 0.8350894688116185,
+    "saturation_preservation_median_ratio": 1.1587918764118186,
+    "spatial_neutral_delta_p95": 0.07392152052562766,
     "memory_color_penalty": 0.0,
     "spatial_consistency_penalty": 0.0,
-    "post_scale_preserved_ratio": 0.97911363435794,
+    "post_scale_preserved_ratio": 0.979114411695176,
     "candidate_acceptance_signatures": [
       "image_derived_matrix|kind=image_derived|strategy=image_derived_matrix|status=rejected_safety|rank=3|selected=false|eligible=true|rejected=true",
       "gamut_safe_image_matrix_blend|kind=image_derived|strategy=gamut_safe_image_matrix_blend|status=accepted_runner_up|rank=2|selected=false|eligible=true|rejected=false",
@@ -101,13 +101,13 @@
     "reference_delta_e_abs": 1.0
   },
   "tone": {
-    "highlight_chroma_compressed_ratio": 0.09163489110191211,
-    "highlight_neutral_chroma_compressed_ratio": 0.02927022208524829,
-    "shadow_chroma_compressed_ratio": 0.17462867286128234
+    "highlight_chroma_compressed_ratio": 0.0916267976495151,
+    "highlight_neutral_chroma_compressed_ratio": 0.03016507442089519,
+    "shadow_chroma_compressed_ratio": 0.17463717784515717
   },
   "grain": {
-    "luma_residual_p95": 0.15114309874756723,
-    "chroma_residual_p95": 0.09321254971113946,
-    "chroma_to_luma_p95_ratio": 0.6167172069617224
+    "luma_residual_p95": 0.1399048182080719,
+    "chroma_residual_p95": 0.06402749340869399,
+    "chroma_to_luma_p95_ratio": 0.4576503813719253
   }
 }

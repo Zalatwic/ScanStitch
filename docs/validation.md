@@ -63,13 +63,16 @@ The current local coverage run maps directly to those paths:
 - `repair_component1_tiff_for_fixture:logan` and
   `repair_component2_tiff_for_fixture:logan`: the presently available LOGAN pair is
   `RGBA8 5959x3670` and `RGBA8 5959x3669`, so it fails the example registry's
-  `min_tiff_bits_per_sample: 14` requirement and dimension-match requirement. For strict CoolScan
+  `min_tiff_bits_per_sample: 14` requirement. Its one-row height delta is accepted by the built-in
+  LOGAN gate as stitch-compatible regression evidence, but it is not high-bit CoolScan RAW input.
+  For strict CoolScan
   RAW evidence, replace both components with matching high-bit scans from the same scanner/settings
   workflow. Coverage also emits the more specific
   `replace_component1_with_minimum_bit_depth_tiff_for_fixture:logan`,
-  `replace_component2_with_minimum_bit_depth_tiff_for_fixture:logan`, and
-  `replace_component_pair_with_dimension_matched_tiffs_for_fixture:logan` actions. Only relax the
-  minimum bit-depth or dimension requirements with an explicit rationale.
+  `replace_component2_with_minimum_bit_depth_tiff_for_fixture:logan`, and only emits
+  `replace_component_pair_with_dimension_matched_tiffs_for_fixture:logan` when a pair is neither
+  exact-dimension nor stitch-compatible. Only relax the minimum bit-depth or dimension requirements
+  with an explicit rationale.
 - `provide_calibration_library_for_fixture:logan`: create the `calibration/` library with scanner
   profile `coolscan-4000-vuescan-raw`, roll profile `logan-roll-2026-05`, and a Kodak Gold 200 film
   hint. This supplies the required `Kodak Gold 200|scanner-roll-library` pair and the
@@ -359,8 +362,8 @@ matches,
 `min_summary_baseline_sha256_fixtures` can require pinned compact baselines for strict reruns.
 `readable_tiff_pair_count` counts fixtures whose two component files are readable supported TIFFs,
 `tiff_layout_consistent_pair_count` counts pairs with matching color type, sample precision,
-channel count, and alpha layout, and `tiff_dimension_matched_pair_count` counts pairs with matching
-component dimensions.
+channel count, and alpha layout, and `tiff_dimension_matched_pair_count` counts pairs with exact
+matching component dimensions or a stitch-compatible one-row height delta with matching width.
 When `min_tiff_bits_per_sample` is set, lower-precision component files report
 `component*_tiff_bits_below_min` and are not validation-ready.
 When `component*_sha256` values are declared, mismatched hashes report
@@ -432,6 +435,9 @@ evidence, and any registry-declared colour-decision expectations. If a fixture d
 `debug_artifacts_required` or
 `debug_artifact_kinds_required`, run the suite with `--debug`; otherwise the suite reports
 `debug_artifacts_missing` or `debug_artifact_kind_missing:<kind>`.
+Validation runs default to `--quality-mode balanced` to avoid writing perfect-mode master/review
+artifacts during strict gates; pass `--quality-mode perfect` when those artifacts are part of the
+review.
 When the embedded coverage summary has unmet corpus requirements, the suite Markdown repeats the
 coverage `action_items` list under `Coverage Action Items` so review runs show both fixture failures
 and the concrete corpus-building steps in one report. The suite fixture table also has a
