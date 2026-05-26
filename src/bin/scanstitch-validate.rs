@@ -339,6 +339,14 @@ struct FixtureEntry {
     #[serde(default)]
     output_dir: Option<PathBuf>,
     #[serde(default)]
+    input_mode: Option<String>,
+    #[serde(default)]
+    bit_depth: Option<u8>,
+    #[serde(default)]
+    force_stitch: bool,
+    #[serde(default)]
+    force_no_stitch: bool,
+    #[serde(default)]
     calibration_profile: Option<PathBuf>,
     #[serde(default)]
     calibration_profile_sha256: Option<String>,
@@ -542,6 +550,10 @@ struct FixtureCoverageEntry {
     component2_tiff: Option<FixtureTiffProbe>,
     tiff_pair: Option<FixtureTiffPairProbe>,
     output_dir: Option<String>,
+    input_mode: Option<String>,
+    bit_depth: Option<u8>,
+    force_stitch: bool,
+    force_no_stitch: bool,
     summary_baseline: Option<String>,
     summary_baseline_exists: Option<bool>,
     summary_baseline_parse_status: Option<String>,
@@ -1697,6 +1709,10 @@ fn load_fixture_registry(
                 "f220edf8704d4d81374ad2befe22c5fdcaf44faafa39228d9f2bf8409bd2a1eb".to_string(),
             ),
             output_dir: Some(PathBuf::from("output/validation/logan")),
+            input_mode: None,
+            bit_depth: None,
+            force_stitch: false,
+            force_no_stitch: false,
             calibration_profile: None,
             calibration_profile_sha256: None,
             calibration_library: None,
@@ -2052,6 +2068,16 @@ fn validate_fixture_entry(name: &str, fixture: &FixtureEntry, issues: &mut Vec<S
         issues,
     );
     validate_optional_path(name, "output_dir", fixture.output_dir.as_deref(), issues);
+    validate_optional_input_mode_label(name, fixture.input_mode.as_deref(), issues);
+    if fixture
+        .bit_depth
+        .is_some_and(|bit_depth| !matches!(bit_depth, 14 | 16))
+    {
+        issues.push(format!("{name}:bit_depth_invalid"));
+    }
+    if fixture.force_stitch && fixture.force_no_stitch {
+        issues.push(format!("{name}:force_stitch_and_force_no_stitch"));
+    }
     validate_optional_path(
         name,
         "summary_baseline",
@@ -2485,6 +2511,20 @@ fn validate_optional_label(
 ) {
     if value.is_some_and(|value| value.trim().is_empty()) {
         issues.push(format!("{fixture_name}:{field_name}_empty"));
+    }
+}
+
+fn validate_optional_input_mode_label(
+    fixture_name: &str,
+    value: Option<&str>,
+    issues: &mut Vec<String>,
+) {
+    if let Some(value) = value {
+        if value.trim().is_empty() {
+            issues.push(format!("{fixture_name}:input_mode_empty"));
+        } else if parse_input_mode_label(value).is_none() {
+            issues.push(format!("{fixture_name}:input_mode_invalid:{value}"));
+        }
     }
 }
 
@@ -4472,6 +4512,10 @@ fn fixture_coverage_entry(
             .output_dir
             .as_ref()
             .map(|path| path.display().to_string()),
+        input_mode: fixture.input_mode.clone(),
+        bit_depth: fixture.bit_depth,
+        force_stitch: fixture.force_stitch,
+        force_no_stitch: fixture.force_no_stitch,
         summary_baseline: fixture
             .summary_baseline
             .as_ref()
@@ -5098,6 +5142,9 @@ fn validate_fixture_suite_inputs(cli: &ValidationCli) -> Result<(), Box<dyn std:
     {
         return Err("--fixture-suite runs registry entries only; omit --component1/--component2, --report, --compare-report, --compare-summary, and --write-summary-baseline".into());
     }
+    if cli.force_stitch && cli.force_no_stitch {
+        return Err("--fixture-suite cannot combine --force-stitch and --force-no-stitch".into());
+    }
     Ok(())
 }
 
@@ -5109,6 +5156,14 @@ fn validate_input_mode_options(
         return Err("--input-mode positive cannot be used with --render-input ica because ICA requires density-inverted negative-film data".into());
     }
     Ok(())
+}
+
+fn parse_input_mode_label(value: &str) -> Option<InputMode> {
+    match value {
+        "negative" => Some(InputMode::Negative),
+        "positive" => Some(InputMode::Positive),
+        _ => None,
+    }
 }
 
 fn validate_roll_inputs(cli: &ValidationCli) -> Result<(), Box<dyn std::error::Error>> {
@@ -8140,6 +8195,50 @@ fn run_fixture_suite_entry(
         Some(fixture),
         calibration_library.as_ref(),
     );
+    let input_mode = if let Some(input_mode) = fixture.input_mode.as_deref() {
+        match parse_input_mode_label(input_mode) {
+            Some(input_mode) => input_mode,
+            None => {
+                entry.status = "failed".to_string();
+                entry
+                    .issues
+                    .push(format!("fixture_suite:{name}:input_mode_invalid"));
+                entry.error = Some(format!("invalid fixture input_mode `{input_mode}`"));
+                return entry;
+            }
+        }
+    } else {
+        cli.input_mode
+    };
+    let bit_depth = fixture.bit_depth.unwrap_or(cli.bit_depth);
+    if !matches!(bit_depth, 14 | 16) {
+        entry.status = "failed".to_string();
+        entry
+            .issues
+            .push(format!("fixture_suite:{name}:bit_depth_invalid"));
+        entry.error = Some(format!("invalid fixture bit_depth `{bit_depth}`"));
+        return entry;
+    }
+    let force_stitch = cli.force_stitch || fixture.force_stitch;
+    let force_no_stitch = cli.force_no_stitch || fixture.force_no_stitch;
+    if force_stitch && force_no_stitch {
+        entry.status = "failed".to_string();
+        entry.issues.push(format!(
+            "fixture_suite:{name}:force_stitch_and_force_no_stitch"
+        ));
+        entry.error = Some(
+            "fixture effective settings request both force-stitch and force-no-stitch".to_string(),
+        );
+        return entry;
+    }
+    if let Err(err) = validate_input_mode_options(input_mode, cli.render_input) {
+        entry.status = "failed".to_string();
+        entry.issues.push(format!(
+            "fixture_suite:{name}:input_mode_render_input_invalid"
+        ));
+        entry.error = Some(err.to_string());
+        return entry;
+    }
 
     let pipeline_cli = PipelineCli {
         component1: fixture.component1.clone(),
@@ -8162,19 +8261,19 @@ fn run_fixture_suite_entry(
         base_color_reason: None,
         color_mode: cli.color_mode,
         render_input: cli.render_input,
-        input_mode: cli.input_mode,
+        input_mode,
         render_intent: cli.render_intent,
         quality_mode: cli.quality_mode,
         write_master: cli.write_master,
         review_sidecar: cli.review_sidecar.clone(),
         write_review_sidecar: cli.write_review_sidecar.clone(),
         debug: cli.debug,
-        force_stitch: cli.force_stitch,
-        force_no_stitch: cli.force_no_stitch,
+        force_stitch,
+        force_no_stitch,
         transform: cli.transform.clone(),
         ica_max_iter: cli.ica_max_iter,
         ica_tol: cli.ica_tol,
-        bit_depth: cli.bit_depth,
+        bit_depth,
         use_opencv: cli.use_opencv,
     };
     entry.expected_calibration_source =

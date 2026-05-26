@@ -273,6 +273,11 @@ Entries may also carry calibration defaults: `calibration_profile`, `calibration
 the fixture is run, and matching command-line flags override the registry value for that field.
 Registry `film_stock` is always retained as corpus metadata; it is passed as a pipeline calibration
 selector only when a calibration library is active, or when `--film-stock` is supplied explicitly.
+Entries may also override pipeline shape with `input_mode`, `bit_depth`, `force_stitch`, and
+`force_no_stitch`. Use `force_no_stitch: true` with the same path for `component1` and `component2`
+to turn an independent roll frame into a fixture-suite entry; this is useful for building the
+multi-scene CoolScan corpus from single-frame roll scans without forcing the whole suite to run in
+no-stitch mode.
 For corpus auditability, entries should also declare `scene_tags`, `exposure_tags`, and
 `reference_evidence`, and `calibration_case` so coverage reports can show which real-image
 conditions are actually tested and which fixtures include objective colour references such as

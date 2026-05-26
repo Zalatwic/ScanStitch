@@ -108,6 +108,10 @@
         "component1_sha256": { "$ref": "#/$defs/sha256Hex" },
         "component2_sha256": { "$ref": "#/$defs/sha256Hex" },
         "output_dir": { "$ref": "#/$defs/pathString" },
+        "input_mode": { "enum": ["negative", "positive"] },
+        "bit_depth": { "enum": [14, 16] },
+        "force_stitch": { "type": "boolean" },
+        "force_no_stitch": { "type": "boolean" },
         "summary_baseline": { "$ref": "#/$defs/pathString" },
         "summary_baseline_sha256": { "$ref": "#/$defs/sha256Hex" },
         "calibration_profile": { "$ref": "#/$defs/pathString" },
@@ -128,6 +132,15 @@
         {
           "not": {
             "required": ["calibration_profile", "calibration_library"]
+          }
+        },
+        {
+          "not": {
+            "required": ["force_stitch", "force_no_stitch"],
+            "properties": {
+              "force_stitch": { "const": true },
+              "force_no_stitch": { "const": true }
+            }
           }
         },
         {

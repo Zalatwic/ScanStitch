@@ -2017,6 +2017,14 @@ fn test_validate_cli_rejects_fixture_registry_contract_violations() {
                     "calibration_profile": "profile.json",
                     "calibration_case": "uncalibrated-image-derived"
                 },
+                "bad-overrides": {
+                    "component1": "left.tif",
+                    "component2": "right.tif",
+                    "input_mode": "not-a-mode",
+                    "bit_depth": 12,
+                    "force_stitch": true,
+                    "force_no_stitch": true
+                },
                 "bad-expectations": {
                     "component1": "left.tif",
                     "component2": "right.tif",
@@ -2110,6 +2118,9 @@ fn test_validate_cli_rejects_fixture_registry_contract_violations() {
         "roll-without-scanner:scanner_roll_library_case_without_scanner_profile",
         "external-no-profile:external_profile_case_without_calibration_profile",
         "uncalibrated-with-profile:uncalibrated_case_declares_calibration_profile",
+        "bad-overrides:input_mode_invalid:not-a-mode",
+        "bad-overrides:bit_depth_invalid",
+        "bad-overrides:force_stitch_and_force_no_stitch",
         "bad-expectations:component1_sha256_invalid",
         "bad-expectations:component_sha256_pair_incomplete",
         "bad-expectations:summary_baseline_sha256_invalid",
@@ -5099,8 +5110,11 @@ fn test_validate_cli_runs_fixture_suite_strict() {
             "fixtures": {
                 "logan": {
                     "component1": path1,
-                    "component2": path2,
+                    "component2": path1,
                     "output_dir": tmp.path().join("registry-output"),
+                    "input_mode": "negative",
+                    "bit_depth": 14,
+                    "force_no_stitch": true,
                     "summary_baseline": baseline_path,
                     "calibration_library": library_dir,
                     "scanner_profile": "scanner-a",
@@ -5151,7 +5165,6 @@ fn test_validate_cli_runs_fixture_suite_strict() {
         .arg(&registry_path)
         .arg("--fixture-suite")
         .arg("--strict")
-        .arg("--force-no-stitch")
         .arg("--debug")
         .arg("--ica-max-iter")
         .arg("20")
@@ -5192,6 +5205,9 @@ fn test_validate_cli_runs_fixture_suite_strict() {
     assert_eq!(suite["coverage"]["scene_tag_count"], 1);
     assert_eq!(suite["fixtures"][0]["name"], "logan");
     assert_eq!(suite["fixtures"][0]["status"], "passed");
+    assert_eq!(suite["coverage"]["fixtures"][0]["input_mode"], "negative");
+    assert_eq!(suite["coverage"]["fixtures"][0]["bit_depth"], 14);
+    assert_eq!(suite["coverage"]["fixtures"][0]["force_no_stitch"], true);
     assert_eq!(suite["fixtures"][0]["coverage_validation_ready"], true);
     assert_eq!(
         suite["fixtures"][0]["coverage_issues"],
@@ -7582,6 +7598,18 @@ fn test_validation_fixture_registry_schema_and_example_cover_color_corpus_fields
     );
     assert!(schema["$defs"]["fixtureEntry"]["properties"]["film_stock"].is_object());
     assert_eq!(
+        schema["$defs"]["fixtureEntry"]["properties"]["input_mode"]["enum"],
+        serde_json::json!(["negative", "positive"])
+    );
+    assert_eq!(
+        schema["$defs"]["fixtureEntry"]["properties"]["bit_depth"]["enum"],
+        serde_json::json!([14, 16])
+    );
+    assert_eq!(
+        schema["$defs"]["fixtureEntry"]["properties"]["force_no_stitch"]["type"],
+        "boolean"
+    );
+    assert_eq!(
         schema["$defs"]["fixtureEntry"]["properties"]["component1_sha256"]["$ref"],
         "#/$defs/sha256Hex"
     );
@@ -7968,6 +7996,8 @@ fn test_validation_docs_map_local_corpus_scaffold_to_registry_actions() {
         "local-fixtures/uncalibrated-night-left.tif",
         "local-fixtures/uncalibrated-night-right.tif",
         "local-fixtures/baselines/uncalibrated-night-summary-baseline.json",
+        "force_no_stitch: true",
+        "multi-scene CoolScan corpus from single-frame roll scans",
         "repair_component1_tiff_for_fixture:logan",
         "repair_component2_tiff_for_fixture:logan",
         "replace_component1_with_minimum_bit_depth_tiff_for_fixture:logan",
