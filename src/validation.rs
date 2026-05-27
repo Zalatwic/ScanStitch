@@ -922,13 +922,19 @@ pub struct ToneValidationSummary {
     pub shadow_saturation_median: Option<f64>,
     pub shadow_saturation_p95: Option<f64>,
     #[serde(default)]
+    pub shadow_rgb_median: Option<Vec<f64>>,
+    #[serde(default)]
     pub shadow_visible_pixel_count: Option<usize>,
     #[serde(default)]
     pub shadow_visible_saturation_median: Option<f64>,
     #[serde(default)]
     pub shadow_visible_saturation_p95: Option<f64>,
+    #[serde(default)]
+    pub shadow_visible_rgb_median: Option<Vec<f64>>,
     pub midtone_saturation_median: Option<f64>,
     pub midtone_saturation_p95: Option<f64>,
+    #[serde(default)]
+    pub midtone_rgb_median: Option<Vec<f64>>,
     #[serde(default)]
     pub render_luminance_percentiles: Option<Vec<f64>>,
     #[serde(default)]
@@ -941,11 +947,15 @@ pub struct ToneValidationSummary {
     #[serde(default)]
     pub midtone_neutral_saturation_p95: Option<f64>,
     #[serde(default)]
+    pub midtone_neutral_rgb_median: Option<Vec<f64>>,
+    #[serde(default)]
     pub midtone_saturated_saturation_median: Option<f64>,
     #[serde(default)]
     pub midtone_saturated_saturation_p95: Option<f64>,
     pub bright_neutral_saturation_median: Option<f64>,
     pub bright_neutral_saturation_p95: Option<f64>,
+    #[serde(default)]
+    pub bright_neutral_rgb_median: Option<Vec<f64>>,
     pub bright_saturated_saturation_median: Option<f64>,
     pub bright_saturated_saturation_p95: Option<f64>,
     pub post_chroma_compression_clipped_high_ratio: Option<Vec<f64>>,
@@ -5733,6 +5743,12 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
     push_row(
         &mut out,
         "tone",
+        "shadow_rgb_median",
+        &format_f64_vec(&summary.tone.shadow_rgb_median),
+    );
+    push_row(
+        &mut out,
+        "tone",
         "shadow_visible_saturation_p95",
         &format_f64(summary.tone.shadow_visible_saturation_p95),
     );
@@ -5741,6 +5757,12 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
         "tone",
         "shadow_visible_pixel_count",
         &format_usize(summary.tone.shadow_visible_pixel_count),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "shadow_visible_rgb_median",
+        &format_f64_vec(&summary.tone.shadow_visible_rgb_median),
     );
     push_row(
         &mut out,
@@ -5757,6 +5779,12 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
     push_row(
         &mut out,
         "tone",
+        "midtone_rgb_median",
+        &format_f64_vec(&summary.tone.midtone_rgb_median),
+    );
+    push_row(
+        &mut out,
+        "tone",
         "midtone_neutral_saturation_p95",
         &format_f64(summary.tone.midtone_neutral_saturation_p95),
     );
@@ -5769,8 +5797,20 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
     push_row(
         &mut out,
         "tone",
+        "midtone_neutral_rgb_median",
+        &format_f64_vec(&summary.tone.midtone_neutral_rgb_median),
+    );
+    push_row(
+        &mut out,
+        "tone",
         "bright_neutral_saturation_p95",
         &format_f64(summary.tone.bright_neutral_saturation_p95),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "bright_neutral_rgb_median",
+        &format_f64_vec(&summary.tone.bright_neutral_rgb_median),
     );
     push_row(
         &mut out,
@@ -6888,6 +6928,7 @@ fn summarize_tone(phase: &PhaseReport) -> ToneValidationSummary {
         color_protection_reason: string_metric(phase, "color_protection_reason"),
         shadow_saturation_median: f64_metric(phase, "shadow_saturation_median"),
         shadow_saturation_p95: f64_metric(phase, "shadow_saturation_p95"),
+        shadow_rgb_median: f64_vec_metric(phase, "shadow_rgb_median"),
         shadow_visible_pixel_count: phase
             .metrics
             .get("shadow_visible_pixel_count")
@@ -6895,8 +6936,10 @@ fn summarize_tone(phase: &PhaseReport) -> ToneValidationSummary {
             .and_then(|count| usize::try_from(count).ok()),
         shadow_visible_saturation_median: f64_metric(phase, "shadow_visible_saturation_median"),
         shadow_visible_saturation_p95: f64_metric(phase, "shadow_visible_saturation_p95"),
+        shadow_visible_rgb_median: f64_vec_metric(phase, "shadow_visible_rgb_median"),
         midtone_saturation_median: f64_metric(phase, "midtone_saturation_median"),
         midtone_saturation_p95: f64_metric(phase, "midtone_saturation_p95"),
+        midtone_rgb_median: f64_vec_metric(phase, "midtone_rgb_median"),
         render_luminance_percentiles: f64_vec_metric(phase, "render_luminance_percentiles"),
         render_luminance_range_p05_p95: f64_metric(phase, "render_luminance_range_p05_p95"),
         midtone_luminance_percentiles: f64_vec_metric(phase, "midtone_luminance_percentiles"),
@@ -6907,6 +6950,7 @@ fn summarize_tone(phase: &PhaseReport) -> ToneValidationSummary {
             .and_then(|count| usize::try_from(count).ok()),
         midtone_neutral_saturation_median: f64_metric(phase, "midtone_neutral_saturation_median"),
         midtone_neutral_saturation_p95: f64_metric(phase, "midtone_neutral_saturation_p95"),
+        midtone_neutral_rgb_median: f64_vec_metric(phase, "midtone_neutral_rgb_median"),
         midtone_saturated_saturation_median: f64_metric(
             phase,
             "midtone_saturated_saturation_median",
@@ -6914,6 +6958,7 @@ fn summarize_tone(phase: &PhaseReport) -> ToneValidationSummary {
         midtone_saturated_saturation_p95: f64_metric(phase, "midtone_saturated_saturation_p95"),
         bright_neutral_saturation_median: f64_metric(phase, "bright_neutral_saturation_median"),
         bright_neutral_saturation_p95: f64_metric(phase, "bright_neutral_saturation_p95"),
+        bright_neutral_rgb_median: f64_vec_metric(phase, "bright_neutral_rgb_median"),
         bright_saturated_saturation_median: f64_metric(phase, "bright_saturated_saturation_median"),
         bright_saturated_saturation_p95: f64_metric(phase, "bright_saturated_saturation_p95"),
         post_chroma_compression_clipped_high_ratio: f64_vec_metric(
@@ -7049,21 +7094,26 @@ fn empty_tone_summary() -> ToneValidationSummary {
         color_protection_reason: None,
         shadow_saturation_median: None,
         shadow_saturation_p95: None,
+        shadow_rgb_median: None,
         shadow_visible_pixel_count: None,
         shadow_visible_saturation_median: None,
         shadow_visible_saturation_p95: None,
+        shadow_visible_rgb_median: None,
         midtone_saturation_median: None,
         midtone_saturation_p95: None,
+        midtone_rgb_median: None,
         render_luminance_percentiles: None,
         render_luminance_range_p05_p95: None,
         midtone_luminance_percentiles: None,
         midtone_neutral_pixel_count: None,
         midtone_neutral_saturation_median: None,
         midtone_neutral_saturation_p95: None,
+        midtone_neutral_rgb_median: None,
         midtone_saturated_saturation_median: None,
         midtone_saturated_saturation_p95: None,
         bright_neutral_saturation_median: None,
         bright_neutral_saturation_p95: None,
+        bright_neutral_rgb_median: None,
         bright_saturated_saturation_median: None,
         bright_saturated_saturation_p95: None,
         post_chroma_compression_clipped_high_ratio: None,

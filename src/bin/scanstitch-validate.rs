@@ -1172,6 +1172,11 @@ struct RollSuiteEntry {
     midtone_neutral_pixel_count: Option<usize>,
     midtone_neutral_saturation_p95: Option<f64>,
     bright_neutral_saturation_p95: Option<f64>,
+    shadow_rgb_median: Option<Vec<f64>>,
+    shadow_visible_rgb_median: Option<Vec<f64>>,
+    midtone_rgb_median: Option<Vec<f64>>,
+    midtone_neutral_rgb_median: Option<Vec<f64>>,
+    bright_neutral_rgb_median: Option<Vec<f64>>,
     shadow_rgb_balance_delta: Option<f64>,
     shadow_visible_rgb_balance_delta: Option<f64>,
     midtone_rgb_balance_delta: Option<f64>,
@@ -4413,6 +4418,18 @@ fn optional_usize(value: Option<usize>) -> String {
 fn optional_f64(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.3}"))
+        .unwrap_or_else(|| "not set".to_string())
+}
+
+fn optional_f64_vec(value: Option<&[f64]>) -> String {
+    value
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| format!("{value:.3}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
         .unwrap_or_else(|| "not set".to_string())
 }
 
@@ -7741,6 +7758,11 @@ fn run_roll_suite_entry(
         midtone_neutral_pixel_count: None,
         midtone_neutral_saturation_p95: None,
         bright_neutral_saturation_p95: None,
+        shadow_rgb_median: None,
+        shadow_visible_rgb_median: None,
+        midtone_rgb_median: None,
+        midtone_neutral_rgb_median: None,
+        bright_neutral_rgb_median: None,
         shadow_rgb_balance_delta: None,
         shadow_visible_rgb_balance_delta: None,
         midtone_rgb_balance_delta: None,
@@ -7897,10 +7919,12 @@ fn run_roll_suite_entry(
     entry.midtone_luminance_p50 =
         nth_f64_slice(summary.tone.midtone_luminance_percentiles.as_deref(), 1);
     entry.shadow_saturation_p95 = summary.tone.shadow_saturation_p95;
+    entry.shadow_rgb_median = summary.tone.shadow_rgb_median.clone();
     entry.shadow_visible_pixel_count =
         phase_usize_metric(&report, "tone_mapping", "shadow_visible_pixel_count");
     if entry.shadow_visible_pixel_count.unwrap_or(0) > 0 {
         entry.shadow_visible_saturation_p95 = summary.tone.shadow_visible_saturation_p95;
+        entry.shadow_visible_rgb_median = summary.tone.shadow_visible_rgb_median.clone();
         entry.shadow_visible_rgb_balance_delta =
             tone_rgb_balance_delta(&report, "shadow_visible_rgb_median");
     }
@@ -7908,10 +7932,13 @@ fn run_roll_suite_entry(
         phase_usize_metric(&report, "tone_mapping", "midtone_neutral_pixel_count");
     if entry.midtone_neutral_pixel_count.unwrap_or(0) > 0 {
         entry.midtone_neutral_saturation_p95 = summary.tone.midtone_neutral_saturation_p95;
+        entry.midtone_neutral_rgb_median = summary.tone.midtone_neutral_rgb_median.clone();
         entry.midtone_neutral_rgb_balance_delta =
             tone_rgb_balance_delta(&report, "midtone_neutral_rgb_median");
     }
     entry.bright_neutral_saturation_p95 = summary.tone.bright_neutral_saturation_p95;
+    entry.midtone_rgb_median = summary.tone.midtone_rgb_median.clone();
+    entry.bright_neutral_rgb_median = summary.tone.bright_neutral_rgb_median.clone();
     entry.shadow_rgb_balance_delta = tone_rgb_balance_delta(&report, "shadow_rgb_median");
     entry.midtone_rgb_balance_delta = tone_rgb_balance_delta(&report, "midtone_rgb_median");
     entry.bright_neutral_rgb_balance_delta =
@@ -8858,11 +8885,11 @@ fn roll_suite_to_markdown(summary: &RollSuiteSummary) -> String {
         ));
     }
     md.push_str("\n## Frame Quality Diagnostics\n\n");
-    md.push_str("| Frame | Render p05 | Render p50 | Render p95 | Render Range | Midtone p50 | Shadow Sat p95 | Mid Neutral Count | Mid Neutral Sat p95 | Bright Neutral Sat p95 | Shadow RGB Delta | Midtone RGB Delta | Mid Neutral RGB Delta | Bright RGB Delta | Luma p95 | Chroma p95 | Chroma:Luma | Flat % | Flat Luma p95 | Flat Chroma p95 | Flat C:L | Denoise | Texture Limit | Saturation Limit | Mean C Delta | Mean L Delta | Preserve | Highlight Comp | Shadow Comp | Clip High | Clip Low |\n");
-    md.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    md.push_str("| Frame | Render p05 | Render p50 | Render p95 | Render Range | Midtone p50 | Shadow Sat p95 | Mid Neutral Count | Mid Neutral Sat p95 | Bright Neutral Sat p95 | Shadow RGB | Midtone RGB | Mid Neutral RGB | Bright Neutral RGB | Shadow RGB Delta | Midtone RGB Delta | Mid Neutral RGB Delta | Bright RGB Delta | Luma p95 | Chroma p95 | Chroma:Luma | Flat % | Flat Luma p95 | Flat Chroma p95 | Flat C:L | Denoise | Texture Limit | Saturation Limit | Mean C Delta | Mean L Delta | Preserve | Highlight Comp | Shadow Comp | Clip High | Clip Low |\n");
+    md.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
     for frame in &summary.frames {
         md.push_str(&format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             markdown_cell(&frame.name),
             optional_f64(frame.render_luminance_p05),
             optional_f64(frame.render_luminance_p50),
@@ -8876,6 +8903,10 @@ fn roll_suite_to_markdown(summary: &RollSuiteSummary) -> String {
                 .unwrap_or_default(),
             optional_f64(frame.midtone_neutral_saturation_p95),
             optional_f64(frame.bright_neutral_saturation_p95),
+            optional_f64_vec(frame.shadow_rgb_median.as_deref()),
+            optional_f64_vec(frame.midtone_rgb_median.as_deref()),
+            optional_f64_vec(frame.midtone_neutral_rgb_median.as_deref()),
+            optional_f64_vec(frame.bright_neutral_rgb_median.as_deref()),
             optional_f64(frame.shadow_rgb_balance_delta),
             optional_f64(frame.midtone_rgb_balance_delta),
             optional_f64(frame.midtone_neutral_rgb_balance_delta),

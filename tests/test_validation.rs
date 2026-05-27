@@ -555,13 +555,21 @@ fn fixture_report() -> PipelineReport {
             "color_protection_policy": "enabled",
             "color_trust_state": "trusted",
             "color_protection_reason": "enabled from colorspace candidate `neutral_balance_fallback` with quality score 0.420",
+            "shadow_rgb_median": [0.14, 0.13, 0.12],
+            "shadow_visible_pixel_count": 120,
+            "shadow_visible_rgb_median": [0.18, 0.17, 0.16],
             "midtone_saturation_median": 0.18,
             "midtone_saturation_p95": 0.42,
+            "midtone_rgb_median": [0.49, 0.48, 0.47],
             "render_luminance_percentiles": [0.04, 0.48, 0.94],
             "render_luminance_range_p05_p95": 0.90,
             "midtone_luminance_percentiles": [0.33, 0.48, 0.61],
+            "midtone_neutral_pixel_count": 512,
+            "midtone_neutral_saturation_p95": 0.05,
+            "midtone_neutral_rgb_median": [0.50, 0.49, 0.48],
             "bright_neutral_saturation_median": 0.04,
             "bright_neutral_saturation_p95": 0.08,
+            "bright_neutral_rgb_median": [0.88, 0.86, 0.84],
             "bright_saturated_saturation_median": 0.63,
             "bright_saturated_saturation_p95": 0.81,
             "post_chroma_compression_clipped_high_ratio": [0.0, 0.0, 0.002],
@@ -1106,6 +1114,19 @@ fn test_validation_summary_extracts_standard_report_fields() {
     );
     assert_eq!(summary.tone.render_luminance_range_p05_p95, Some(0.90));
     assert_eq!(summary.tone.bright_neutral_saturation_p95, Some(0.08));
+    assert_eq!(summary.tone.shadow_rgb_median, Some(vec![0.14, 0.13, 0.12]));
+    assert_eq!(
+        summary.tone.midtone_rgb_median,
+        Some(vec![0.49, 0.48, 0.47])
+    );
+    assert_eq!(
+        summary.tone.midtone_neutral_rgb_median,
+        Some(vec![0.50, 0.49, 0.48])
+    );
+    assert_eq!(
+        summary.tone.bright_neutral_rgb_median,
+        Some(vec![0.88, 0.86, 0.84])
+    );
     assert_eq!(
         summary.tone.color_protection_policy.as_deref(),
         Some("enabled")
@@ -1456,6 +1477,7 @@ fn test_validation_summary_markdown_is_compact() {
     assert!(markdown.contains("high_frequency_flat_chroma_residual_p95"));
     assert!(markdown.contains("neutral_balance_weak_anchor_fallback"));
     assert!(markdown.contains("bright_neutral_saturation_p95"));
+    assert!(markdown.contains("bright_neutral_rgb_median"));
     assert!(markdown.contains("colorspace matrix has weak dominant-channel anchor support"));
 }
 
@@ -4878,6 +4900,10 @@ fn test_validate_cli_roll_suite_applies_roll_consensus_base_source() {
                     && frame.get("midtone_neutral_pixel_count").is_some()
                     && frame.get("midtone_neutral_saturation_p95").is_some()
                     && frame.get("bright_neutral_saturation_p95").is_some()
+                    && frame.get("shadow_rgb_median").is_some()
+                    && frame.get("midtone_rgb_median").is_some()
+                    && frame.get("midtone_neutral_rgb_median").is_some()
+                    && frame.get("bright_neutral_rgb_median").is_some()
                     && frame.get("shadow_rgb_balance_delta").is_some()
                     && frame.get("midtone_rgb_balance_delta").is_some()
                     && frame.get("midtone_neutral_rgb_balance_delta").is_some()
@@ -4900,6 +4926,7 @@ fn test_validate_cli_roll_suite_applies_roll_consensus_base_source() {
     assert!(summary_md.contains("Mid Neutral"));
     assert!(summary_md.contains("Flat Chroma"));
     assert!(summary_md.contains("RGB Delta"));
+    assert!(summary_md.contains("Bright Neutral RGB"));
     assert!(summary_md.contains("Frame Quality Diagnostics"));
 
     let subset_summary_json = tmp.path().join("roll-suite-subset.json");
