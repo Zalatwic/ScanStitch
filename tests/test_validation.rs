@@ -4222,6 +4222,86 @@ fn test_validate_cli_roll_inventory_writes_fixture_metadata_template() {
 }
 
 #[test]
+fn test_validate_cli_roll_fixture_metadata_template_refresh_preserves_curated_entries() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let roll_dir = tmp.path().join("TESTROLL");
+    std::fs::create_dir_all(&roll_dir).unwrap();
+    write_rgba8_tiff(&roll_dir.join("RAW_0000.tif"), 4, 3);
+    write_rgba8_tiff(&roll_dir.join("RAW_0001.tif"), 4, 3);
+
+    let existing_metadata = tmp.path().join("existing-roll-fixture-metadata.json");
+    std::fs::write(
+        &existing_metadata,
+        serde_json::json!({
+            "coverage_requirements": {
+                "required_scene_tags": ["skin-tone"]
+            },
+            "frames": {
+                "RAW_0000": {
+                    "film_stock": "Kodak Portra 400",
+                    "scene_tags": ["skin-tone"],
+                    "exposure_tags": ["normal-exposure"],
+                    "reference_evidence": ["gray-card"],
+                    "calibration_case": "uncalibrated-image-derived",
+                    "description": "Curated frame metadata from local notes"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let refreshed_template = tmp.path().join("refreshed-roll-fixture-metadata.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--roll-dir")
+        .arg(&roll_dir)
+        .arg("--roll-inventory")
+        .arg("--quiet")
+        .arg("--roll-fixture-metadata")
+        .arg(&existing_metadata)
+        .arg("--write-roll-fixture-metadata-template")
+        .arg(&refreshed_template)
+        .output()
+        .expect("refresh roll fixture metadata template");
+
+    assert!(
+        output.status.success(),
+        "roll metadata template refresh failed: status={} stderr={} stdout={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let template: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&refreshed_template).unwrap()).unwrap();
+    assert_eq!(
+        template["coverage_requirements"]["required_scene_tags"],
+        serde_json::json!(["skin-tone"])
+    );
+    let frames = template["frames"].as_object().unwrap();
+    assert_eq!(frames.len(), 2);
+    assert_eq!(
+        template["frames"]["RAW_0000"]["film_stock"],
+        "Kodak Portra 400"
+    );
+    assert_eq!(
+        template["frames"]["RAW_0000"]["reference_evidence"],
+        serde_json::json!(["gray-card"])
+    );
+    assert_eq!(
+        template["frames"]["RAW_0000"]["description"],
+        "Curated frame metadata from local notes"
+    );
+    assert_eq!(
+        template["frames"]["RAW_0001"]["calibration_case"],
+        "uncalibrated-image-derived"
+    );
+    assert!(template["frames"]["RAW_0001"]["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("TODO")));
+}
+
+#[test]
 fn test_validate_cli_roll_inventory_applies_fixture_metadata_sidecar() {
     let tmp = tempfile::TempDir::new().unwrap();
     let roll_dir = tmp.path().join("TESTROLL");

@@ -1279,8 +1279,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("--roll-fixture-scene-tag and --roll-fixture-exposure-tag require --write-roll-fixture-registry or --write-roll-fixture-metadata-template".into());
     }
-    if cli.roll_fixture_metadata.is_some() && cli.write_roll_fixture_registry.is_none() {
-        return Err("--roll-fixture-metadata requires --write-roll-fixture-registry".into());
+    if cli.roll_fixture_metadata.is_some()
+        && cli.write_roll_fixture_registry.is_none()
+        && cli.write_roll_fixture_metadata_template.is_none()
+    {
+        return Err("--roll-fixture-metadata requires --write-roll-fixture-registry or --write-roll-fixture-metadata-template".into());
     }
 
     if cli.list_fixtures {
@@ -5725,6 +5728,7 @@ fn roll_fixture_metadata_template(
     cli: &ValidationCli,
     inventory: &RollInventorySummary,
 ) -> Result<RollFixtureMetadata, Box<dyn std::error::Error>> {
+    let existing_metadata = load_roll_fixture_metadata(cli.roll_fixture_metadata.as_ref())?;
     let scene_tags =
         normalized_roll_fixture_labels("--roll-fixture-scene-tag", &cli.roll_fixture_scene_tags)?;
     let exposure_tags = normalized_roll_fixture_labels(
@@ -5742,7 +5746,19 @@ fn roll_fixture_metadata_template(
     }
 
     let mut frames = BTreeMap::new();
+    let mut matched_metadata_keys = BTreeSet::new();
+    let roll_slug = slug_label(&inventory.roll_name);
     for frame in selected_frames.into_iter().filter(|frame| frame.usable) {
+        let frame_slug = roll_frame_slug(frame);
+        let fixture_name = format!("{roll_slug}-{frame_slug}");
+        if let Some((metadata_key, entry)) =
+            roll_fixture_metadata_entry_for_frame(existing_metadata.as_ref(), frame, &fixture_name)?
+        {
+            matched_metadata_keys.insert(metadata_key.to_string());
+            frames.insert(frame.stem.clone(), entry.clone());
+            continue;
+        }
+
         frames.insert(
             frame.stem.clone(),
             RollFixtureMetadataEntry {
@@ -5772,8 +5788,27 @@ fn roll_fixture_metadata_template(
         return Err("--write-roll-fixture-metadata-template found no usable frames".into());
     }
 
+    if let Some(metadata) = &existing_metadata {
+        let unmatched_keys = metadata
+            .frames
+            .keys()
+            .filter(|key| !matched_metadata_keys.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unmatched_keys.is_empty() {
+            return Err(format!(
+                "--roll-fixture-metadata contains frame key(s) that did not match selected usable inventory frames while refreshing template: {}",
+                unmatched_keys.join(", ")
+            )
+            .into());
+        }
+    }
+
     Ok(RollFixtureMetadata {
-        coverage_requirements: FixtureCoverageRequirements::default(),
+        coverage_requirements: existing_metadata
+            .as_ref()
+            .map(|metadata| metadata.coverage_requirements.clone())
+            .unwrap_or_default(),
         frames,
     })
 }

@@ -203,11 +203,13 @@ For per-frame curation, keep a private ignored JSON sidecar and pass it with
 `--write-roll-fixture-metadata-template`; repeated or comma-separated `--roll-suite-frame`
 selectors limit the template to a curated subset. Template frame keys use the frame stem by
 default, and sidecar frame keys may be the frame filename, stem, slug, or generated fixture name.
-Sidecar metadata overrides only the fields it declares; unspecified entries keep the writer
-defaults. Unknown sidecar frame keys are rejected so a typo cannot silently drop required scene,
-exposure, calibration, or reference evidence. The generated template is not corpus proof by itself;
-replace the `TODO` descriptions and add only factual film-stock, scene, exposure, calibration, and
-reference fields.
+To refresh an existing partially curated sidecar, pass it with `--roll-fixture-metadata` alongside
+`--write-roll-fixture-metadata-template`; matching entries are preserved, newly discovered selected
+frames get `TODO` entries, and unmatched sidecar keys are rejected. Sidecar metadata overrides only
+the fields it declares; unspecified entries keep the writer defaults. Unknown sidecar frame keys are
+rejected so a typo cannot silently drop required scene, exposure, calibration, or reference evidence.
+The generated template is not corpus proof by itself; replace the `TODO` descriptions and add only
+factual film-stock, scene, exposure, calibration, and reference fields.
 
 ```json
 {
