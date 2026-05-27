@@ -178,6 +178,7 @@ cargo run --release --bin scanstitch-validate -- `
   --film-stock "Kodak Gold 200" `
   --roll-fixture-scene-tag outdoor,skin `
   --roll-fixture-exposure-tag normal-exposure `
+  --write-roll-fixture-metadata-template local-fixtures/testroll-metadata-template.json `
   --roll-fixture-metadata local-fixtures/testroll-metadata.json `
   --write-roll-fixture-registry local-fixtures/testroll-fixtures.json `
   --summary-json output/validation/testroll-inventory.json `
@@ -198,10 +199,15 @@ baselines with `--write-fixture-suite-baselines`, run fixture coverage with
 for strict reruns.
 
 For per-frame curation, keep a private ignored JSON sidecar and pass it with
-`--roll-fixture-metadata`. Frame keys may be the frame filename, stem, slug, or generated fixture
-name. Sidecar metadata overrides only the fields it declares; unspecified entries keep the writer
+`--roll-fixture-metadata`. Start one from the current inventory with
+`--write-roll-fixture-metadata-template`; repeated or comma-separated `--roll-suite-frame`
+selectors limit the template to a curated subset. Template frame keys use the frame stem by
+default, and sidecar frame keys may be the frame filename, stem, slug, or generated fixture name.
+Sidecar metadata overrides only the fields it declares; unspecified entries keep the writer
 defaults. Unknown sidecar frame keys are rejected so a typo cannot silently drop required scene,
-exposure, calibration, or reference evidence.
+exposure, calibration, or reference evidence. The generated template is not corpus proof by itself;
+replace the `TODO` descriptions and add only factual film-stock, scene, exposure, calibration, and
+reference fields.
 
 ```json
 {

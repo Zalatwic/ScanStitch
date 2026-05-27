@@ -90,6 +90,10 @@ struct ValidationCli {
     #[arg(long)]
     roll_fixture_metadata: Option<PathBuf>,
 
+    /// Write a per-frame metadata sidecar template from usable --roll-inventory frames.
+    #[arg(long)]
+    write_roll_fixture_metadata_template: Option<PathBuf>,
+
     /// Internal worker mode used to isolate one roll-suite render in a child process.
     #[arg(long, hide = true, default_value_t = false)]
     roll_suite_child: bool,
@@ -1263,17 +1267,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !cli.roll_suite
         && !cli.roll_suite_frames.is_empty()
         && cli.write_roll_fixture_registry.is_none()
+        && cli.write_roll_fixture_metadata_template.is_none()
     {
         return Err(
-            "--roll-suite-frame requires --roll-suite or --write-roll-fixture-registry".into(),
+            "--roll-suite-frame requires --roll-suite, --write-roll-fixture-registry, or --write-roll-fixture-metadata-template".into(),
         );
     }
     if cli.write_roll_fixture_registry.is_none()
-        && (!cli.roll_fixture_scene_tags.is_empty()
-            || !cli.roll_fixture_exposure_tags.is_empty()
-            || cli.roll_fixture_metadata.is_some())
+        && cli.write_roll_fixture_metadata_template.is_none()
+        && (!cli.roll_fixture_scene_tags.is_empty() || !cli.roll_fixture_exposure_tags.is_empty())
     {
-        return Err("--roll-fixture-scene-tag, --roll-fixture-exposure-tag, and --roll-fixture-metadata require --write-roll-fixture-registry".into());
+        return Err("--roll-fixture-scene-tag and --roll-fixture-exposure-tag require --write-roll-fixture-registry or --write-roll-fixture-metadata-template".into());
+    }
+    if cli.roll_fixture_metadata.is_some() && cli.write_roll_fixture_registry.is_none() {
+        return Err("--roll-fixture-metadata requires --write-roll-fixture-registry".into());
     }
 
     if cli.list_fixtures {
@@ -1414,6 +1421,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .expect("roll fixture registry JSON should serialize");
             write_text(registry_path, &registry_contents)?;
         }
+        if let Some(metadata_template_path) = &cli.write_roll_fixture_metadata_template {
+            let metadata = roll_fixture_metadata_template(&cli, &summary)?;
+            let mut metadata_json =
+                serde_json::to_value(&metadata).expect("roll fixture metadata should serialize");
+            strip_empty_registry_snapshot_values(&mut metadata_json);
+            let metadata_contents = serde_json::to_string_pretty(&metadata_json)
+                .expect("roll fixture metadata JSON should serialize");
+            write_text(metadata_template_path, &metadata_contents)?;
+        }
         if cli.print_json_summary {
             println!("{json_summary}");
         }
@@ -1422,6 +1438,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("roll_inventory_md={}", md_path.display());
             if let Some(registry_path) = &cli.write_roll_fixture_registry {
                 println!("roll_fixture_registry={}", registry_path.display());
+            }
+            if let Some(metadata_template_path) = &cli.write_roll_fixture_metadata_template {
+                println!(
+                    "roll_fixture_metadata_template={}",
+                    metadata_template_path.display()
+                );
             }
             println!(
                 "roll_inventory_status={} frames={} usable={} issues={}",
@@ -5296,9 +5318,10 @@ fn validate_roll_inputs(cli: &ValidationCli) -> Result<(), Box<dyn std::error::E
     if !cli.roll_suite
         && !cli.roll_suite_frames.is_empty()
         && cli.write_roll_fixture_registry.is_none()
+        && cli.write_roll_fixture_metadata_template.is_none()
     {
         return Err(
-            "--roll-suite-frame requires --roll-suite or --write-roll-fixture-registry".into(),
+            "--roll-suite-frame requires --roll-suite, --write-roll-fixture-registry, or --write-roll-fixture-metadata-template".into(),
         );
     }
     if cli.write_roll_fixture_registry.is_some() && !cli.roll_inventory {
@@ -5306,6 +5329,14 @@ fn validate_roll_inputs(cli: &ValidationCli) -> Result<(), Box<dyn std::error::E
     }
     if cli.write_roll_fixture_registry.is_some() && cli.roll_suite {
         return Err("--write-roll-fixture-registry cannot be combined with --roll-suite".into());
+    }
+    if cli.write_roll_fixture_metadata_template.is_some() && !cli.roll_inventory {
+        return Err("--write-roll-fixture-metadata-template requires --roll-inventory".into());
+    }
+    if cli.write_roll_fixture_metadata_template.is_some() && cli.roll_suite {
+        return Err(
+            "--write-roll-fixture-metadata-template cannot be combined with --roll-suite".into(),
+        );
     }
     if cli.write_roll_fixture_registry.is_some()
         && cli.calibration_profile.is_some()
@@ -5688,6 +5719,63 @@ fn validate_roll_fixture_metadata(
         .into());
     }
     Ok(())
+}
+
+fn roll_fixture_metadata_template(
+    cli: &ValidationCli,
+    inventory: &RollInventorySummary,
+) -> Result<RollFixtureMetadata, Box<dyn std::error::Error>> {
+    let scene_tags =
+        normalized_roll_fixture_labels("--roll-fixture-scene-tag", &cli.roll_fixture_scene_tags)?;
+    let exposure_tags = normalized_roll_fixture_labels(
+        "--roll-fixture-exposure-tag",
+        &cli.roll_fixture_exposure_tags,
+    )?;
+    let mut selection_issues = Vec::new();
+    let selected_frames = roll_suite_render_frames(cli, &inventory.frames, &mut selection_issues);
+    if !selection_issues.is_empty() {
+        return Err(format!(
+            "--write-roll-fixture-metadata-template frame selection failed: {}",
+            selection_issues.join(", ")
+        )
+        .into());
+    }
+
+    let mut frames = BTreeMap::new();
+    for frame in selected_frames.into_iter().filter(|frame| frame.usable) {
+        frames.insert(
+            frame.stem.clone(),
+            RollFixtureMetadataEntry {
+                calibration_profile: cli.calibration_profile.clone(),
+                calibration_profile_sha256: None,
+                calibration_library: cli.calibration_library.clone(),
+                calibration_library_sha256: None,
+                scanner_profile: cli.scanner_profile.clone(),
+                roll_profile: cli.roll_profile.clone(),
+                film_stock: cli.film_stock.clone(),
+                scene_tags: (!scene_tags.is_empty()).then_some(scene_tags.clone()),
+                exposure_tags: (!exposure_tags.is_empty()).then_some(exposure_tags.clone()),
+                reference_evidence: None,
+                calibration_case: roll_fixture_calibration_case(cli),
+                expectations: FixtureExpectations::default(),
+                summary_baseline: None,
+                summary_baseline_sha256: None,
+                description: Some(format!(
+                    "TODO: curate factual fixture metadata for {}",
+                    frame.name
+                )),
+            },
+        );
+    }
+
+    if frames.is_empty() {
+        return Err("--write-roll-fixture-metadata-template found no usable frames".into());
+    }
+
+    Ok(RollFixtureMetadata {
+        coverage_requirements: FixtureCoverageRequirements::default(),
+        frames,
+    })
 }
 
 fn roll_fixture_metadata_entry_for_frame<'a>(

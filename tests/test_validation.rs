@@ -4169,6 +4169,59 @@ fn test_validate_cli_roll_inventory_writes_fixture_registry_scaffold() {
 }
 
 #[test]
+fn test_validate_cli_roll_inventory_writes_fixture_metadata_template() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let roll_dir = tmp.path().join("TESTROLL");
+    std::fs::create_dir_all(&roll_dir).unwrap();
+    write_rgba8_tiff(&roll_dir.join("RAW_0000.tif"), 4, 3);
+    write_rgba8_tiff(&roll_dir.join("RAW_0001.tif"), 4, 3);
+
+    let template_path = tmp.path().join("roll-fixture-metadata-template.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--roll-dir")
+        .arg(&roll_dir)
+        .arg("--roll-inventory")
+        .arg("--quiet")
+        .arg("--roll-suite-frame")
+        .arg("RAW_0000")
+        .arg("--film-stock")
+        .arg("Kodak Gold 200")
+        .arg("--roll-fixture-scene-tag")
+        .arg("outdoor")
+        .arg("--roll-fixture-exposure-tag")
+        .arg("normal-exposure")
+        .arg("--write-roll-fixture-metadata-template")
+        .arg(&template_path)
+        .output()
+        .expect("run scanstitch-validate roll fixture metadata template writer");
+
+    assert!(
+        output.status.success(),
+        "roll metadata template writer failed: status={} stderr={} stdout={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let template: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&template_path).unwrap()).unwrap();
+    let frames = template["frames"].as_object().unwrap();
+    assert_eq!(frames.len(), 1);
+    let frame = &template["frames"]["RAW_0000"];
+    assert_eq!(frame["film_stock"], "Kodak Gold 200");
+    assert_eq!(frame["scene_tags"], serde_json::json!(["outdoor"]));
+    assert_eq!(
+        frame["exposure_tags"],
+        serde_json::json!(["normal-exposure"])
+    );
+    assert_eq!(frame["calibration_case"], "uncalibrated-image-derived");
+    assert!(frame["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("RAW_0000.tif")));
+    assert!(template.get("coverage_requirements").is_none());
+}
+
+#[test]
 fn test_validate_cli_roll_inventory_applies_fixture_metadata_sidecar() {
     let tmp = tempfile::TempDir::new().unwrap();
     let roll_dir = tmp.path().join("TESTROLL");
@@ -8437,6 +8490,7 @@ fn test_validation_docs_map_local_corpus_scaffold_to_registry_actions() {
         "--roll-fixture-scene-tag",
         "--roll-fixture-exposure-tag",
         "--roll-fixture-metadata",
+        "--write-roll-fixture-metadata-template",
         "testroll-metadata.json",
         "--write-fixture-suite-baselines",
         "--overwrite-fixture-suite-baselines",
