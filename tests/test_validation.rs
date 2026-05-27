@@ -4080,6 +4080,109 @@ fn test_validate_cli_roll_inventory_inspects_scan_dir_and_reports_sequence_gaps(
 }
 
 #[test]
+fn test_validate_cli_roll_inventory_writes_fixture_registry_scaffold() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let roll_dir = tmp.path().join("TESTROLL");
+    std::fs::create_dir_all(&roll_dir).unwrap();
+    let frame0 = roll_dir.join("RAW_0000.tif");
+    let frame1 = roll_dir.join("RAW_0001.tif");
+    write_rgba8_tiff(&frame0, 4, 3);
+    write_rgba8_tiff(&frame1, 4, 3);
+
+    let summary_json = tmp.path().join("roll-inventory.json");
+    let registry_path = tmp.path().join("roll-fixtures.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--roll-dir")
+        .arg(&roll_dir)
+        .arg("--roll-inventory")
+        .arg("--quiet")
+        .arg("--bit-depth")
+        .arg("14")
+        .arg("--roll-suite-frame")
+        .arg("RAW_0000")
+        .arg("--write-roll-fixture-registry")
+        .arg(&registry_path)
+        .arg("--summary-json")
+        .arg(&summary_json)
+        .output()
+        .expect("run scanstitch-validate roll inventory registry scaffold writer");
+
+    assert!(
+        output.status.success(),
+        "roll inventory registry writer failed: status={} stderr={} stdout={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let registry: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&registry_path).unwrap()).unwrap();
+    let fixtures = registry["fixtures"].as_object().unwrap();
+    assert_eq!(fixtures.len(), 1);
+    let fixture = &registry["fixtures"]["testroll-raw-0000"];
+    assert_eq!(fixture["component1"], frame0.display().to_string());
+    assert_eq!(fixture["component2"], frame0.display().to_string());
+    assert_eq!(fixture["input_mode"], "negative");
+    assert_eq!(fixture["bit_depth"], 14);
+    assert_eq!(fixture["force_no_stitch"], true);
+    assert_eq!(
+        fixture["summary_baseline"],
+        std::path::PathBuf::from("local-fixtures")
+            .join("baselines")
+            .join("testroll-raw-0000-summary-baseline.json")
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        fixture["expectations"]["stitch_decision"],
+        "skipped_pre_score"
+    );
+    assert_eq!(
+        fixture["expectations"]["output_color_space"],
+        "linear_prophoto_rgb_d50"
+    );
+    assert_eq!(fixture["calibration_case"], "uncalibrated-image-derived");
+
+    let list_output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--list-fixtures")
+        .output()
+        .expect("load generated roll fixture registry");
+    assert!(
+        list_output.status.success(),
+        "generated registry should load: status={} stderr={} stdout={}",
+        list_output.status,
+        String::from_utf8_lossy(&list_output.stderr),
+        String::from_utf8_lossy(&list_output.stdout)
+    );
+}
+
+#[test]
+fn test_validate_cli_roll_fixture_registry_rejects_incomplete_calibration_wiring() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let roll_dir = tmp.path().join("TESTROLL");
+    std::fs::create_dir_all(&roll_dir).unwrap();
+    write_rgba8_tiff(&roll_dir.join("RAW_0000.tif"), 4, 3);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--roll-dir")
+        .arg(&roll_dir)
+        .arg("--roll-inventory")
+        .arg("--quiet")
+        .arg("--scanner-profile")
+        .arg("scanner-a")
+        .arg("--write-roll-fixture-registry")
+        .arg(tmp.path().join("roll-fixtures.json"))
+        .output()
+        .expect("run scanstitch-validate invalid roll fixture registry scaffold writer");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--calibration-library"));
+}
+
+#[test]
 fn test_validate_cli_roll_inventory_positive_flags_negative_like_input() {
     let tmp = tempfile::TempDir::new().unwrap();
     let roll_dir = tmp.path().join("TESTROLL");
@@ -8170,6 +8273,7 @@ fn test_validation_docs_map_local_corpus_scaffold_to_registry_actions() {
         "low-neutral|underexposed-negative",
         "--compute-fixture-hashes",
         "--write-fixture-hash-registry",
+        "--write-roll-fixture-registry",
         "--write-fixture-suite-baselines",
         "--overwrite-fixture-suite-baselines",
         "--fixture-coverage --strict",

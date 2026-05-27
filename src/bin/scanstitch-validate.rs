@@ -66,6 +66,10 @@ struct ValidationCli {
     #[arg(long, default_value_t = false)]
     roll_inventory: bool,
 
+    /// Write a fixture-registry scaffold from usable --roll-inventory frames.
+    #[arg(long)]
+    write_roll_fixture_registry: Option<PathBuf>,
+
     /// Run every readable scan in --roll-dir as an independent no-stitch validation frame.
     #[arg(long, default_value_t = false)]
     roll_suite: bool,
@@ -1200,8 +1204,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.strict && cli.write_fixture_suite_baselines {
         return Err("--write-fixture-suite-baselines is a corpus-building mode; omit --strict and run a separate strict fixture-suite after accepting the baselines".into());
     }
-    if !cli.roll_suite && !cli.roll_suite_frames.is_empty() {
-        return Err("--roll-suite-frame requires --roll-suite".into());
+    if !cli.roll_suite
+        && !cli.roll_suite_frames.is_empty()
+        && cli.write_roll_fixture_registry.is_none()
+    {
+        return Err(
+            "--roll-suite-frame requires --roll-suite or --write-roll-fixture-registry".into(),
+        );
     }
 
     if cli.list_fixtures {
@@ -1333,12 +1342,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             serde_json::to_string_pretty(&summary).expect("roll inventory should serialize");
         write_text(&json_path, &json_summary)?;
         write_text(&md_path, &roll_inventory_to_markdown(&summary))?;
+        if let Some(registry_path) = &cli.write_roll_fixture_registry {
+            let registry = roll_fixture_registry_scaffold(&cli, &summary)?;
+            let mut registry_json =
+                serde_json::to_value(&registry).expect("roll fixture registry should serialize");
+            strip_empty_registry_snapshot_values(&mut registry_json);
+            let registry_contents = serde_json::to_string_pretty(&registry_json)
+                .expect("roll fixture registry JSON should serialize");
+            write_text(registry_path, &registry_contents)?;
+        }
         if cli.print_json_summary {
             println!("{json_summary}");
         }
         if !cli.quiet {
             println!("roll_inventory_json={}", json_path.display());
             println!("roll_inventory_md={}", md_path.display());
+            if let Some(registry_path) = &cli.write_roll_fixture_registry {
+                println!("roll_fixture_registry={}", registry_path.display());
+            }
             println!(
                 "roll_inventory_status={} frames={} usable={} issues={}",
                 summary.status,
@@ -5209,8 +5230,37 @@ fn validate_roll_inputs(cli: &ValidationCli) -> Result<(), Box<dyn std::error::E
     if cli.roll_inventory && cli.compare_roll_suite.is_some() {
         return Err("--compare-roll-suite requires --roll-suite, not --roll-inventory".into());
     }
-    if !cli.roll_suite && !cli.roll_suite_frames.is_empty() {
-        return Err("--roll-suite-frame requires --roll-suite".into());
+    if !cli.roll_suite
+        && !cli.roll_suite_frames.is_empty()
+        && cli.write_roll_fixture_registry.is_none()
+    {
+        return Err(
+            "--roll-suite-frame requires --roll-suite or --write-roll-fixture-registry".into(),
+        );
+    }
+    if cli.write_roll_fixture_registry.is_some() && !cli.roll_inventory {
+        return Err("--write-roll-fixture-registry requires --roll-inventory".into());
+    }
+    if cli.write_roll_fixture_registry.is_some() && cli.roll_suite {
+        return Err("--write-roll-fixture-registry cannot be combined with --roll-suite".into());
+    }
+    if cli.write_roll_fixture_registry.is_some()
+        && cli.calibration_profile.is_some()
+        && cli.calibration_library.is_some()
+    {
+        return Err("--write-roll-fixture-registry cannot scaffold both --calibration-profile and --calibration-library; choose the evidence path for this registry".into());
+    }
+    if cli.write_roll_fixture_registry.is_some()
+        && (cli.scanner_profile.is_some() || cli.roll_profile.is_some())
+        && cli.calibration_library.is_none()
+    {
+        return Err("--write-roll-fixture-registry requires --calibration-library when --scanner-profile or --roll-profile is supplied".into());
+    }
+    if cli.write_roll_fixture_registry.is_some()
+        && cli.roll_profile.is_some()
+        && cli.scanner_profile.is_none()
+    {
+        return Err("--write-roll-fixture-registry requires --scanner-profile when --roll-profile is supplied".into());
     }
     Ok(())
 }
@@ -5309,6 +5359,97 @@ fn run_roll_inventory(cli: &ValidationCli) -> RollInventorySummary {
             frames
         },
         issues,
+    }
+}
+
+fn roll_fixture_registry_scaffold(
+    cli: &ValidationCli,
+    inventory: &RollInventorySummary,
+) -> Result<FixtureRegistry, Box<dyn std::error::Error>> {
+    let roll_slug = slug_label(&inventory.roll_name);
+    let output_root = roll_mode_output_dir(cli);
+    let mut fixtures = BTreeMap::new();
+    let mut selection_issues = Vec::new();
+    let selected_frames = roll_suite_render_frames(cli, &inventory.frames, &mut selection_issues);
+    if !selection_issues.is_empty() {
+        return Err(format!(
+            "--write-roll-fixture-registry frame selection failed: {}",
+            selection_issues.join(", ")
+        )
+        .into());
+    }
+
+    for frame in selected_frames.into_iter().filter(|frame| frame.usable) {
+        let frame_slug = roll_frame_slug(frame);
+        let name = format!("{roll_slug}-{frame_slug}");
+        let component = PathBuf::from(&frame.path);
+        let mut expectations = FixtureExpectations {
+            stitch_decision: Some("skipped_pre_score".to_string()),
+            output_color_space: Some("linear_prophoto_rgb_d50".to_string()),
+            ..FixtureExpectations::default()
+        };
+        if cli.input_mode == InputMode::Positive {
+            expectations.render_input_source = Some("positive_scan_rgb".to_string());
+            expectations.mapping_strategy = Some("positive_rgb_passthrough".to_string());
+        }
+
+        fixtures.insert(
+            name.clone(),
+            FixtureEntry {
+                component1: component.clone(),
+                component2: component,
+                component1_sha256: None,
+                component2_sha256: None,
+                output_dir: Some(output_root.join(&frame_slug)),
+                input_mode: Some(cli.input_mode.as_str().to_string()),
+                bit_depth: Some(cli.bit_depth),
+                force_stitch: false,
+                force_no_stitch: true,
+                calibration_profile: cli.calibration_profile.clone(),
+                calibration_profile_sha256: None,
+                calibration_library: cli.calibration_library.clone(),
+                calibration_library_sha256: None,
+                scanner_profile: cli.scanner_profile.clone(),
+                roll_profile: cli.roll_profile.clone(),
+                film_stock: cli.film_stock.clone(),
+                scene_tags: Vec::new(),
+                exposure_tags: Vec::new(),
+                reference_evidence: Vec::new(),
+                calibration_case: roll_fixture_calibration_case(cli),
+                expectations,
+                summary_baseline: Some(
+                    PathBuf::from("local-fixtures")
+                        .join("baselines")
+                        .join(format!("{name}-summary-baseline.json")),
+                ),
+                summary_baseline_sha256: None,
+                description: Some(format!(
+                    "Scaffolded from roll inventory frame {}",
+                    frame.name
+                )),
+            },
+        );
+    }
+
+    if fixtures.is_empty() {
+        return Err("--write-roll-fixture-registry found no usable frames to scaffold".into());
+    }
+
+    Ok(FixtureRegistry {
+        fixtures,
+        coverage_requirements: FixtureCoverageRequirements::default(),
+    })
+}
+
+fn roll_fixture_calibration_case(cli: &ValidationCli) -> Option<String> {
+    if cli.calibration_profile.is_some() {
+        Some("external-profile".to_string())
+    } else if cli.calibration_library.is_some() && cli.scanner_profile.is_some() {
+        Some("scanner-roll-library".to_string())
+    } else if cli.calibration_library.is_some() {
+        None
+    } else {
+        Some("uncalibrated-image-derived".to_string())
     }
 }
 
@@ -7387,9 +7528,13 @@ fn roll_mode_output_dir(cli: &ValidationCli) -> PathBuf {
 }
 
 fn roll_frame_slug(frame: &RollFrameInspection) -> String {
+    slug_label(&frame.stem)
+}
+
+fn slug_label(label: &str) -> String {
     let mut slug = String::new();
     let mut last_was_dash = false;
-    for ch in frame.stem.chars() {
+    for ch in label.chars() {
         if ch.is_ascii_alphanumeric() {
             slug.push(ch.to_ascii_lowercase());
             last_was_dash = false;

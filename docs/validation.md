@@ -167,6 +167,30 @@ cargo run --release --bin scanstitch-validate -- `
   --summary-md output/validation/testroll/raw-0000-summary.md
 ```
 
+To scaffold a private fixture registry from every usable frame in a roll inventory, write a roll
+fixture registry:
+
+```powershell
+cargo run --release --bin scanstitch-validate -- `
+  --roll-dir TESTROLL `
+  --roll-inventory `
+  --bit-depth 16 `
+  --write-roll-fixture-registry local-fixtures/testroll-fixtures.json `
+  --summary-json output/validation/testroll-inventory.json `
+  --summary-md output/validation/testroll-inventory.md
+```
+
+The writer emits same-path `component1`/`component2` entries with `force_no_stitch: true`, local
+baseline paths under `local-fixtures/baselines/`, per-frame output directories, the selected
+`input_mode`/`bit_depth`, and any supplied calibration profile/library, scanner profile, roll
+profile, or film-stock defaults. It does not invent scene, exposure, or reference-evidence labels;
+add those curated fields before treating the registry as corpus proof. Use repeated or
+comma-separated `--roll-suite-frame <name|stem|slug>` selectors with the writer when only a curated
+representative subset should become fixture entries. After accepting generated baselines with
+`--write-fixture-suite-baselines`, run fixture coverage with
+`--compute-fixture-hashes --write-fixture-hash-registry` to pin the component and baseline hashes
+for strict reruns.
+
 Use `--debug` on a representative frame to verify candidate-comparison and gamut-clipping debug
 artifacts. Unbordered full-frame DNGs may report `base_estimate_source=high_transmittance_fallback`;
 that is a low-confidence finite base estimate used to avoid a zero-base density inversion, not proof
