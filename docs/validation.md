@@ -178,6 +178,7 @@ cargo run --release --bin scanstitch-validate -- `
   --film-stock "Kodak Gold 200" `
   --roll-fixture-scene-tag outdoor,skin `
   --roll-fixture-exposure-tag normal-exposure `
+  --roll-fixture-metadata local-fixtures/testroll-metadata.json `
   --write-roll-fixture-registry local-fixtures/testroll-fixtures.json `
   --summary-json output/validation/testroll-inventory.json `
   --summary-md output/validation/testroll-inventory.md
@@ -195,6 +196,41 @@ writer when only a representative subset should become fixture entries. After ac
 baselines with `--write-fixture-suite-baselines`, run fixture coverage with
 `--compute-fixture-hashes --write-fixture-hash-registry` to pin the component and baseline hashes
 for strict reruns.
+
+For per-frame curation, keep a private ignored JSON sidecar and pass it with
+`--roll-fixture-metadata`. Frame keys may be the frame filename, stem, slug, or generated fixture
+name. Sidecar metadata overrides only the fields it declares; unspecified entries keep the writer
+defaults. Unknown sidecar frame keys are rejected so a typo cannot silently drop required scene,
+exposure, calibration, or reference evidence.
+
+```json
+{
+  "coverage_requirements": {
+    "min_fixtures": 2,
+    "required_scene_tags": ["skin-tone", "foliage"],
+    "required_exposure_tags": ["normal-exposure", "overexposed-negative"],
+    "required_scene_exposure_pairs": [
+      "skin-tone|normal-exposure",
+      "foliage|overexposed-negative"
+    ],
+    "required_debug_artifact_kinds": ["candidate_comparison", "gamut_clipping_map"]
+  },
+  "frames": {
+    "RAW_0000": {
+      "film_stock": "Kodak Gold 200",
+      "scene_tags": ["skin-tone"],
+      "exposure_tags": ["normal-exposure"],
+      "reference_evidence": ["gray-card"],
+      "calibration_case": "uncalibrated-image-derived",
+      "expectations": {
+        "debug_artifacts_required": true,
+        "debug_artifact_kinds_required": ["candidate_comparison"]
+      },
+      "description": "Curated from local roll notes"
+    }
+  }
+}
+```
 
 Use `--debug` on a representative frame to verify candidate-comparison and gamut-clipping debug
 artifacts. Unbordered full-frame DNGs may report `base_estimate_source=high_transmittance_fallback`;

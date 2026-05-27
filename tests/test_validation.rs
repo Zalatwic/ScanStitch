@@ -4169,6 +4169,156 @@ fn test_validate_cli_roll_inventory_writes_fixture_registry_scaffold() {
 }
 
 #[test]
+fn test_validate_cli_roll_inventory_applies_fixture_metadata_sidecar() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let roll_dir = tmp.path().join("TESTROLL");
+    std::fs::create_dir_all(&roll_dir).unwrap();
+    let frame0 = roll_dir.join("RAW_0000.tif");
+    let frame1 = roll_dir.join("RAW_0001.tif");
+    write_rgba8_tiff(&frame0, 4, 3);
+    write_rgba8_tiff(&frame1, 4, 3);
+
+    let metadata_path = tmp.path().join("roll-fixture-metadata.json");
+    std::fs::write(
+        &metadata_path,
+        serde_json::json!({
+            "coverage_requirements": {
+                "min_fixtures": 1,
+                "required_scene_tags": ["skin-tone"],
+                "required_exposure_tags": ["normal-exposure"],
+                "required_scene_exposure_pairs": ["skin-tone|normal-exposure"],
+                "required_debug_artifact_kinds": ["candidate_comparison"]
+            },
+            "frames": {
+                "RAW_0000": {
+                    "film_stock": "Kodak Portra 400",
+                    "scene_tags": ["skin-tone"],
+                    "exposure_tags": ["normal-exposure"],
+                    "reference_evidence": ["gray-card"],
+                    "calibration_case": "uncalibrated-image-derived",
+                    "expectations": {
+                        "candidate_risk": "safe",
+                        "debug_artifacts_required": true,
+                        "debug_artifact_kinds_required": ["candidate_comparison"]
+                    },
+                    "description": "Curated frame metadata from local notes"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let summary_json = tmp.path().join("roll-inventory.json");
+    let registry_path = tmp.path().join("roll-fixtures.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--roll-dir")
+        .arg(&roll_dir)
+        .arg("--roll-inventory")
+        .arg("--quiet")
+        .arg("--bit-depth")
+        .arg("14")
+        .arg("--roll-suite-frame")
+        .arg("RAW_0000")
+        .arg("--roll-fixture-scene-tag")
+        .arg("global-scene")
+        .arg("--roll-fixture-exposure-tag")
+        .arg("global-exposure")
+        .arg("--roll-fixture-metadata")
+        .arg(&metadata_path)
+        .arg("--write-roll-fixture-registry")
+        .arg(&registry_path)
+        .arg("--summary-json")
+        .arg(&summary_json)
+        .output()
+        .expect("run scanstitch-validate roll metadata registry scaffold writer");
+
+    assert!(
+        output.status.success(),
+        "roll metadata registry writer failed: status={} stderr={} stdout={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let registry: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&registry_path).unwrap()).unwrap();
+    let fixture = &registry["fixtures"]["testroll-raw-0000"];
+    assert_eq!(fixture["film_stock"], "Kodak Portra 400");
+    assert_eq!(fixture["scene_tags"], serde_json::json!(["skin-tone"]));
+    assert_eq!(
+        fixture["exposure_tags"],
+        serde_json::json!(["normal-exposure"])
+    );
+    assert_eq!(
+        fixture["reference_evidence"],
+        serde_json::json!(["gray-card"])
+    );
+    assert_eq!(
+        fixture["expectations"]["stitch_decision"],
+        "skipped_pre_score"
+    );
+    assert_eq!(fixture["expectations"]["candidate_risk"], "safe");
+    assert_eq!(fixture["expectations"]["debug_artifacts_required"], true);
+    assert_eq!(
+        fixture["expectations"]["debug_artifact_kinds_required"],
+        serde_json::json!(["candidate_comparison"])
+    );
+    assert_eq!(
+        fixture["description"],
+        "Curated frame metadata from local notes"
+    );
+    assert_eq!(registry["coverage_requirements"]["min_fixtures"], 1);
+    assert_eq!(
+        registry["coverage_requirements"]["required_scene_exposure_pairs"],
+        serde_json::json!(["skin-tone|normal-exposure"])
+    );
+}
+
+#[test]
+fn test_validate_cli_roll_fixture_metadata_rejects_unmatched_frame_key() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let roll_dir = tmp.path().join("TESTROLL");
+    std::fs::create_dir_all(&roll_dir).unwrap();
+    write_rgba8_tiff(&roll_dir.join("RAW_0000.tif"), 4, 3);
+
+    let metadata_path = tmp.path().join("roll-fixture-metadata.json");
+    std::fs::write(
+        &metadata_path,
+        serde_json::json!({
+            "frames": {
+                "RAW_9999": {
+                    "scene_tags": ["skin-tone"],
+                    "exposure_tags": ["normal-exposure"]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--roll-dir")
+        .arg(&roll_dir)
+        .arg("--roll-inventory")
+        .arg("--quiet")
+        .arg("--roll-fixture-metadata")
+        .arg(&metadata_path)
+        .arg("--write-roll-fixture-registry")
+        .arg(tmp.path().join("roll-fixtures.json"))
+        .output()
+        .expect("run scanstitch-validate roll metadata with unmatched frame key");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--roll-fixture-metadata contains frame key(s)")
+            && stderr.contains("RAW_9999"),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+#[test]
 fn test_validate_cli_roll_fixture_registry_rejects_incomplete_calibration_wiring() {
     let tmp = tempfile::TempDir::new().unwrap();
     let roll_dir = tmp.path().join("TESTROLL");
@@ -8286,6 +8436,8 @@ fn test_validation_docs_map_local_corpus_scaffold_to_registry_actions() {
         "--write-roll-fixture-registry",
         "--roll-fixture-scene-tag",
         "--roll-fixture-exposure-tag",
+        "--roll-fixture-metadata",
+        "testroll-metadata.json",
         "--write-fixture-suite-baselines",
         "--overwrite-fixture-suite-baselines",
         "--fixture-coverage --strict",
