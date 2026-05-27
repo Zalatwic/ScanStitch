@@ -389,7 +389,6 @@ pub enum ToneColorProtectionPolicy {
     WeakNeutralBoundedHighlightCleanup,
     WeakNeutralBoundedNeutralCleanup,
     ReviewBoundedNeutralAndShadowCleanup,
-    ReviewBoundedShadowCleanup,
     DisabledColorCandidateReview,
 }
 
@@ -401,7 +400,6 @@ impl ToneColorProtectionPolicy {
             Self::WeakNeutralBoundedHighlightCleanup => "weak_neutral_bounded_highlight_cleanup",
             Self::WeakNeutralBoundedNeutralCleanup => "weak_neutral_bounded_neutral_cleanup",
             Self::ReviewBoundedNeutralAndShadowCleanup => "review_bounded_neutral_shadow_cleanup",
-            Self::ReviewBoundedShadowCleanup => "review_bounded_shadow_cleanup",
             Self::DisabledColorCandidateReview => "disabled_color_candidate_review",
         }
     }
@@ -435,8 +433,7 @@ impl ToneColorProtection {
             ToneColorProtectionPolicy::NeutralHighlightDisabledWeakNeutral
             | ToneColorProtectionPolicy::WeakNeutralBoundedHighlightCleanup
             | ToneColorProtectionPolicy::WeakNeutralBoundedNeutralCleanup => "limited_weak_neutral",
-            ToneColorProtectionPolicy::ReviewBoundedNeutralAndShadowCleanup
-            | ToneColorProtectionPolicy::ReviewBoundedShadowCleanup => "review_required",
+            ToneColorProtectionPolicy::ReviewBoundedNeutralAndShadowCleanup => "review_required",
             ToneColorProtectionPolicy::DisabledColorCandidateReview => "review_required",
         }
     }
@@ -473,11 +470,11 @@ impl ToneColorProtection {
 
         if diagnostics.candidate_risk == "review_model_plausibility" {
             return Self {
-                policy: ToneColorProtectionPolicy::ReviewBoundedShadowCleanup,
-                highlight_neutral_chroma_enabled: false,
-                midtone_neutral_chroma_enabled: false,
+                policy: ToneColorProtectionPolicy::ReviewBoundedNeutralAndShadowCleanup,
+                highlight_neutral_chroma_enabled: true,
+                midtone_neutral_chroma_enabled: true,
                 shadow_chroma_enabled: true,
-                reason: "bounded shadow chroma cleanup remains enabled for model-plausibility review frames to reduce low-tone colour speckle without applying neutral cast cleanup or marking colour trusted".to_string(),
+                reason: "bounded neutral midtone/highlight and shadow chroma cleanup remain enabled for model-plausibility review frames because neutral and anchor evidence are accepted, reducing neutral casts and low-tone colour speckle without marking colour trusted".to_string(),
             };
         }
 

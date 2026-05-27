@@ -1674,12 +1674,14 @@ fn test_synthetic_color_suite_proves_required_decision_edges() {
                 .is_some_and(|ratio| ratio > 0.0)
     }));
     assert!(suite.cases.iter().any(|case| {
-        case.name == "tone_policy_model_review_keeps_bounded_shadow_cleanup"
-            && case.actual_tone_policy.as_deref() == Some("review_bounded_shadow_cleanup")
+        case.name == "tone_policy_model_review_keeps_bounded_neutral_cleanup"
+            && case.actual_tone_policy.as_deref() == Some("review_bounded_neutral_shadow_cleanup")
             && case.actual_tone_policy_color_trust_state.as_deref() == Some("review_required")
-            && case.actual_tone_highlight_neutral_chroma_enabled == Some(false)
+            && case.actual_tone_highlight_neutral_chroma_enabled == Some(true)
             && case.actual_tone_shadow_chroma_enabled == Some(true)
-            && case.actual_tone_highlight_neutral_chroma_compressed_ratio == Some(0.0)
+            && case
+                .actual_tone_highlight_neutral_chroma_compressed_ratio
+                .is_some_and(|ratio| ratio > 0.0)
             && case
                 .actual_tone_shadow_chroma_compressed_ratio
                 .is_some_and(|ratio| ratio > 0.0)
@@ -1783,8 +1785,8 @@ fn test_validate_cli_runs_synthetic_color_suite_strict() {
     assert!(markdown.contains("Tone policy"));
     assert!(markdown.contains("tone_policy_weak_neutral_keeps_bounded_neutral_cleanup"));
     assert!(markdown.contains("weak_neutral_bounded_neutral_cleanup"));
-    assert!(markdown.contains("tone_policy_model_review_keeps_bounded_shadow_cleanup"));
-    assert!(markdown.contains("review_bounded_shadow_cleanup"));
+    assert!(markdown.contains("tone_policy_model_review_keeps_bounded_neutral_cleanup"));
+    assert!(markdown.contains("review_bounded_neutral_shadow_cleanup"));
     assert!(
         markdown.contains("tone_policy_color_review_disables_color_cleanup_preserves_gamut_repair")
     );

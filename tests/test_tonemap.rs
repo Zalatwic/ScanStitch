@@ -1288,7 +1288,7 @@ fn test_tone_policy_anchor_review_keeps_bounded_highlight_and_shadow_cleanup() {
 }
 
 #[test]
-fn test_tone_policy_model_review_keeps_bounded_shadow_cleanup_only() {
+fn test_tone_policy_model_review_keeps_bounded_neutral_and_shadow_cleanup() {
     let params = scanstitch::tonemap::ToneCurveParams {
         domain: scanstitch::tonemap::ToneFitDomain::LinearLuminance,
         midpoint: 0.5,
@@ -1297,9 +1297,10 @@ fn test_tone_policy_model_review_keeps_bounded_shadow_cleanup_only() {
         shoulder_max: 0.995,
     };
     let protection = scanstitch::tonemap::ToneColorProtection {
-        policy: scanstitch::tonemap::ToneColorProtectionPolicy::ReviewBoundedShadowCleanup,
-        highlight_neutral_chroma_enabled: false,
-        midtone_neutral_chroma_enabled: false,
+        policy:
+            scanstitch::tonemap::ToneColorProtectionPolicy::ReviewBoundedNeutralAndShadowCleanup,
+        highlight_neutral_chroma_enabled: true,
+        midtone_neutral_chroma_enabled: true,
         shadow_chroma_enabled: true,
         reason: "synthetic model-plausibility review".to_string(),
     };
@@ -1322,19 +1323,13 @@ fn test_tone_policy_model_review_keeps_bounded_shadow_cleanup_only() {
 
     assert_eq!(
         result.diagnostics.color_protection_policy,
-        "review_bounded_shadow_cleanup"
+        "review_bounded_neutral_shadow_cleanup"
     );
-    assert_eq!(
-        result.diagnostics.highlight_neutral_chroma_compressed_ratio,
-        0.0
-    );
-    assert_eq!(
-        result.diagnostics.midtone_neutral_chroma_compressed_ratio,
-        0.0
-    );
+    assert!(result.diagnostics.highlight_neutral_chroma_compressed_ratio > 0.0);
+    assert!(result.diagnostics.midtone_neutral_chroma_compressed_ratio > 0.0);
     assert!(result.diagnostics.shadow_chroma_compressed_ratio > 0.0);
-    assert!(!result.diagnostics.highlight_neutral_chroma_enabled);
-    assert!(!result.diagnostics.midtone_neutral_chroma_enabled);
+    assert!(result.diagnostics.highlight_neutral_chroma_enabled);
+    assert!(result.diagnostics.midtone_neutral_chroma_enabled);
     assert!(result.diagnostics.shadow_chroma_enabled);
     assert_eq!(result.diagnostics.color_trust_state, "review_required");
 }

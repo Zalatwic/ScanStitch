@@ -269,7 +269,7 @@ fn test_tone_protection_keeps_shadow_cleanup_for_anchor_review() {
 }
 
 #[test]
-fn test_tone_protection_keeps_shadow_cleanup_for_model_review() {
+fn test_tone_protection_keeps_bounded_neutral_cleanup_for_model_review() {
     let mut diagnostics = diagnostics_with_image_matrix_low_clip([0.0, 0.0, 0.0], false);
     diagnostics.candidate_risk = "review_model_plausibility".to_string();
     diagnostics.selected_quality_score = Some(2.8);
@@ -282,10 +282,10 @@ fn test_tone_protection_keeps_shadow_cleanup_for_model_review() {
 
     assert_eq!(
         protection.policy,
-        scanstitch::tonemap::ToneColorProtectionPolicy::ReviewBoundedShadowCleanup
+        scanstitch::tonemap::ToneColorProtectionPolicy::ReviewBoundedNeutralAndShadowCleanup
     );
-    assert!(!protection.highlight_neutral_chroma_enabled);
-    assert!(!protection.midtone_neutral_chroma_enabled);
+    assert!(protection.highlight_neutral_chroma_enabled);
+    assert!(protection.midtone_neutral_chroma_enabled);
     assert!(protection.shadow_chroma_enabled);
     assert_eq!(protection.color_trust_state(), "review_required");
 }
