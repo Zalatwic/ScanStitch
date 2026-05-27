@@ -563,7 +563,7 @@ fn test_tone_fit_uses_perceptual_luminance_domain_for_shadow_heavy_input() {
     );
     assert!(
         fit.diagnostics.mapped_linear_percentiles[1] > 0.31
-            && fit.diagnostics.mapped_linear_percentiles[1] < 0.34,
+            && fit.diagnostics.mapped_linear_percentiles[1] < 0.36,
         "shadow-heavy negative median should be lifted above the old dark placement: {:?}",
         fit.diagnostics.mapped_linear_percentiles
     );
@@ -611,6 +611,78 @@ fn test_tone_fit_softens_shadow_heavy_testroll_frames() {
     assert!(
         fit.diagnostics.mapped_linear_percentiles[2] < 0.90,
         "shadow-heavy highlights should retain headroom after softening: {:?}",
+        fit.diagnostics.mapped_linear_percentiles
+    );
+}
+
+#[test]
+fn test_tone_fit_lifts_testroll_like_shadow_frame_without_pinning_highlights() {
+    let mut img = Array3::<f64>::zeros((100, 100, 3));
+    for y in 0..100 {
+        for x in 0..100 {
+            let lum = if x < 5 {
+                0.0665
+            } else if x < 50 {
+                0.2125
+            } else if x < 95 {
+                0.4555
+            } else {
+                0.58
+            };
+            for c in 0..3 {
+                img[[y, x, c]] = lum;
+            }
+        }
+    }
+
+    let fit = scanstitch::tonemap::fit_tone_params_with_diagnostics(&img);
+
+    assert_eq!(fit.diagnostics.fit_domain, "log2_compressed_luminance");
+    assert!(
+        fit.diagnostics.mapped_linear_percentiles[1] >= 0.332,
+        "TESTROLL-like shadow frame should open above the previous dark placement: input {:?}, mapped {:?}",
+        fit.diagnostics.input_linear_percentiles,
+        fit.diagnostics.mapped_linear_percentiles
+    );
+    assert!(
+        fit.diagnostics.mapped_linear_percentiles[2] < 0.90,
+        "shadow-frame lift should retain highlight headroom: {:?}",
+        fit.diagnostics.mapped_linear_percentiles
+    );
+}
+
+#[test]
+fn test_tone_fit_keeps_midrange_shadow_negatives_from_grain_amplifying_lift() {
+    let mut img = Array3::<f64>::zeros((100, 100, 3));
+    for y in 0..100 {
+        for x in 0..100 {
+            let lum = if x < 5 {
+                0.107
+            } else if x < 50 {
+                0.195
+            } else if x < 95 {
+                0.347
+            } else {
+                0.50
+            };
+            for c in 0..3 {
+                img[[y, x, c]] = lum;
+            }
+        }
+    }
+
+    let fit = scanstitch::tonemap::fit_tone_params_with_diagnostics(&img);
+
+    assert_eq!(fit.diagnostics.fit_domain, "log2_compressed_luminance");
+    assert!(
+        fit.diagnostics.mapped_linear_percentiles[1] > 0.315
+            && fit.diagnostics.mapped_linear_percentiles[1] < 0.325,
+        "mid-range shadow negatives should keep the conservative placement to avoid texture/grain amplification: {:?}",
+        fit.diagnostics.mapped_linear_percentiles
+    );
+    assert!(
+        fit.diagnostics.mapped_linear_percentiles[2] < 0.78,
+        "conservative mid-range shadow placement should retain highlight headroom: {:?}",
         fit.diagnostics.mapped_linear_percentiles
     );
 }
