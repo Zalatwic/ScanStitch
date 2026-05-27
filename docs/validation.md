@@ -29,7 +29,9 @@ Add local fixtures with a registry file shaped like
 [`validation-fixtures.schema.json`](validation-fixtures.schema.json) gives the machine-readable
 draft 2020-12 schema for registry review tools.
 `scanstitch-validate` also rejects unknown registry fields and calibration wiring that violates the
-schema contract before listing, auditing, or running fixtures.
+schema contract before listing, auditing, or running fixtures. Per-frame roll metadata sidecars use
+[`validation-roll-fixture-metadata.schema.json`](validation-roll-fixture-metadata.schema.json),
+which reuses the registry coverage and expectation definitions.
 
 ```powershell
 cargo run --bin scanstitch-validate -- `

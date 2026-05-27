@@ -8514,6 +8514,67 @@ fn test_validation_fixture_registry_schema_and_example_cover_color_corpus_fields
 }
 
 #[test]
+fn test_validation_roll_fixture_metadata_schema_covers_sidecar_contract() {
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../docs/validation-roll-fixture-metadata.schema.json"
+    ))
+    .unwrap();
+    let validation_docs = include_str!("../docs/validation.md");
+
+    assert_eq!(
+        schema["$id"],
+        "https://example.invalid/scanstitch/validation-roll-fixture-metadata.schema.json"
+    );
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["properties"]["coverage_requirements"]["$ref"],
+        "https://example.invalid/scanstitch/validation-fixtures.schema.json#/$defs/coverageRequirements"
+    );
+    assert_eq!(
+        schema["properties"]["frames"]["additionalProperties"]["$ref"],
+        "#/$defs/rollFixtureMetadataEntry"
+    );
+    assert_eq!(schema["$defs"]["sha256Hex"]["pattern"], "^[A-Fa-f0-9]{64}$");
+
+    let entry = &schema["$defs"]["rollFixtureMetadataEntry"];
+    assert_eq!(entry["additionalProperties"], false);
+    for property in [
+        "film_stock",
+        "scene_tags",
+        "exposure_tags",
+        "reference_evidence",
+        "calibration_case",
+        "summary_baseline",
+        "summary_baseline_sha256",
+        "calibration_profile",
+        "calibration_profile_sha256",
+        "calibration_library",
+        "calibration_library_sha256",
+        "scanner_profile",
+        "roll_profile",
+        "description",
+    ] {
+        assert!(
+            entry["properties"][property].is_object(),
+            "roll fixture metadata schema missing `{property}`"
+        );
+    }
+    assert_eq!(
+        entry["properties"]["expectations"]["$ref"],
+        "https://example.invalid/scanstitch/validation-fixtures.schema.json#/$defs/fixtureExpectations"
+    );
+    assert!(
+        entry["allOf"]
+            .as_array()
+            .expect("roll fixture metadata conditionals")
+            .len()
+            >= 4
+    );
+    assert!(validation_docs.contains("validation-roll-fixture-metadata.schema.json"));
+    assert!(validation_docs.contains("--write-roll-fixture-metadata-template"));
+}
+
+#[test]
 fn test_validation_docs_map_local_corpus_scaffold_to_registry_actions() {
     let validation = include_str!("../docs/validation.md");
     let gitignore = include_str!("../.gitignore");
@@ -8571,6 +8632,7 @@ fn test_validation_docs_map_local_corpus_scaffold_to_registry_actions() {
         "--roll-fixture-exposure-tag",
         "--roll-fixture-metadata",
         "--write-roll-fixture-metadata-template",
+        "validation-roll-fixture-metadata.schema.json",
         "testroll-metadata.json",
         "--write-fixture-suite-baselines",
         "--overwrite-fixture-suite-baselines",

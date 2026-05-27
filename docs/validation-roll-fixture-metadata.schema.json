@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/scanstitch/validation-roll-fixture-metadata.schema.json",
+  "title": "ScanStitch Roll Fixture Metadata Sidecar",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "coverage_requirements": {
+      "$ref": "https://example.invalid/scanstitch/validation-fixtures.schema.json#/$defs/coverageRequirements"
+    },
+    "frames": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "$ref": "#/$defs/rollFixtureMetadataEntry" }
+    }
+  },
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "pathString": {
+      "$ref": "#/$defs/nonEmptyString"
+    },
+    "sha256Hex": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$"
+    },
+    "tagList": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/nonEmptyString" }
+    },
+    "rollFixtureMetadataEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "summary_baseline": { "$ref": "#/$defs/pathString" },
+        "summary_baseline_sha256": { "$ref": "#/$defs/sha256Hex" },
+        "calibration_profile": { "$ref": "#/$defs/pathString" },
+        "calibration_profile_sha256": { "$ref": "#/$defs/sha256Hex" },
+        "calibration_library": { "$ref": "#/$defs/pathString" },
+        "calibration_library_sha256": { "$ref": "#/$defs/sha256Hex" },
+        "scanner_profile": { "$ref": "#/$defs/nonEmptyString" },
+        "roll_profile": { "$ref": "#/$defs/nonEmptyString" },
+        "film_stock": { "$ref": "#/$defs/nonEmptyString" },
+        "scene_tags": { "$ref": "#/$defs/tagList" },
+        "exposure_tags": { "$ref": "#/$defs/tagList" },
+        "reference_evidence": { "$ref": "#/$defs/tagList" },
+        "calibration_case": { "$ref": "#/$defs/nonEmptyString" },
+        "expectations": {
+          "$ref": "https://example.invalid/scanstitch/validation-fixtures.schema.json#/$defs/fixtureExpectations"
+        },
+        "description": { "$ref": "#/$defs/nonEmptyString" }
+      },
+      "allOf": [
+        {
+          "not": {
+            "required": ["calibration_profile", "calibration_library"]
+          }
+        },
+        {
+          "if": { "required": ["summary_baseline_sha256"] },
+          "then": { "required": ["summary_baseline"] }
+        },
+        {
+          "if": { "required": ["calibration_profile_sha256"] },
+          "then": { "required": ["calibration_profile"] }
+        },
+        {
+          "if": { "required": ["calibration_library_sha256"] },
+          "then": { "required": ["calibration_library"] }
+        }
+      ]
+    }
+  }
+}
