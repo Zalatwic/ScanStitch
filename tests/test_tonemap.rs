@@ -1075,6 +1075,12 @@ fn test_tonemap_compresses_bright_neutral_chroma_without_moving_luminance() {
         naive_sat
     );
     assert!(
+        out_sat <= naive_sat * 0.60,
+        "upper bright near-neutral cleanup should be strong enough to remove visible cast: out={}, naive={}",
+        out_sat,
+        naive_sat
+    );
+    assert!(
         (out_lum - mapped_lum).abs() < 1e-9,
         "bright neutral compression should preserve mapped luminance: out={}, target={}",
         out_lum,
