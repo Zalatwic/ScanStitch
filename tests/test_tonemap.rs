@@ -568,7 +568,7 @@ fn test_tone_fit_uses_perceptual_luminance_domain_for_shadow_heavy_input() {
         fit.diagnostics.mapped_linear_percentiles
     );
     assert!(
-        fit.diagnostics.mapped_linear_percentiles[2] < 0.93,
+        fit.diagnostics.mapped_linear_percentiles[2] < 0.96,
         "expected the linear 95th percentile to retain highlight headroom after median lift: {:?}",
         fit.diagnostics.mapped_linear_percentiles
     );
@@ -611,6 +611,41 @@ fn test_tone_fit_softens_shadow_heavy_testroll_frames() {
     assert!(
         fit.diagnostics.mapped_linear_percentiles[2] < 0.90,
         "shadow-heavy highlights should retain headroom after softening: {:?}",
+        fit.diagnostics.mapped_linear_percentiles
+    );
+}
+
+#[test]
+fn test_tone_fit_lifts_high_range_shadow_negative_under_soft_shoulder() {
+    let mut img = Array3::<f64>::zeros((100, 100, 3));
+    for y in 0..100 {
+        for x in 0..100 {
+            let lum = if x < 5 {
+                0.078
+            } else if x < 50 {
+                0.117
+            } else if x < 95 {
+                0.367
+            } else {
+                0.54
+            };
+            for c in 0..3 {
+                img[[y, x, c]] = lum;
+            }
+        }
+    }
+
+    let fit = scanstitch::tonemap::fit_tone_params_with_diagnostics(&img);
+
+    assert_eq!(fit.diagnostics.fit_domain, "log2_compressed_luminance");
+    assert!(
+        fit.diagnostics.mapped_linear_percentiles[1] > 0.30,
+        "high-range shadow-heavy negatives should not hold the median at the old dark placement: {:?}",
+        fit.diagnostics.mapped_linear_percentiles
+    );
+    assert!(
+        fit.diagnostics.mapped_linear_percentiles[2] < 0.96,
+        "high-range shadow-heavy negatives should keep p95 below the soft shoulder: {:?}",
         fit.diagnostics.mapped_linear_percentiles
     );
 }

@@ -13,21 +13,21 @@ Weak or unstable colour came mainly from image-derived matrix candidates that pr
 
 - Input mode: `negative`
 - TESTROLL validation bit depth: `16`
-- TESTROLL roll base: `21737.428571,5322,2938`
+- TESTROLL roll base: `56004.818681,22973.258242,12666.899267`
 - Roll base source: `roll_consensus_base`
 - Roll base confidence: `0.98`
-- Roll base reason: selected stable cluster from 9 of 12 frame candidates; 3 darker candidates rejected against the roll high-transmittance envelope
+- Roll base reason: selected stable cluster from 14 of 17 frame candidates; 3 darker candidates rejected against the roll high-transmittance envelope
 - Render input for the final negative checks: `direct-density`
 - Density inversion Dmax percentile: `0.995`
 - Direct-density normalization: `positive_density / shared_robust_d_max` before density-to-transmittance conversion
-- Colour candidate selected on validated TESTROLL negative outputs: `gamut_trusted_image_matrix_blend`
+- Colour candidates selected on validated TESTROLL negative outputs: `gamut_trusted_image_matrix_blend` or `image_derived_matrix`, with review state retained when neutral, anchor, or model-plausibility support is not strong enough for trusted colour
 - Highlight headroom percentile for colour exposure normalization: `0.995`
 - Gamut-trusted blend limits: max low clip per channel `0.01`, total low clip `0.02`
 - Negative low-range tone trigger: linear p95 <= `0.12` and p95-p05 <= `0.045`
 - Negative low-range target median: `0.35`
 - Negative shadow tone trigger: linear p50 <= `0.22`
 - Negative shadow target median: `0.32`
-- Negative shadow highlight guardrail: mapped linear p95 <= `0.92`
+- Negative shadow highlight guardrail: mapped linear p95 <= `0.95`
 - Tone curve: Naka-Rushton, toe `0.005`, shoulder `0.995`
 - Perceptual log-domain gain: `15.0`
 - Highlight chroma repair: enabled to preserve mapped luminance without hard channel clipping
@@ -242,6 +242,21 @@ Fresh TESTROLL DNG model-review shadow cleanup on 2026-05-27:
 - Midtone placement was unchanged: mean/min/max/range stayed `0.403397` / `0.317542` / `0.531507` / `0.213964`. Post-tone clipping stayed `0.000000` high and `0.000000` low, and preserved-gamut minimum stayed `0.981210`.
 - The tradeoff was small and localized: `RAW_0011` chroma residual p95 moved `+0.000599`, and selected-subset chroma residual p95 mean moved `+0.000120`, both below the roll-suite comparator's material regression threshold.
 - Non-TESTROLL guard: `output/validation/old_testroll_model_shadow_cleanup_raw0055_20260527.md` compared `OLD_TESTROLL` `RAW_0055.dng` against `output/validation/old_testroll_chromadamp055_raw0055_20260523.json` with `comparison.status=comparable` and `issues=[]`; the frame remained `candidate_risk=safe`, `tone_color_trust_state=trusted`.
+
+Fresh TESTROLL DNG high-range shadow lift on 2026-05-27:
+
+- Baseline artifact: `output/goal_testroll_highrange_shadow_baseline_subset_20260527.md`
+- Current artifact: `output/goal_testroll_highrange_shadow_lift_subset_20260527.md`
+- Full-roll artifact: `output/goal_testroll_full_highrange_shadow_lift_20260527.md`
+- Visual comparison: `output/goal_testroll_highrange_shadow_lift_before_after_20260527.png`
+- Command: `cargo run --release --locked --bin scanstitch-validate -- --roll-dir TESTROLL --roll-suite --roll-suite-frame RAW_0003,RAW_0004,RAW_0005,RAW_0008,RAW_0010,RAW_0016 --bit-depth 16 --render-input direct-density --input-mode negative --quality-mode balanced --compare-roll-suite output\goal_testroll_highrange_shadow_baseline_subset_20260527.json --output-dir output\goal_testroll_highrange_shadow_lift_subset_20260527 --summary-json output\goal_testroll_highrange_shadow_lift_subset_20260527.json --summary-md output\goal_testroll_highrange_shadow_lift_subset_20260527.md --quiet`
+- Policy change: high-range shadow-heavy negatives now allow the log-domain tone fit to place mapped p95 up to `0.95` instead of `0.92`, so the median target is not unnecessarily pulled back to the old dark placement when highlight clipping remains absent.
+- Focused subset status: `review_required`, with all 6 selected DNG frames rendered and `0` failed frames. The focused comparator reported `comparison.status=comparable` and `issues=[]`.
+- The intended dark-frame lift was localized to `RAW_0003.dng` and `RAW_0004.dng`: midtone p50 improved `0.202524 -> 0.305494` and `0.222864 -> 0.320378`; selected-subset midtone p50 min/range improved `0.202524` / `0.342382 -> 0.305494` / `0.239412`.
+- Highlight detail stayed bounded: `RAW_0003` render p95 moved `0.930267 -> 0.950276`, `RAW_0004` moved `0.920479 -> 0.942079`, and post-tone high clipping stayed `0.000000`.
+- Grain and colour tradeoffs remained inside the roll-suite guardrails: selected-subset chroma residual p95 mean moved `+0.001354`, flat chroma residual p95 mean moved `+0.000709`, preserved-gamut minimum stayed unchanged, and the comparator did not flag material residual, balance, gamut, or clipping regressions.
+- Full 17-frame current-code rerun rendered every DNG with `0` failed frames. Relative to the earlier full baseline, midtone p50 min/range improved `0.202524` / `0.342382 -> 0.305494` / `0.239412`; post-tone high clipping stayed `0.000000`, preserved-gamut minimum stayed `0.978597`, chroma residual p95 mean moved only `+0.000299`, and flat chroma residual p95 mean moved `+0.000283`. The full comparison status remained `review_required` only because the previous full baseline had `RAW_0016.dng` failed and the new run rendered it as reviewable.
+- Non-TESTROLL guards: `output/validation/logan_highrange_shadow_lift_strict_20260527.md` stayed strict-comparable against `tests/fixtures/baselines/logan_summary_baseline.json` with `summary_baseline_status=comparable` and `issues=[]`; `output/validation/old_testroll_highrange_shadow_lift_raw0055_20260527.md` compared `OLD_TESTROLL` `RAW_0055.dng` against `output/validation/old_testroll_chromadamp055_raw0055_20260523.json` with `comparison.status=comparable` and `issues=[]`.
 
 Focused tests run after the audit, anchor-support shadow cleanup, weak-neutral highlight cleanup, saturated-shadow denoise relaxation, shadow-heavy midtone lift, and tightened shadow guard:
 
