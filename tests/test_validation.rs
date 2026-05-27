@@ -4222,6 +4222,67 @@ fn test_validate_cli_roll_inventory_writes_fixture_metadata_template() {
 }
 
 #[test]
+fn test_validate_cli_roll_inventory_writes_contact_sheet_and_index() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let roll_dir = tmp.path().join("TESTROLL");
+    std::fs::create_dir_all(&roll_dir).unwrap();
+    write_rgba8_tiff(&roll_dir.join("RAW_0000.tif"), 4, 3);
+    write_rgba8_tiff(&roll_dir.join("RAW_0001.tif"), 4, 3);
+
+    let sheet_path = tmp.path().join("roll-contact-sheet.png");
+    let index_path = tmp.path().join("roll-contact-sheet.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--roll-dir")
+        .arg(&roll_dir)
+        .arg("--roll-inventory")
+        .arg("--quiet")
+        .arg("--roll-suite-frame")
+        .arg("RAW_0000")
+        .arg("--write-roll-contact-sheet")
+        .arg(&sheet_path)
+        .arg("--write-roll-contact-sheet-index")
+        .arg(&index_path)
+        .output()
+        .expect("run scanstitch-validate roll contact sheet writer");
+
+    assert!(
+        output.status.success(),
+        "roll contact sheet writer failed: status={} stderr={} stdout={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    assert_eq!(image::image_dimensions(&sheet_path).unwrap(), (196, 136));
+    let index: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&index_path).unwrap()).unwrap();
+    assert_eq!(index["contact_sheet"], sheet_path.display().to_string());
+    assert_eq!(index["roll_name"], "TESTROLL");
+    assert_eq!(index["input_mode"], "negative");
+    assert_eq!(index["bit_depth"], serde_json::json!(14));
+    assert_eq!(index["columns"], serde_json::json!(1));
+    assert_eq!(index["rows"], serde_json::json!(1));
+    assert_eq!(index["thumb_width"], serde_json::json!(180));
+    assert_eq!(index["thumb_height"], serde_json::json!(120));
+
+    let frames = index["frames"].as_array().unwrap();
+    assert_eq!(frames.len(), 1);
+    let frame = &frames[0];
+    assert_eq!(frame["name"], "RAW_0000.tif");
+    assert_eq!(frame["stem"], "RAW_0000");
+    assert_eq!(frame["row"], serde_json::json!(0));
+    assert_eq!(frame["column"], serde_json::json!(0));
+    assert_eq!(frame["tile_x"], serde_json::json!(8));
+    assert_eq!(frame["tile_y"], serde_json::json!(8));
+    assert_eq!(frame["source_width"], serde_json::json!(4));
+    assert_eq!(frame["source_height"], serde_json::json!(3));
+    assert_eq!(
+        frame["preview_transform"],
+        "per_channel_stretch_inverted_gamma"
+    );
+}
+
+#[test]
 fn test_validate_cli_roll_fixture_metadata_template_refresh_preserves_curated_entries() {
     let tmp = tempfile::TempDir::new().unwrap();
     let roll_dir = tmp.path().join("TESTROLL");
@@ -8632,6 +8693,9 @@ fn test_validation_docs_map_local_corpus_scaffold_to_registry_actions() {
         "--roll-fixture-exposure-tag",
         "--roll-fixture-metadata",
         "--write-roll-fixture-metadata-template",
+        "--write-roll-contact-sheet",
+        "--write-roll-contact-sheet-index",
+        "contact sheet",
         "validation-roll-fixture-metadata.schema.json",
         "testroll-metadata.json",
         "--write-fixture-suite-baselines",

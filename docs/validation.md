@@ -180,6 +180,8 @@ cargo run --release --bin scanstitch-validate -- `
   --film-stock "Kodak Gold 200" `
   --roll-fixture-scene-tag outdoor,skin `
   --roll-fixture-exposure-tag normal-exposure `
+  --write-roll-contact-sheet output/validation/testroll-contact-sheet.png `
+  --write-roll-contact-sheet-index output/validation/testroll-contact-sheet.json `
   --write-roll-fixture-metadata-template local-fixtures/testroll-metadata-template.json `
   --roll-fixture-metadata local-fixtures/testroll-metadata.json `
   --write-roll-fixture-registry local-fixtures/testroll-fixtures.json `
@@ -205,6 +207,11 @@ For per-frame curation, keep a private ignored JSON sidecar and pass it with
 `--write-roll-fixture-metadata-template`; repeated or comma-separated `--roll-suite-frame`
 selectors limit the template to a curated subset. Template frame keys use the frame stem by
 default, and sidecar frame keys may be the frame filename, stem, slug, or generated fixture name.
+For visual scene and exposure curation, add `--write-roll-contact-sheet` and optionally
+`--write-roll-contact-sheet-index` to the inventory run. The PNG contact sheet uses a fast
+per-channel stretch preview, inverting negative inputs only for visual triage; it is not color
+proof or calibration evidence. The JSON index maps each tile back to its frame key, dimensions, and
+preview transform so curation notes can be copied into the sidecar without guessing from filenames.
 To refresh an existing partially curated sidecar, pass it with `--roll-fixture-metadata` alongside
 `--write-roll-fixture-metadata-template`; matching entries are preserved, newly discovered selected
 frames get `TODO` entries, and unmatched sidecar keys are rejected. Sidecar metadata overrides only

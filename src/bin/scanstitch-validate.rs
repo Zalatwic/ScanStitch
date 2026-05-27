@@ -1,4 +1,5 @@
 use clap::Parser;
+use image::{Rgb, RgbImage};
 use ndarray::Array3;
 use scanstitch::cli::{Cli as PipelineCli, InputMode, QualityMode, RenderInputMode, RenderIntent};
 use scanstitch::colorspace::ColorMode;
@@ -19,6 +20,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const ROLL_BASE_PREPASS_MAX_DIMENSION: usize = 1600;
+const ROLL_CONTACT_SHEET_THUMB_WIDTH: u32 = 180;
+const ROLL_CONTACT_SHEET_THUMB_HEIGHT: u32 = 120;
+const ROLL_CONTACT_SHEET_COLUMNS: usize = 6;
+const ROLL_CONTACT_SHEET_GUTTER: u32 = 8;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -93,6 +98,14 @@ struct ValidationCli {
     /// Write a per-frame metadata sidecar template from usable --roll-inventory frames.
     #[arg(long)]
     write_roll_fixture_metadata_template: Option<PathBuf>,
+
+    /// Write a low-resolution PNG contact sheet from usable --roll-inventory frames.
+    #[arg(long)]
+    write_roll_contact_sheet: Option<PathBuf>,
+
+    /// Write a JSON tile index for --write-roll-contact-sheet.
+    #[arg(long)]
+    write_roll_contact_sheet_index: Option<PathBuf>,
 
     /// Internal worker mode used to isolate one roll-suite render in a child process.
     #[arg(long, hide = true, default_value_t = false)]
@@ -1268,9 +1281,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         && !cli.roll_suite_frames.is_empty()
         && cli.write_roll_fixture_registry.is_none()
         && cli.write_roll_fixture_metadata_template.is_none()
+        && cli.write_roll_contact_sheet.is_none()
     {
         return Err(
-            "--roll-suite-frame requires --roll-suite, --write-roll-fixture-registry, or --write-roll-fixture-metadata-template".into(),
+            "--roll-suite-frame requires --roll-suite, --write-roll-fixture-registry, --write-roll-fixture-metadata-template, or --write-roll-contact-sheet".into(),
         );
     }
     if cli.write_roll_fixture_registry.is_none()
@@ -1284,6 +1298,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         && cli.write_roll_fixture_metadata_template.is_none()
     {
         return Err("--roll-fixture-metadata requires --write-roll-fixture-registry or --write-roll-fixture-metadata-template".into());
+    }
+    if cli.write_roll_contact_sheet_index.is_some() && cli.write_roll_contact_sheet.is_none() {
+        return Err("--write-roll-contact-sheet-index requires --write-roll-contact-sheet".into());
     }
 
     if cli.list_fixtures {
@@ -1433,6 +1450,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .expect("roll fixture metadata JSON should serialize");
             write_text(metadata_template_path, &metadata_contents)?;
         }
+        if let Some(contact_sheet_path) = &cli.write_roll_contact_sheet {
+            write_roll_contact_sheet(
+                &cli,
+                &summary,
+                contact_sheet_path,
+                cli.write_roll_contact_sheet_index.as_ref(),
+            )?;
+        }
         if cli.print_json_summary {
             println!("{json_summary}");
         }
@@ -1446,6 +1471,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "roll_fixture_metadata_template={}",
                     metadata_template_path.display()
+                );
+            }
+            if let Some(contact_sheet_path) = &cli.write_roll_contact_sheet {
+                println!("roll_contact_sheet={}", contact_sheet_path.display());
+            }
+            if let Some(contact_sheet_index_path) = &cli.write_roll_contact_sheet_index {
+                println!(
+                    "roll_contact_sheet_index={}",
+                    contact_sheet_index_path.display()
                 );
             }
             println!(
@@ -5322,9 +5356,10 @@ fn validate_roll_inputs(cli: &ValidationCli) -> Result<(), Box<dyn std::error::E
         && !cli.roll_suite_frames.is_empty()
         && cli.write_roll_fixture_registry.is_none()
         && cli.write_roll_fixture_metadata_template.is_none()
+        && cli.write_roll_contact_sheet.is_none()
     {
         return Err(
-            "--roll-suite-frame requires --roll-suite, --write-roll-fixture-registry, or --write-roll-fixture-metadata-template".into(),
+            "--roll-suite-frame requires --roll-suite, --write-roll-fixture-registry, --write-roll-fixture-metadata-template, or --write-roll-contact-sheet".into(),
         );
     }
     if cli.write_roll_fixture_registry.is_some() && !cli.roll_inventory {
@@ -5340,6 +5375,15 @@ fn validate_roll_inputs(cli: &ValidationCli) -> Result<(), Box<dyn std::error::E
         return Err(
             "--write-roll-fixture-metadata-template cannot be combined with --roll-suite".into(),
         );
+    }
+    if cli.write_roll_contact_sheet.is_some() && !cli.roll_inventory {
+        return Err("--write-roll-contact-sheet requires --roll-inventory".into());
+    }
+    if cli.write_roll_contact_sheet.is_some() && cli.roll_suite {
+        return Err("--write-roll-contact-sheet cannot be combined with --roll-suite".into());
+    }
+    if cli.write_roll_contact_sheet_index.is_some() && cli.write_roll_contact_sheet.is_none() {
+        return Err("--write-roll-contact-sheet-index requires --write-roll-contact-sheet".into());
     }
     if cli.write_roll_fixture_registry.is_some()
         && cli.calibration_profile.is_some()
@@ -5811,6 +5855,188 @@ fn roll_fixture_metadata_template(
             .unwrap_or_default(),
         frames,
     })
+}
+
+fn write_roll_contact_sheet(
+    cli: &ValidationCli,
+    inventory: &RollInventorySummary,
+    sheet_path: &PathBuf,
+    index_path: Option<&PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut selection_issues = Vec::new();
+    let selected_frames = roll_suite_render_frames(cli, &inventory.frames, &mut selection_issues);
+    if !selection_issues.is_empty() {
+        return Err(format!(
+            "--write-roll-contact-sheet frame selection failed: {}",
+            selection_issues.join(", ")
+        )
+        .into());
+    }
+    let frames = selected_frames
+        .into_iter()
+        .filter(|frame| frame.usable)
+        .collect::<Vec<_>>();
+    if frames.is_empty() {
+        return Err("--write-roll-contact-sheet found no usable frames".into());
+    }
+
+    let columns = ROLL_CONTACT_SHEET_COLUMNS.min(frames.len()).max(1);
+    let rows = frames.len().div_ceil(columns);
+    let sheet_width = ROLL_CONTACT_SHEET_GUTTER
+        + columns as u32 * (ROLL_CONTACT_SHEET_THUMB_WIDTH + ROLL_CONTACT_SHEET_GUTTER);
+    let sheet_height = ROLL_CONTACT_SHEET_GUTTER
+        + rows as u32 * (ROLL_CONTACT_SHEET_THUMB_HEIGHT + ROLL_CONTACT_SHEET_GUTTER);
+    let mut sheet = RgbImage::from_pixel(sheet_width, sheet_height, Rgb([238, 238, 238]));
+    let mut index_entries = Vec::new();
+
+    for (idx, frame) in frames.iter().enumerate() {
+        let row = idx / columns;
+        let column = idx % columns;
+        let tile_x = ROLL_CONTACT_SHEET_GUTTER
+            + column as u32 * (ROLL_CONTACT_SHEET_THUMB_WIDTH + ROLL_CONTACT_SHEET_GUTTER);
+        let tile_y = ROLL_CONTACT_SHEET_GUTTER
+            + row as u32 * (ROLL_CONTACT_SHEET_THUMB_HEIGHT + ROLL_CONTACT_SHEET_GUTTER);
+        let thumbnail = roll_frame_contact_thumbnail(frame, cli.input_mode, cli.bit_depth)?;
+        let offset_x = tile_x + (ROLL_CONTACT_SHEET_THUMB_WIDTH - thumbnail.width()) / 2;
+        let offset_y = tile_y + (ROLL_CONTACT_SHEET_THUMB_HEIGHT - thumbnail.height()) / 2;
+        draw_tile_background(
+            &mut sheet,
+            tile_x,
+            tile_y,
+            ROLL_CONTACT_SHEET_THUMB_WIDTH,
+            ROLL_CONTACT_SHEET_THUMB_HEIGHT,
+        );
+        blit_rgb_image(&thumbnail, &mut sheet, offset_x, offset_y);
+        index_entries.push(serde_json::json!({
+            "index": idx,
+            "name": frame.name,
+            "stem": frame.stem,
+            "path": frame.path,
+            "row": row,
+            "column": column,
+            "tile_x": tile_x,
+            "tile_y": tile_y,
+            "tile_width": ROLL_CONTACT_SHEET_THUMB_WIDTH,
+            "tile_height": ROLL_CONTACT_SHEET_THUMB_HEIGHT,
+            "preview_transform": if cli.input_mode == InputMode::Negative {
+                "per_channel_stretch_inverted_gamma"
+            } else {
+                "per_channel_stretch_gamma"
+            },
+            "source_width": frame.width,
+            "source_height": frame.height,
+            "source_color_type": frame.color_type,
+            "source_bits_per_sample": frame.source_bits_per_sample,
+        }));
+    }
+
+    write_rgb_image(sheet_path, &sheet)?;
+    if let Some(index_path) = index_path {
+        let index = serde_json::json!({
+            "contact_sheet": sheet_path.display().to_string(),
+            "roll_dir": inventory.roll_dir,
+            "roll_name": inventory.roll_name,
+            "input_mode": cli.input_mode.as_str(),
+            "bit_depth": cli.bit_depth,
+            "columns": columns,
+            "rows": rows,
+            "thumb_width": ROLL_CONTACT_SHEET_THUMB_WIDTH,
+            "thumb_height": ROLL_CONTACT_SHEET_THUMB_HEIGHT,
+            "gutter": ROLL_CONTACT_SHEET_GUTTER,
+            "frames": index_entries,
+        });
+        write_text(
+            index_path,
+            &serde_json::to_string_pretty(&index).expect("contact sheet index should serialize"),
+        )?;
+    }
+    Ok(())
+}
+
+fn draw_tile_background(sheet: &mut RgbImage, x: u32, y: u32, width: u32, height: u32) {
+    for yy in y..(y + height).min(sheet.height()) {
+        for xx in x..(x + width).min(sheet.width()) {
+            sheet.put_pixel(xx, yy, Rgb([250, 250, 250]));
+        }
+    }
+}
+
+fn blit_rgb_image(source: &RgbImage, target: &mut RgbImage, x: u32, y: u32) {
+    for yy in 0..source.height() {
+        for xx in 0..source.width() {
+            let target_x = x + xx;
+            let target_y = y + yy;
+            if target_x < target.width() && target_y < target.height() {
+                target.put_pixel(target_x, target_y, *source.get_pixel(xx, yy));
+            }
+        }
+    }
+}
+
+fn roll_frame_contact_thumbnail(
+    frame: &RollFrameInspection,
+    input_mode: InputMode,
+    bit_depth: u8,
+) -> Result<RgbImage, Box<dyn std::error::Error>> {
+    let loaded = tiff_io::load_tiff_u16(Path::new(&frame.path), bit_depth)?;
+    let image = loaded.image;
+    let (height, width, channels) = image.dim();
+    if width == 0 || height == 0 || channels < 3 {
+        return Err(format!("{} has unsupported image dimensions", frame.name).into());
+    }
+    let (mins, maxes) = sampled_channel_min_max(&image);
+    let scale = (ROLL_CONTACT_SHEET_THUMB_WIDTH as f64 / width as f64)
+        .min(ROLL_CONTACT_SHEET_THUMB_HEIGHT as f64 / height as f64)
+        .max(1.0 / width.max(height) as f64);
+    let thumb_width = ((width as f64 * scale).round() as u32).max(1);
+    let thumb_height = ((height as f64 * scale).round() as u32).max(1);
+    let mut thumbnail = RgbImage::new(thumb_width, thumb_height);
+
+    for y in 0..thumb_height {
+        let source_y = ((y as usize * height) / thumb_height as usize).min(height - 1);
+        for x in 0..thumb_width {
+            let source_x = ((x as usize * width) / thumb_width as usize).min(width - 1);
+            let mut rgb = [0u8; 3];
+            for channel in 0..3 {
+                let min = mins[channel] as f64;
+                let max = maxes[channel] as f64;
+                let sample = image[[source_y, source_x, channel]] as f64;
+                let mut normalized = if max > min {
+                    ((sample - min) / (max - min)).clamp(0.0, 1.0)
+                } else {
+                    0.5
+                };
+                if input_mode == InputMode::Negative {
+                    normalized = 1.0 - normalized;
+                }
+                rgb[channel] = (normalized.powf(1.0 / 2.2) * 255.0).round() as u8;
+            }
+            thumbnail.put_pixel(x, y, Rgb(rgb));
+        }
+    }
+    Ok(thumbnail)
+}
+
+fn sampled_channel_min_max(image: &Array3<u16>) -> ([u16; 3], [u16; 3]) {
+    let (height, width, _) = image.dim();
+    let mut mins = [u16::MAX; 3];
+    let mut maxes = [0u16; 3];
+    let target_samples = 200_000usize;
+    let pixel_count = height.saturating_mul(width).max(1);
+    let step = (pixel_count as f64 / target_samples as f64)
+        .sqrt()
+        .ceil()
+        .max(1.0) as usize;
+    for y in (0..height).step_by(step) {
+        for x in (0..width).step_by(step) {
+            for channel in 0..3 {
+                let sample = image[[y, x, channel]];
+                mins[channel] = mins[channel].min(sample);
+                maxes[channel] = maxes[channel].max(sample);
+            }
+        }
+    }
+    (mins, maxes)
 }
 
 fn roll_fixture_metadata_entry_for_frame<'a>(
@@ -10858,5 +11084,13 @@ fn write_text(path: &PathBuf, contents: &str) -> Result<(), Box<dyn std::error::
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, contents)?;
+    Ok(())
+}
+
+fn write_rgb_image(path: &PathBuf, image: &RgbImage) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    image.save(path)?;
     Ok(())
 }
