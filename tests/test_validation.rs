@@ -4100,6 +4100,12 @@ fn test_validate_cli_roll_inventory_writes_fixture_registry_scaffold() {
         .arg("14")
         .arg("--roll-suite-frame")
         .arg("RAW_0000")
+        .arg("--film-stock")
+        .arg("Kodak Gold 200")
+        .arg("--roll-fixture-scene-tag")
+        .arg("outdoor,skin")
+        .arg("--roll-fixture-exposure-tag")
+        .arg("normal-exposure")
         .arg("--write-roll-fixture-registry")
         .arg(&registry_path)
         .arg("--summary-json")
@@ -4142,6 +4148,10 @@ fn test_validate_cli_roll_inventory_writes_fixture_registry_scaffold() {
         "linear_prophoto_rgb_d50"
     );
     assert_eq!(fixture["calibration_case"], "uncalibrated-image-derived");
+    assert_eq!(fixture["film_stock"], "Kodak Gold 200");
+    assert_eq!(fixture["scene_tags"][0], "outdoor");
+    assert_eq!(fixture["scene_tags"][1], "skin");
+    assert_eq!(fixture["exposure_tags"][0], "normal-exposure");
 
     let list_output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
         .arg("--fixture-registry")
@@ -8274,6 +8284,8 @@ fn test_validation_docs_map_local_corpus_scaffold_to_registry_actions() {
         "--compute-fixture-hashes",
         "--write-fixture-hash-registry",
         "--write-roll-fixture-registry",
+        "--roll-fixture-scene-tag",
+        "--roll-fixture-exposure-tag",
         "--write-fixture-suite-baselines",
         "--overwrite-fixture-suite-baselines",
         "--fixture-coverage --strict",

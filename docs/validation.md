@@ -175,6 +175,9 @@ cargo run --release --bin scanstitch-validate -- `
   --roll-dir TESTROLL `
   --roll-inventory `
   --bit-depth 16 `
+  --film-stock "Kodak Gold 200" `
+  --roll-fixture-scene-tag outdoor,skin `
+  --roll-fixture-exposure-tag normal-exposure `
   --write-roll-fixture-registry local-fixtures/testroll-fixtures.json `
   --summary-json output/validation/testroll-inventory.json `
   --summary-md output/validation/testroll-inventory.md
@@ -183,11 +186,13 @@ cargo run --release --bin scanstitch-validate -- `
 The writer emits same-path `component1`/`component2` entries with `force_no_stitch: true`, local
 baseline paths under `local-fixtures/baselines/`, per-frame output directories, the selected
 `input_mode`/`bit_depth`, and any supplied calibration profile/library, scanner profile, roll
-profile, or film-stock defaults. It does not invent scene, exposure, or reference-evidence labels;
-add those curated fields before treating the registry as corpus proof. Use repeated or
-comma-separated `--roll-suite-frame <name|stem|slug>` selectors with the writer when only a curated
-representative subset should become fixture entries. After accepting generated baselines with
-`--write-fixture-suite-baselines`, run fixture coverage with
+profile, film-stock default, `--roll-fixture-scene-tag`, or `--roll-fixture-exposure-tag` values.
+Those scene and exposure flags are stamped onto every generated entry, so use them only for a
+curated subset whose labels are genuinely shared. The writer does not invent scene, exposure, or
+reference-evidence labels; add or pass those curated fields before treating the registry as corpus
+proof. Use repeated or comma-separated `--roll-suite-frame <name|stem|slug>` selectors with the
+writer when only a representative subset should become fixture entries. After accepting generated
+baselines with `--write-fixture-suite-baselines`, run fixture coverage with
 `--compute-fixture-hashes --write-fixture-hash-registry` to pin the component and baseline hashes
 for strict reruns.
 
