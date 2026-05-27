@@ -229,6 +229,20 @@ Fresh TESTROLL shadow-heavy midtone lift and tighter shadow guard on 2026-05-22:
 - Roll-suite validation now also records `midtone_luminance_p50_max` and `midtone_luminance_p50_range`; `--compare-roll-suite` derives these from per-frame midtone values when the baseline JSON predates the aggregate fields.
 - Non-TESTROLL LOGAN strict check after this change: `output/validation/logan_shadow_lift_guard_strict_20260522.md` / `.json` rendered `5959x3670`, kept `render_review_status=reviewable`, `stitch.decision=accepted`, `render_input_source=fastica_separated_transmittance`, `selected_candidate=gamut_trusted_image_matrix_blend`, `selected_quality_score=1.794397`, `post_scale_preserved_ratio=0.979114`, and passed `--strict` with `summary_baseline_status=comparable` and `issues=none`. LOGAN shadow saturation p95 is now `0.540000`; chroma residual p95 stayed essentially unchanged at `0.093204`.
 
+Fresh TESTROLL DNG model-review shadow cleanup on 2026-05-27:
+
+- Baseline artifact: `output/goal_testroll_current_subset_20260527.md`
+- Current artifact: `output/goal_testroll_model_shadow_cleanup_subset_20260527.md`
+- Visual comparison: `output/goal_testroll_model_shadow_cleanup_before_after_20260527.png`
+- Command: `cargo run --release --locked --bin scanstitch-validate -- --roll-dir TESTROLL --roll-suite --roll-suite-frame RAW_0001,RAW_0005,RAW_0008,RAW_0011,RAW_0012 --bit-depth 16 --render-input direct-density --input-mode negative --quality-mode balanced --compare-roll-suite output\goal_testroll_current_subset_20260527.json --output-dir output\goal_testroll_model_shadow_cleanup_subset_20260527 --summary-json output\goal_testroll_model_shadow_cleanup_subset_20260527.json --summary-md output\goal_testroll_model_shadow_cleanup_subset_20260527.md --quiet`
+- Policy change: `review_model_plausibility` frames now keep bounded shadow chroma cleanup enabled, while neutral highlight and midtone cleanup remain disabled and `color_trust_state` remains `review_required`.
+- Status: `review_required`, with all 5 selected DNG frames rendered and `0` failed frames. The comparator reported `comparison.status=comparable` and `issues=[]`.
+- `RAW_0011.dng` was the targeted model-plausibility frame: shadow saturation p95 improved `0.841849 -> 0.470662`, shadow RGB delta improved `0.009 -> 0.002`, and shadow chroma compression became `0.190654`.
+- The selected-subset shadow saturation p95 mean/max improved `0.490247` / `0.841849 -> 0.416010` / `0.540000`.
+- Midtone placement was unchanged: mean/min/max/range stayed `0.403397` / `0.317542` / `0.531507` / `0.213964`. Post-tone clipping stayed `0.000000` high and `0.000000` low, and preserved-gamut minimum stayed `0.981210`.
+- The tradeoff was small and localized: `RAW_0011` chroma residual p95 moved `+0.000599`, and selected-subset chroma residual p95 mean moved `+0.000120`, both below the roll-suite comparator's material regression threshold.
+- Non-TESTROLL guard: `output/validation/old_testroll_model_shadow_cleanup_raw0055_20260527.md` compared `OLD_TESTROLL` `RAW_0055.dng` against `output/validation/old_testroll_chromadamp055_raw0055_20260523.json` with `comparison.status=comparable` and `issues=[]`; the frame remained `candidate_risk=safe`, `tone_color_trust_state=trusted`.
+
 Focused tests run after the audit, anchor-support shadow cleanup, weak-neutral highlight cleanup, saturated-shadow denoise relaxation, shadow-heavy midtone lift, and tightened shadow guard:
 
 ```powershell

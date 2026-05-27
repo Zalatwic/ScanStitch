@@ -36,9 +36,9 @@ git diff --check
 
 ## Current Local Evidence
 
-On 2026-05-12, the synthetic colour gate
+On 2026-05-27, the synthetic colour gate
 `cargo run --bin scanstitch-validate -- --synthetic-color-suite --strict --quiet --summary-json target\tmp\synthetic-color-suite.json --summary-md target\tmp\synthetic-color-suite.md`
-passed with `status=passed`, 19 passed cases, and `issues=[]`. The cases cover calibrated profile
+passed with `status=passed`, 20 passed cases, and `issues=[]`. The cases cover calibrated profile
 selection, weak/unsafe calibration rejection, scanner-prior selection/rejection, sparse and biased
 anchor review, dirty-edge sample rejection, high-key headroom preservation, destructive-gamut render
 fallback, tone colour-protection policy gates, reference-patch regression rejection, and forced

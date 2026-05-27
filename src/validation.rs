@@ -1134,6 +1134,7 @@ pub fn run_synthetic_color_suite() -> SyntheticColorSuiteSummary {
         synthetic_case_direct_density_render_fallback_for_quality_win(),
         synthetic_case_direct_density_render_fallback_rejects_worse_risk(),
         synthetic_case_tone_policy_weak_neutral_keeps_bounded_neutral_cleanup(),
+        synthetic_case_tone_policy_model_review_keeps_bounded_shadow_cleanup(),
         synthetic_case_tone_policy_color_review_disables_color_cleanup_preserves_gamut_repair(),
         synthetic_case_reference_patch_regression_rejected(),
         synthetic_case_forced_unsafe_calibration_fails(),
@@ -2069,6 +2070,46 @@ fn synthetic_case_tone_policy_color_review_disables_color_cleanup_preserves_gamu
             highlight_chroma_compressed_ratio_min: Some(0.1),
             highlight_neutral_chroma_compressed_ratio_max: Some(0.0),
             shadow_chroma_compressed_ratio_max: Some(0.0),
+        },
+    )
+}
+
+fn synthetic_case_tone_policy_model_review_keeps_bounded_shadow_cleanup(
+) -> SyntheticColorCaseSummary {
+    let params = synthetic_linear_tone_params(5.0);
+    let protection = tonemap::ToneColorProtection {
+        policy: tonemap::ToneColorProtectionPolicy::ReviewBoundedShadowCleanup,
+        highlight_neutral_chroma_enabled: false,
+        midtone_neutral_chroma_enabled: false,
+        shadow_chroma_enabled: true,
+        reason: "synthetic model-plausibility review".to_string(),
+    };
+    let mut img = Array3::<f64>::zeros((3, 1, 3));
+    img[[0, 0, 0]] = 0.20;
+    img[[0, 0, 1]] = 0.90;
+    img[[0, 0, 2]] = 1.00;
+    img[[1, 0, 0]] = 0.34;
+    img[[1, 0, 1]] = 0.42;
+    img[[1, 0, 2]] = 0.50;
+    img[[2, 0, 0]] = 0.03;
+    img[[2, 0, 1]] = 0.10;
+    img[[2, 0, 2]] = 0.22;
+
+    summarize_synthetic_tone_policy_result(
+        "tone_policy_model_review_keeps_bounded_shadow_cleanup",
+        tonemap::apply_tonemap_with_params_and_color_protection_diagnostics(
+            &img,
+            &params,
+            &protection,
+        ),
+        SyntheticTonePolicyExpectations {
+            policy: "review_bounded_shadow_cleanup",
+            color_trust_state: "review_required",
+            highlight_neutral_chroma_enabled: false,
+            shadow_chroma_enabled: true,
+            highlight_chroma_compressed_ratio_min: Some(0.1),
+            highlight_neutral_chroma_compressed_ratio_max: Some(0.0),
+            shadow_chroma_compressed_ratio_max: None,
         },
     )
 }

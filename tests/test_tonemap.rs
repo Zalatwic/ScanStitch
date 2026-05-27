@@ -1253,6 +1253,58 @@ fn test_tone_policy_anchor_review_keeps_bounded_highlight_and_shadow_cleanup() {
 }
 
 #[test]
+fn test_tone_policy_model_review_keeps_bounded_shadow_cleanup_only() {
+    let params = scanstitch::tonemap::ToneCurveParams {
+        domain: scanstitch::tonemap::ToneFitDomain::LinearLuminance,
+        midpoint: 0.5,
+        slope: 5.0,
+        toe_lift: 0.005,
+        shoulder_max: 0.995,
+    };
+    let protection = scanstitch::tonemap::ToneColorProtection {
+        policy: scanstitch::tonemap::ToneColorProtectionPolicy::ReviewBoundedShadowCleanup,
+        highlight_neutral_chroma_enabled: false,
+        midtone_neutral_chroma_enabled: false,
+        shadow_chroma_enabled: true,
+        reason: "synthetic model-plausibility review".to_string(),
+    };
+    let mut img = Array3::<f64>::zeros((3, 1, 3));
+    img[[0, 0, 0]] = 0.55;
+    img[[0, 0, 1]] = 0.70;
+    img[[0, 0, 2]] = 0.80;
+    img[[1, 0, 0]] = 0.34;
+    img[[1, 0, 1]] = 0.42;
+    img[[1, 0, 2]] = 0.50;
+    img[[2, 0, 0]] = 0.03;
+    img[[2, 0, 1]] = 0.10;
+    img[[2, 0, 2]] = 0.22;
+
+    let result = scanstitch::tonemap::apply_tonemap_with_params_and_color_protection_diagnostics(
+        &img,
+        &params,
+        &protection,
+    );
+
+    assert_eq!(
+        result.diagnostics.color_protection_policy,
+        "review_bounded_shadow_cleanup"
+    );
+    assert_eq!(
+        result.diagnostics.highlight_neutral_chroma_compressed_ratio,
+        0.0
+    );
+    assert_eq!(
+        result.diagnostics.midtone_neutral_chroma_compressed_ratio,
+        0.0
+    );
+    assert!(result.diagnostics.shadow_chroma_compressed_ratio > 0.0);
+    assert!(!result.diagnostics.highlight_neutral_chroma_enabled);
+    assert!(!result.diagnostics.midtone_neutral_chroma_enabled);
+    assert!(result.diagnostics.shadow_chroma_enabled);
+    assert_eq!(result.diagnostics.color_trust_state, "review_required");
+}
+
+#[test]
 fn test_tone_policy_color_review_disables_shadow_cleanup_but_not_luminance_or_gamut_repair() {
     let params = scanstitch::tonemap::ToneCurveParams {
         domain: scanstitch::tonemap::ToneFitDomain::LinearLuminance,

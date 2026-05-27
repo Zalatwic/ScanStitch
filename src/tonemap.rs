@@ -389,6 +389,7 @@ pub enum ToneColorProtectionPolicy {
     WeakNeutralBoundedHighlightCleanup,
     WeakNeutralBoundedNeutralCleanup,
     ReviewBoundedNeutralAndShadowCleanup,
+    ReviewBoundedShadowCleanup,
     DisabledColorCandidateReview,
 }
 
@@ -400,6 +401,7 @@ impl ToneColorProtectionPolicy {
             Self::WeakNeutralBoundedHighlightCleanup => "weak_neutral_bounded_highlight_cleanup",
             Self::WeakNeutralBoundedNeutralCleanup => "weak_neutral_bounded_neutral_cleanup",
             Self::ReviewBoundedNeutralAndShadowCleanup => "review_bounded_neutral_shadow_cleanup",
+            Self::ReviewBoundedShadowCleanup => "review_bounded_shadow_cleanup",
             Self::DisabledColorCandidateReview => "disabled_color_candidate_review",
         }
     }
@@ -433,7 +435,8 @@ impl ToneColorProtection {
             ToneColorProtectionPolicy::NeutralHighlightDisabledWeakNeutral
             | ToneColorProtectionPolicy::WeakNeutralBoundedHighlightCleanup
             | ToneColorProtectionPolicy::WeakNeutralBoundedNeutralCleanup => "limited_weak_neutral",
-            ToneColorProtectionPolicy::ReviewBoundedNeutralAndShadowCleanup => "review_required",
+            ToneColorProtectionPolicy::ReviewBoundedNeutralAndShadowCleanup
+            | ToneColorProtectionPolicy::ReviewBoundedShadowCleanup => "review_required",
             ToneColorProtectionPolicy::DisabledColorCandidateReview => "review_required",
         }
     }
@@ -465,6 +468,16 @@ impl ToneColorProtection {
                 midtone_neutral_chroma_enabled: true,
                 shadow_chroma_enabled: true,
                 reason: "bounded neutral midtone/highlight and shadow chroma cleanup remain enabled for anchor-support review frames to reduce snow/highlight casts and low-tone colour speckle without marking colour trusted".to_string(),
+            };
+        }
+
+        if diagnostics.candidate_risk == "review_model_plausibility" {
+            return Self {
+                policy: ToneColorProtectionPolicy::ReviewBoundedShadowCleanup,
+                highlight_neutral_chroma_enabled: false,
+                midtone_neutral_chroma_enabled: false,
+                shadow_chroma_enabled: true,
+                reason: "bounded shadow chroma cleanup remains enabled for model-plausibility review frames to reduce low-tone colour speckle without applying neutral cast cleanup or marking colour trusted".to_string(),
             };
         }
 
