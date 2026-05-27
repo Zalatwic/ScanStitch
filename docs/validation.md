@@ -550,7 +550,10 @@ and add `--write-fixture-suite-baselines`. This writes only missing files declar
 the per-fixture summary still reports baseline comparability. Existing files are left untouched and
 reported as `skipped_exists`; add `--overwrite-fixture-suite-baselines` only when intentionally
 refreshing accepted baselines. Baseline writing is rejected with `--strict`, so regression gates stay
-read-only. After accepting generated baselines, pin `summary_baseline_sha256`, rerun
+read-only. For large local roll registries, add one or more `--fixture-suite-fixture <name>`
+selectors to render and write baselines only for selected curated entries; the embedded coverage
+summary still audits the whole registry so remaining corpus gaps stay visible. After accepting
+generated baselines, pin `summary_baseline_sha256`, rerun
 `--fixture-coverage --strict`, then rerun `--fixture-suite --strict --debug`.
 
 Run deterministic synthetic colour-decision cases without local TIFFs:

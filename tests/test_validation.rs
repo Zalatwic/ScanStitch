@@ -5996,6 +5996,7 @@ fn test_validate_cli_fixture_suite_writes_missing_summary_baseline() {
     scanstitch::tiff_io::save_tiff_u16(&comp, &path1).unwrap();
 
     let baseline_path = tmp.path().join("baselines/generated.json");
+    let other_baseline_path = tmp.path().join("baselines/other-generated.json");
     let registry_path = tmp.path().join("fixtures.json");
     std::fs::write(
         &registry_path,
@@ -6019,6 +6020,20 @@ fn test_validate_cli_fixture_suite_writes_missing_summary_baseline() {
                         "base_estimate_source": "working_edges",
                         "output_color_space": "linear_prophoto_rgb_d50"
                     }
+                },
+                "other": {
+                    "component1": path1,
+                    "component2": path1,
+                    "output_dir": tmp.path().join("registry-output-other"),
+                    "input_mode": "negative",
+                    "bit_depth": 14,
+                    "force_no_stitch": true,
+                    "summary_baseline": other_baseline_path,
+                    "expectations": {
+                        "stitch_decision": "skipped_pre_score",
+                        "base_estimate_source": "working_edges",
+                        "output_color_space": "linear_prophoto_rgb_d50"
+                    }
                 }
             }
         })
@@ -6033,6 +6048,8 @@ fn test_validate_cli_fixture_suite_writes_missing_summary_baseline() {
         .arg("--fixture-registry")
         .arg(&registry_path)
         .arg("--fixture-suite")
+        .arg("--fixture-suite-fixture")
+        .arg("logan")
         .arg("--write-fixture-suite-baselines")
         .arg("--ica-max-iter")
         .arg("20")
@@ -6056,6 +6073,7 @@ fn test_validate_cli_fixture_suite_writes_missing_summary_baseline() {
         String::from_utf8_lossy(&output.stdout)
     );
     assert!(baseline_path.exists());
+    assert!(!other_baseline_path.exists());
 
     let baseline: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&baseline_path).unwrap()).unwrap();
@@ -6069,7 +6087,10 @@ fn test_validate_cli_fixture_suite_writes_missing_summary_baseline() {
     let suite: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&suite_json).unwrap()).unwrap();
     assert_eq!(suite["status"], "review_required");
+    assert_eq!(suite["fixture_count"], serde_json::json!(1));
+    assert_eq!(suite["coverage"]["fixtures"].as_array().unwrap().len(), 2);
     assert_eq!(suite["fixtures"][0]["status"], "review_required");
+    assert_eq!(suite["fixtures"][0]["name"], "logan");
     assert_eq!(
         suite["fixtures"][0]["summary_baseline_write_status"],
         "written"
@@ -6128,6 +6149,22 @@ fn test_validate_cli_rejects_fixture_suite_baseline_overwrite_without_writer() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr
         .contains("--overwrite-fixture-suite-baselines requires --write-fixture-suite-baselines"));
+}
+
+#[test]
+fn test_validate_cli_rejects_unknown_fixture_suite_selector() {
+    let output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-suite")
+        .arg("--fixture-suite-fixture")
+        .arg("missing-fixture")
+        .arg("--quiet")
+        .output()
+        .expect("run scanstitch-validate invalid fixture-suite selector");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr
+        .contains("--fixture-suite-fixture did not match registry fixture(s): missing-fixture"));
 }
 
 #[test]
@@ -8700,6 +8737,7 @@ fn test_validation_docs_map_local_corpus_scaffold_to_registry_actions() {
         "testroll-metadata.json",
         "--write-fixture-suite-baselines",
         "--overwrite-fixture-suite-baselines",
+        "--fixture-suite-fixture",
         "--fixture-coverage --strict",
         "--fixture-suite --strict --debug",
         "coverage_validation_ready",

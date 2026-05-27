@@ -63,6 +63,10 @@ struct ValidationCli {
     #[arg(long, default_value_t = false)]
     fixture_suite: bool,
 
+    /// Limit --fixture-suite rendering to one or more fixture names.
+    #[arg(long = "fixture-suite-fixture", value_delimiter = ',')]
+    fixture_suite_fixtures: Vec<String>,
+
     /// Directory containing a scanner roll to inspect or validate frame-by-frame.
     #[arg(long)]
     roll_dir: Option<PathBuf>,
@@ -1269,6 +1273,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.write_fixture_suite_baselines && !cli.fixture_suite {
         return Err("--write-fixture-suite-baselines requires --fixture-suite".into());
     }
+    if !cli.fixture_suite && !cli.fixture_suite_fixtures.is_empty() {
+        return Err("--fixture-suite-fixture requires --fixture-suite".into());
+    }
     if cli.overwrite_fixture_suite_baselines && !cli.write_fixture_suite_baselines {
         return Err(
             "--overwrite-fixture-suite-baselines requires --write-fixture-suite-baselines".into(),
@@ -1585,7 +1592,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if cli.fixture_suite {
-        validate_fixture_suite_inputs(&cli)?;
+        validate_fixture_suite_inputs(&cli, fixtures)?;
         let summary = run_fixture_suite(&cli, fixtures, &registry.coverage_requirements);
         let json_path = cli
             .summary_json
@@ -5296,7 +5303,10 @@ fn fixture_tiff_probe_label(probe: Option<&FixtureTiffProbe>) -> String {
     }
 }
 
-fn validate_fixture_suite_inputs(cli: &ValidationCli) -> Result<(), Box<dyn std::error::Error>> {
+fn validate_fixture_suite_inputs(
+    cli: &ValidationCli,
+    fixtures: &BTreeMap<String, FixtureEntry>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if cli.component1.is_some()
         || cli.component2.is_some()
         || cli.report.is_some()
@@ -5308,6 +5318,26 @@ fn validate_fixture_suite_inputs(cli: &ValidationCli) -> Result<(), Box<dyn std:
     }
     if cli.force_stitch && cli.force_no_stitch {
         return Err("--fixture-suite cannot combine --force-stitch and --force-no-stitch".into());
+    }
+    if cli
+        .fixture_suite_fixtures
+        .iter()
+        .any(|fixture| fixture.trim().is_empty())
+    {
+        return Err("--fixture-suite-fixture cannot be empty".into());
+    }
+    let missing_fixtures = cli
+        .fixture_suite_fixtures
+        .iter()
+        .filter(|fixture| !fixtures.contains_key(*fixture))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_fixtures.is_empty() {
+        return Err(format!(
+            "--fixture-suite-fixture did not match registry fixture(s): {}",
+            missing_fixtures.join(", ")
+        )
+        .into());
     }
     Ok(())
 }
@@ -8914,8 +8944,16 @@ fn run_fixture_suite(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    let selected_fixture_names = cli
+        .fixture_suite_fixtures
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let fixtures = fixtures
         .iter()
+        .filter(|(name, _)| {
+            selected_fixture_names.is_empty() || selected_fixture_names.contains(*name)
+        })
         .map(|(name, fixture)| {
             run_fixture_suite_entry(
                 cli,
