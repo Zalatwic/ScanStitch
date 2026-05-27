@@ -461,6 +461,16 @@ fields; a parseable but empty compact baseline is treated as incomplete rather t
 comparability. Use `--output-dir some/root` to place each fixture under `some/root/<fixture-name>`
 instead of the registry output directories.
 
+To build missing compact baselines for registry fixtures, run the fixture suite without `--strict`
+and add `--write-fixture-suite-baselines`. This writes only missing files declared by each fixture's
+`summary_baseline`, records `summary_baseline_write_status` and
+`summary_baseline_written_path` on the suite entry, then compares the freshly written baseline so
+the per-fixture summary still reports baseline comparability. Existing files are left untouched and
+reported as `skipped_exists`; add `--overwrite-fixture-suite-baselines` only when intentionally
+refreshing accepted baselines. Baseline writing is rejected with `--strict`, so regression gates stay
+read-only. After accepting generated baselines, pin `summary_baseline_sha256`, rerun
+`--fixture-coverage --strict`, then rerun `--fixture-suite --strict --debug`.
+
 Run deterministic synthetic colour-decision cases without local TIFFs:
 
 ```powershell

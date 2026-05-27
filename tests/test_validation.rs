@@ -5528,6 +5528,152 @@ fn test_validate_cli_runs_fixture_suite_strict() {
 }
 
 #[test]
+fn test_validate_cli_fixture_suite_writes_missing_summary_baseline() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let input_dir = tmp.path().join("input");
+    std::fs::create_dir_all(&input_dir).unwrap();
+
+    let comp =
+        synthetic::film_negative_image(160, 300, 10, 30, [12000, 7000, 3000], [5400, 4300, 3500]);
+    let path1 = input_dir.join("single-frame.tiff");
+    scanstitch::tiff_io::save_tiff_u16(&comp, &path1).unwrap();
+
+    let baseline_path = tmp.path().join("baselines/generated.json");
+    let registry_path = tmp.path().join("fixtures.json");
+    std::fs::write(
+        &registry_path,
+        serde_json::json!({
+            "coverage_requirements": {
+                "min_fixtures": 1,
+                "min_component_pairs": 1,
+                "min_summary_baselines": 1
+            },
+            "fixtures": {
+                "logan": {
+                    "component1": path1,
+                    "component2": path1,
+                    "output_dir": tmp.path().join("registry-output"),
+                    "input_mode": "negative",
+                    "bit_depth": 14,
+                    "force_no_stitch": true,
+                    "summary_baseline": baseline_path,
+                    "expectations": {
+                        "stitch_decision": "skipped_pre_score",
+                        "base_estimate_source": "working_edges",
+                        "output_color_space": "linear_prophoto_rgb_d50"
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let suite_output_dir = tmp.path().join("suite-output");
+    let suite_json = tmp.path().join("fixture-suite.json");
+    let suite_md = tmp.path().join("fixture-suite.md");
+    let output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture-suite")
+        .arg("--write-fixture-suite-baselines")
+        .arg("--ica-max-iter")
+        .arg("20")
+        .arg("--ica-tol")
+        .arg("0.0001")
+        .arg("--quiet")
+        .arg("--output-dir")
+        .arg(&suite_output_dir)
+        .arg("--summary-json")
+        .arg(&suite_json)
+        .arg("--summary-md")
+        .arg(&suite_md)
+        .output()
+        .expect("run scanstitch-validate fixture-suite baseline writer");
+
+    assert!(
+        output.status.success(),
+        "fixture suite baseline writer failed: status={} stderr={} stdout={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(baseline_path.exists());
+
+    let baseline: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&baseline_path).unwrap()).unwrap();
+    assert_eq!(baseline["fixture"], "logan");
+    assert_eq!(baseline["stitch"]["decision"], "skipped_pre_score");
+    assert_eq!(
+        baseline["render"]["output_color_space"],
+        "linear_prophoto_rgb_d50"
+    );
+
+    let suite: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&suite_json).unwrap()).unwrap();
+    assert_eq!(suite["status"], "review_required");
+    assert_eq!(suite["fixtures"][0]["status"], "review_required");
+    assert_eq!(
+        suite["fixtures"][0]["summary_baseline_write_status"],
+        "written"
+    );
+    assert_eq!(
+        suite["fixtures"][0]["summary_baseline_written_path"],
+        baseline_path.display().to_string()
+    );
+    assert_eq!(
+        suite["fixtures"][0]["summary_baseline_status"],
+        "comparable"
+    );
+    assert!(suite["fixtures"][0]["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|issue| issue == "fixture_suite:logan:coverage_not_validation_ready"));
+
+    let per_fixture_summary = suite_output_dir.join("logan/summary.json");
+    let summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(per_fixture_summary).unwrap()).unwrap();
+    assert_eq!(
+        summary["summary_baseline_comparison"]["status"],
+        "comparable"
+    );
+
+    let markdown = std::fs::read_to_string(&suite_md).unwrap();
+    assert!(markdown.contains("write written"));
+}
+
+#[test]
+fn test_validate_cli_rejects_fixture_suite_baseline_writer_in_strict_mode() {
+    let output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-suite")
+        .arg("--write-fixture-suite-baselines")
+        .arg("--strict")
+        .arg("--quiet")
+        .output()
+        .expect("run scanstitch-validate invalid fixture-suite baseline writer");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--write-fixture-suite-baselines is a corpus-building mode"));
+}
+
+#[test]
+fn test_validate_cli_rejects_fixture_suite_baseline_overwrite_without_writer() {
+    let output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-suite")
+        .arg("--overwrite-fixture-suite-baselines")
+        .arg("--quiet")
+        .output()
+        .expect("run scanstitch-validate invalid fixture-suite baseline overwrite");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr
+        .contains("--overwrite-fixture-suite-baselines requires --write-fixture-suite-baselines"));
+}
+
+#[test]
 fn test_validate_cli_fixture_suite_rejects_incomplete_summary_baseline_contract() {
     let tmp = tempfile::TempDir::new().unwrap();
     let input_dir = tmp.path().join("input");
@@ -8024,12 +8170,17 @@ fn test_validation_docs_map_local_corpus_scaffold_to_registry_actions() {
         "low-neutral|underexposed-negative",
         "--compute-fixture-hashes",
         "--write-fixture-hash-registry",
+        "--write-fixture-suite-baselines",
+        "--overwrite-fixture-suite-baselines",
         "--fixture-coverage --strict",
         "--fixture-suite --strict --debug",
         "coverage_validation_ready",
         "coverage_issues",
         "coverage_action_items",
         "coverage_not_validation_ready",
+        "summary_baseline_write_status",
+        "summary_baseline_written_path",
+        "skipped_exists",
         "Coverage actions",
         "fixtures[].repair_plan",
         "path or paths",

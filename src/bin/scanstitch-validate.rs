@@ -106,6 +106,14 @@ struct ValidationCli {
     #[arg(long)]
     write_summary_baseline: Option<PathBuf>,
 
+    /// Write missing tracked compact baselines declared by --fixture-suite registry entries.
+    #[arg(long, default_value_t = false)]
+    write_fixture_suite_baselines: bool,
+
+    /// Replace existing tracked compact baselines when --write-fixture-suite-baselines is used.
+    #[arg(long, default_value_t = false)]
+    overwrite_fixture_suite_baselines: bool,
+
     /// Exit with an error when --compare-report finds review-required differences.
     #[arg(long, default_value_t = false)]
     strict: bool,
@@ -663,6 +671,8 @@ struct FixtureSuiteEntry {
     summary_md_path: Option<String>,
     summary_baseline_path: Option<String>,
     summary_baseline_status: Option<String>,
+    summary_baseline_write_status: Option<String>,
+    summary_baseline_written_path: Option<String>,
     stitch_decision: Option<String>,
     expected_stitch_decision: Option<String>,
     base_estimate_source: Option<String>,
@@ -1178,6 +1188,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if cli.write_fixture_hash_registry.is_some() && !cli.fixture_coverage {
         return Err("--write-fixture-hash-registry requires --fixture-coverage".into());
+    }
+    if cli.write_fixture_suite_baselines && !cli.fixture_suite {
+        return Err("--write-fixture-suite-baselines requires --fixture-suite".into());
+    }
+    if cli.overwrite_fixture_suite_baselines && !cli.write_fixture_suite_baselines {
+        return Err(
+            "--overwrite-fixture-suite-baselines requires --write-fixture-suite-baselines".into(),
+        );
+    }
+    if cli.strict && cli.write_fixture_suite_baselines {
+        return Err("--write-fixture-suite-baselines is a corpus-building mode; omit --strict and run a separate strict fixture-suite after accepting the baselines".into());
     }
     if !cli.roll_suite && !cli.roll_suite_frames.is_empty() {
         return Err("--roll-suite-frame requires --roll-suite".into());
@@ -8058,6 +8079,8 @@ fn run_fixture_suite_entry(
             .as_ref()
             .map(|path| path.display().to_string()),
         summary_baseline_status: None,
+        summary_baseline_write_status: None,
+        summary_baseline_written_path: None,
         stitch_decision: None,
         expected_stitch_decision: None,
         base_estimate_source: None,
@@ -8389,7 +8412,10 @@ fn run_fixture_suite_entry(
     entry.report_path = Some(report_path.display().to_string());
 
     let mut summary = summarize_report_with_source(name.to_string(), &report, Some(&report_path));
-    apply_fixture_suite_summary_baseline(name, fixture, &mut summary, &mut entry);
+    write_fixture_suite_summary_baseline(cli, name, fixture, &summary, &mut entry);
+    if entry.status != "failed" {
+        apply_fixture_suite_summary_baseline(name, fixture, &mut summary, &mut entry);
+    }
 
     entry.output_path = summary.render.output_path.clone();
     entry.output_modified_at = summary.render.output_modified_at.clone();
@@ -9150,6 +9176,52 @@ fn expected_calibration_source(pipeline_cli: &PipelineCli) -> Option<&'static st
     }
 }
 
+fn write_fixture_suite_summary_baseline(
+    cli: &ValidationCli,
+    name: &str,
+    fixture: &FixtureEntry,
+    summary: &ValidationSummary,
+    entry: &mut FixtureSuiteEntry,
+) {
+    if !cli.write_fixture_suite_baselines {
+        return;
+    }
+
+    let Some(baseline_path) = &fixture.summary_baseline else {
+        entry.summary_baseline_write_status = Some("path_missing".to_string());
+        entry.issues.push(format!(
+            "fixture_suite:{name}:summary_baseline_write_path_missing"
+        ));
+        return;
+    };
+
+    let baseline_exists = baseline_path.exists();
+    if baseline_exists && !cli.overwrite_fixture_suite_baselines {
+        entry.summary_baseline_write_status = Some("skipped_exists".to_string());
+        return;
+    }
+
+    let baseline = tracked_baseline_from_summary(summary);
+    let baseline_json =
+        serde_json::to_string_pretty(&baseline).expect("summary baseline should serialize");
+    if let Err(err) = write_text(baseline_path, &baseline_json) {
+        entry.summary_baseline_write_status = Some("failed".to_string());
+        entry.issues.push(format!(
+            "fixture_suite:{name}:summary_baseline_write_failed"
+        ));
+        entry.status = "failed".to_string();
+        entry.error = Some(err.to_string());
+        return;
+    }
+
+    entry.summary_baseline_write_status = Some(if baseline_exists {
+        "overwritten".to_string()
+    } else {
+        "written".to_string()
+    });
+    entry.summary_baseline_written_path = Some(baseline_path.display().to_string());
+}
+
 fn apply_fixture_suite_summary_baseline(
     name: &str,
     fixture: &FixtureEntry,
@@ -9348,7 +9420,15 @@ fn fixture_suite_to_markdown(summary: &FixtureSuiteSummary) -> String {
             format!("blocked: {}", fixture.coverage_issues.join(", "))
         };
         let coverage_actions = fixture.coverage_action_items.join(", ");
-        let baseline = fixture.summary_baseline_status.as_deref().unwrap_or("none");
+        let baseline = match (
+            fixture.summary_baseline_status.as_deref(),
+            fixture.summary_baseline_write_status.as_deref(),
+        ) {
+            (Some(status), Some(write_status)) => format!("{status}; write {write_status}"),
+            (Some(status), None) => status.to_string(),
+            (None, Some(write_status)) => format!("write {write_status}"),
+            (None, None) => "none".to_string(),
+        };
         let stitch = expected_actual_label(
             fixture.expected_stitch_decision.as_deref(),
             fixture.stitch_decision.as_deref(),
