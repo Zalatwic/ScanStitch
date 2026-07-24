@@ -1,5 +1,13 @@
 # TESTROLL Negative Dynamic Range Notes - 2026-05-20
 
+> Historical audit record. Current status is defined by `PROJECT_ASSESSMENT.md` and
+> `validation-corpus-status.md`. In particular, later LOGAN statements below that say
+> `render_review_status=reviewable` describe the obsolete 5,959×3,670 single-component-era output,
+> not the current 11,701×3,671 full-union reconstruction. The fresh 2026-07-17 current-code run has
+> zero film-base confidence, a severe magenta/yellow cast, and
+> `render_review_status=blocked_low_base_confidence`; it must not be used as colour truth or as an
+> approved baseline refresh.
+
 ## Diagnosis
 
 The overly dark positive renders came from two coupled issues in the negative path:
@@ -297,7 +305,7 @@ Result: targeted density/tone/colorspace/validation tests, full `cargo test --lo
 Targeted single-frame final checks use the same settings as the successful shadow-lift artifacts:
 
 ```powershell
-.\target\release\scanstitch-validate.exe --component1 TESTROLL\RAW_0001.tif --component2 TESTROLL\RAW_0001.tif --force-no-stitch --bit-depth 16 --render-input direct-density --input-mode negative --base-color 21737.428571,5322,2938 --base-color-source roll_consensus_base --base-color-confidence 0.98 --base-color-reason "selected stable roll base cluster from 9/12 frame candidates; rejected 3 darker candidate(s) against the roll high-transmittance envelope" --output-dir output\testroll_negative_dynamic_range_shadow_lift_20260520\raw-0001
+.\target\release\scanstitch-validate.exe --component1 TESTROLL\RAW_0001.tif --force-no-stitch --bit-depth 16 --render-input direct-density --input-mode negative --base-color 21737.428571,5322,2938 --base-color-source roll_consensus_base --base-color-confidence 0.98 --base-color-reason "selected stable roll base cluster from 9/12 frame candidates; rejected 3 darker candidate(s) against the roll high-transmittance envelope" --output-dir output\testroll_negative_dynamic_range_shadow_lift_20260520\raw-0001
 ```
 
 The latest full current-code TESTROLL rerun with the shadow-heavy lift and tighter guard is:

@@ -1,16 +1,21 @@
 use clap::Parser;
 use image::{Rgb, RgbImage};
 use ndarray::Array3;
-use scanstitch::cli::{Cli as PipelineCli, InputMode, QualityMode, RenderInputMode, RenderIntent};
+use scanstitch::cli::{
+    Cli as PipelineCli, DeskewMode, GeometryArgs, GrainReductionArgs, GrainReductionMode,
+    InputMode, OrientationCorrection, QualityMode, RenderInputMode, RenderIntent, WhiteBalanceArgs,
+};
 use scanstitch::colorspace::ColorMode;
 use scanstitch::report::PipelineReport;
+use scanstitch::tonemap::{GRAIN_DETAIL_MIN_PROBE_COUNT, GRAIN_DETAIL_P10_RETENTION_MIN};
 use scanstitch::validation::{
-    compare_render_summaries, compare_summary_baseline, run_synthetic_color_suite,
-    summarize_report_with_source, summary_to_markdown, synthetic_color_suite_to_markdown,
-    tracked_baseline_from_summary, ColorCandidateAcceptanceSummary, TrackedValidationBaseline,
-    ValidationSummary,
+    compare_render_summaries, compare_summary_baseline, delivery_artifact_integrity_issues,
+    final_delivery_evidence_is_reviewable, run_synthetic_color_suite, summarize_report_with_source,
+    summary_to_markdown, synthetic_color_suite_to_markdown, tracked_baseline_from_summary,
+    BorderCropComponentValidationSummary, ColorCandidateAcceptanceSummary,
+    InputOrientationComponentValidationSummary, TrackedValidationBaseline, ValidationSummary,
 };
-use scanstitch::{base_detect, border, positive_input, tiff_io};
+use scanstitch::{atomic_file, base_detect, border, positive_input, render_review, tiff_io};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,6 +29,24 @@ const ROLL_CONTACT_SHEET_THUMB_WIDTH: u32 = 180;
 const ROLL_CONTACT_SHEET_THUMB_HEIGHT: u32 = 120;
 const ROLL_CONTACT_SHEET_COLUMNS: usize = 6;
 const ROLL_CONTACT_SHEET_GUTTER: u32 = 8;
+const ORIENTATION_REVIEW_PREVIEW_MAX_WIDTH: u32 = 1200;
+const ORIENTATION_REVIEW_PREVIEW_MAX_HEIGHT: u32 = 1200;
+const STITCH_NORMALIZATION_MIN_DETAIL_SCALE_COUNT: usize = 2;
+const STITCH_NORMALIZATION_MAX_DETAIL_ENERGY_RATIO: f64 = 2.0;
+const STITCH_NORMALIZATION_MAX_GRADIENT_RATIO: f64 = 1.05;
+const STITCH_NORMALIZATION_MAX_OFFSET_RATIO: f64 = 0.05;
+const GEOMETRY_PREPARATION_MIN_DESKEW_RETAINED_AREA_RATIO: f64 = 0.90;
+const GEOMETRY_PREPARATION_MIN_BORDER_RETAINED_AREA_RATIO: f64 = 0.50;
+const GEOMETRY_PREPARATION_MIN_REMOVED_EDGES_PER_COMPONENT: usize = 4;
+const GEOMETRY_ACCURACY_MAX_DESKEW_TOLERANCE_DEGREES: f64 = 0.05;
+const GEOMETRY_ACCURACY_MAX_CROP_TOLERANCE_PX: usize = 4;
+const NEGATIVE_RECONSTRUCTION_MIN_BASE_CONFIDENCE: f64 = 0.30;
+const NEGATIVE_RECONSTRUCTION_MIN_MEASURED_CONFIDENCE: f64 = 0.75;
+const NEGATIVE_RECONSTRUCTION_MAX_HELD_OUT_DELTA_E00_RMS: f64 = 6.0;
+const NEGATIVE_RECONSTRUCTION_MAX_HELD_OUT_DELTA_E00_MAX: f64 = 15.0;
+const NEGATIVE_RECONSTRUCTION_MIN_BASELINE_IMPROVEMENT: f64 = 0.25;
+const NEGATIVE_RECONSTRUCTION_MAX_DENSITY_NOISE_GAIN: f64 = 4.0;
+const NEGATIVE_RECONSTRUCTION_MAX_EXTRAPOLATION_RATIO: f64 = 0.01;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -50,6 +73,18 @@ struct ValidationCli {
     /// Audit fixture registry readiness without running the pipeline.
     #[arg(long, default_value_t = false)]
     fixture_coverage: bool,
+
+    /// Decode the selected fixture and write upright-review previews plus a non-approved annotation draft.
+    #[arg(long, value_name = "DIR")]
+    write_orientation_review: Option<PathBuf>,
+
+    /// Write a hash-bound, explicitly unapproved human review draft for --report artifacts.
+    #[arg(long, value_name = "DIR")]
+    write_render_review: Option<PathBuf>,
+
+    /// Bind the exact matched grain-off perfect-render report used to review a grain-on result.
+    #[arg(long, value_name = "REPORT")]
+    render_review_grain_control_report: Option<PathBuf>,
 
     /// Compute fixture SHA-256 values during fixture coverage even when the registry has no expected hashes.
     #[arg(long, default_value_t = false)]
@@ -115,11 +150,11 @@ struct ValidationCli {
     #[arg(long, hide = true, default_value_t = false)]
     roll_suite_child: bool,
 
-    /// First component TIFF. Required unless --report is used or --fixture logan files exist.
+    /// First component TIFF. May be used alone for a direct single-scan run.
     #[arg(long)]
     component1: Option<PathBuf>,
 
-    /// Second component TIFF. Required unless --report is used or --fixture logan files exist.
+    /// Optional second component TIFF. Requires --component1.
     #[arg(long)]
     component2: Option<PathBuf>,
 
@@ -154,6 +189,11 @@ struct ValidationCli {
     /// Exit with an error when --compare-report finds review-required differences.
     #[arg(long, default_value_t = false)]
     strict: bool,
+
+    /// Preserve reports and summaries, then require reviewable evidence and independently
+    /// verified primary and requested auxiliary artifacts for every rendered output.
+    #[arg(long, default_value_t = false)]
+    require_reviewable: bool,
 
     /// Exit nonzero for selected comparison issue groups or exact issue names.
     #[arg(long, value_delimiter = ',')]
@@ -229,6 +269,15 @@ struct ValidationCli {
     /// perfect-mode review artifacts unless explicitly requested.
     #[arg(long, value_enum, default_value = "balanced")]
     quality_mode: QualityMode,
+
+    #[command(flatten)]
+    white_balance: WhiteBalanceArgs,
+
+    #[command(flatten)]
+    geometry: GeometryArgs,
+
+    #[command(flatten)]
+    grain: GrainReductionArgs,
 
     /// Write the scene-referred master even outside perfect mode.
     #[arg(long, default_value_t = false)]
@@ -307,6 +356,10 @@ struct FixtureCoverageRequirements {
     #[serde(default)]
     min_component_sha256_pairs: Option<usize>,
     #[serde(default)]
+    min_n_component_fixtures: Option<usize>,
+    #[serde(default)]
+    min_component_sha256_sets: Option<usize>,
+    #[serde(default)]
     min_readable_tiff_pairs: Option<usize>,
     #[serde(default)]
     min_tiff_layout_consistent_pairs: Option<usize>,
@@ -349,7 +402,27 @@ struct FixtureCoverageRequirements {
     #[serde(default)]
     min_reference_patch_count: Option<usize>,
     #[serde(default)]
+    min_approved_render_review_fixtures: Option<usize>,
+    #[serde(default)]
     min_debug_artifact_expectation_fixtures: Option<usize>,
+    #[serde(default)]
+    min_render_dynamic_range_contract_fixtures: Option<usize>,
+    #[serde(default)]
+    min_stitch_normalization_contract_fixtures: Option<usize>,
+    #[serde(default)]
+    min_geometry_preparation_contract_fixtures: Option<usize>,
+    #[serde(default)]
+    min_geometry_accuracy_contract_fixtures: Option<usize>,
+    #[serde(default)]
+    min_orientation_accuracy_contract_fixtures: Option<usize>,
+    #[serde(default)]
+    min_negative_reconstruction_contract_fixtures: Option<usize>,
+    #[serde(default)]
+    min_grain_reduction_enabled_fixtures: Option<usize>,
+    #[serde(default)]
+    min_grain_detail_contract_fixtures: Option<usize>,
+    #[serde(default)]
+    min_grain_reduction_effect_contract_fixtures: Option<usize>,
     #[serde(default)]
     required_film_stocks: Vec<String>,
     #[serde(default)]
@@ -374,19 +447,42 @@ struct FixtureCoverageRequirements {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+struct AdditionalFixtureComponent {
+    path: PathBuf,
+    #[serde(default)]
+    sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct FixtureEntry {
     component1: PathBuf,
-    component2: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    component2: Option<PathBuf>,
     #[serde(default)]
     component1_sha256: Option<String>,
     #[serde(default)]
     component2_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    additional_components: Vec<AdditionalFixtureComponent>,
     #[serde(default)]
     output_dir: Option<PathBuf>,
     #[serde(default)]
     input_mode: Option<String>,
     #[serde(default)]
     bit_depth: Option<u8>,
+    #[serde(default)]
+    grain_reduction: Option<String>,
+    #[serde(default)]
+    grain_strength: Option<f64>,
+    #[serde(default)]
+    grain_scale: Option<f64>,
+    #[serde(default)]
+    deskew: Option<String>,
+    #[serde(default)]
+    orientation_correction: Option<String>,
+    #[serde(default)]
+    deskew_angle_degrees: Option<f64>,
     #[serde(default)]
     force_stitch: bool,
     #[serde(default)]
@@ -411,6 +507,10 @@ struct FixtureEntry {
     exposure_tags: Vec<String>,
     #[serde(default)]
     reference_evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    render_review: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    render_review_sha256: Option<String>,
     #[serde(default)]
     calibration_case: Option<String>,
     #[serde(default)]
@@ -421,6 +521,38 @@ struct FixtureEntry {
     summary_baseline_sha256: Option<String>,
     #[serde(default)]
     description: Option<String>,
+}
+
+impl FixtureEntry {
+    fn component_count(&self) -> usize {
+        1 + usize::from(self.component2.is_some()) + self.additional_components.len()
+    }
+
+    fn pipeline_inputs(&self) -> Vec<PathBuf> {
+        let mut inputs = Vec::with_capacity(self.component_count());
+        inputs.push(self.component1.clone());
+        inputs.extend(self.component2.iter().cloned());
+        inputs.extend(
+            self.additional_components
+                .iter()
+                .map(|component| component.path.clone()),
+        );
+        inputs
+    }
+
+    fn component_hashes(&self) -> Vec<Option<&str>> {
+        let mut hashes = Vec::with_capacity(self.component_count());
+        hashes.push(self.component1_sha256.as_deref());
+        if self.component2.is_some() {
+            hashes.push(self.component2_sha256.as_deref());
+        }
+        hashes.extend(
+            self.additional_components
+                .iter()
+                .map(|component| component.sha256.as_deref()),
+        );
+        hashes
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -455,6 +587,10 @@ struct RollFixtureMetadataEntry {
     exposure_tags: Option<Vec<String>>,
     #[serde(default)]
     reference_evidence: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    render_review: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    render_review_sha256: Option<String>,
     #[serde(default)]
     calibration_case: Option<String>,
     #[serde(default)]
@@ -467,13 +603,195 @@ struct RollFixtureMetadataEntry {
     description: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BorderCropComponentExpectation {
+    component_index: usize,
+    top_removed: usize,
+    bottom_removed: usize,
+    left_removed: usize,
+    right_removed: usize,
+    tolerance_px: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OrientationComponentExpectation {
+    component_index: usize,
+    upright_approved: bool,
+    decoded_pixel_sha256: String,
+    tag_present: bool,
+    tag_value: Option<u16>,
+    transform: String,
+    applied: bool,
+    source_width: usize,
+    source_height: usize,
+    output_width: usize,
+    output_height: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct OrientationReviewManifest {
+    schema_version: u32,
+    fixture: String,
+    review_status: &'static str,
+    instructions: &'static str,
+    input_mode: String,
+    working_bit_depth: u8,
+    orientation_correction: String,
+    preview_transform: &'static str,
+    previews: Vec<OrientationReviewPreview>,
+    orientation_components_expected: Vec<OrientationComponentExpectation>,
+}
+
+#[derive(Debug, Serialize)]
+struct OrientationReviewPreview {
+    component_index: usize,
+    source_path: String,
+    preview_path: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FixtureExpectations {
     #[serde(default)]
+    deskew_status: Option<String>,
+    #[serde(default)]
+    deskew_applied: Option<bool>,
+    #[serde(default)]
+    deskew_review_required: Option<bool>,
+    #[serde(default)]
+    deskew_retained_area_ratio_min: Option<f64>,
+    #[serde(default)]
+    deskew_all_components_applied: Option<bool>,
+    #[serde(default)]
+    deskew_minimum_component_retained_area_ratio_min: Option<f64>,
+    #[serde(default)]
+    border_crop_all_components_cropped: Option<bool>,
+    #[serde(default)]
+    border_crop_minimum_removed_edge_count_per_component_min: Option<usize>,
+    #[serde(default)]
+    border_crop_retained_area_ratio_min: Option<f64>,
+    #[serde(default)]
+    border_crop_retained_area_ratio_max: Option<f64>,
+    #[serde(default)]
+    border_crop_rejected: Option<bool>,
+    #[serde(default)]
+    deskew_correction_degrees_expected: Option<f64>,
+    #[serde(default)]
+    deskew_correction_tolerance_degrees: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    border_crop_components_expected: Vec<BorderCropComponentExpectation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    orientation_components_expected: Vec<OrientationComponentExpectation>,
+    #[serde(default)]
     stitch_decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    inferred_component_order: Vec<usize>,
+    #[serde(default)]
+    technical_white_balance_status: Option<String>,
+    #[serde(default)]
+    technical_white_balance_applied: Option<bool>,
+    #[serde(default)]
+    technical_white_balance_review_required: Option<bool>,
+    #[serde(default)]
+    creative_temperature: Option<f64>,
+    #[serde(default)]
+    creative_tint: Option<f64>,
+    #[serde(default)]
+    seam_exposure_model: Option<String>,
+    #[serde(default)]
+    seam_exposure_held_out_validation_passed: Option<bool>,
+    #[serde(default)]
+    seam_exposure_held_out_improvement_over_gain_min: Option<f64>,
+    #[serde(default)]
+    seam_exposure_offset_normalized_abs_max: Option<f64>,
+    #[serde(default)]
+    seam_exposure_spatial_slope_abs_min: Option<f64>,
+    #[serde(default)]
+    seam_exposure_spatial_slope_abs_max: Option<f64>,
+    #[serde(default)]
+    seam_exposure_spatial_slope_agreement_ratio_min: Option<f64>,
+    #[serde(default)]
+    seam_exposure_held_out_spatial_improvement_over_best_constant_min: Option<f64>,
+    #[serde(default)]
+    seam_exposure_spatial_offset_slope_normalized_abs_min: Option<f64>,
+    #[serde(default)]
+    seam_exposure_spatial_offset_slope_normalized_abs_max: Option<f64>,
+    #[serde(default)]
+    seam_exposure_spatial_offset_endpoint_normalized_abs_max: Option<f64>,
+    #[serde(default)]
+    seam_exposure_spatial_affine_slope_agreement_ratio_min: Option<f64>,
+    #[serde(default)]
+    seam_exposure_spatial_affine_center_offset_delta_normalized_max: Option<f64>,
+    #[serde(default)]
+    seam_exposure_held_out_spatial_gain_offset_improvement_over_best_simpler_min: Option<f64>,
+    #[serde(default)]
+    seam_exposure_spatial_2d_gain_accepted: Option<bool>,
+    #[serde(default)]
+    seam_exposure_spatial_2d_gain_offset_accepted: Option<bool>,
+    #[serde(default)]
+    seam_exposure_spatial_quadratic_gain_accepted: Option<bool>,
+    #[serde(default)]
+    seam_exposure_spatial_quadratic_gain_offset_accepted: Option<bool>,
+    #[serde(default)]
+    seam_exposure_spatial_2d_distinct_columns_min: Option<usize>,
+    #[serde(default)]
+    seam_exposure_spatial_2d_horizontal_slope_agreement_ratio_min: Option<f64>,
+    #[serde(default)]
+    seam_exposure_held_out_spatial_2d_improvement_over_best_simpler_min: Option<f64>,
+    #[serde(default)]
+    seam_blend_required: bool,
+    #[serde(default)]
+    seam_blend_mode: Option<String>,
+    #[serde(default)]
+    seam_blend_review_required: Option<bool>,
+    #[serde(default)]
+    seam_detail_review_required: Option<bool>,
+    #[serde(default)]
+    seam_detail_supported_scale_count_min: Option<usize>,
+    #[serde(default)]
+    seam_detail_max_symmetric_energy_ratio_max: Option<f64>,
+    #[serde(default)]
+    seam_gradient_ratio_max: Option<f64>,
+    #[serde(default)]
+    seam_overlap_p95_abs_difference_max: Option<f64>,
     #[serde(default)]
     base_estimate_source: Option<String>,
+    #[serde(default)]
+    base_confidence_min: Option<f64>,
+    #[serde(default)]
+    density_inversion_skipped: Option<bool>,
+    #[serde(default)]
+    negative_response_model: Option<String>,
+    #[serde(default)]
+    negative_response_source: Option<String>,
+    #[serde(default)]
+    negative_response_accepted: Option<bool>,
+    #[serde(default)]
+    negative_response_review_required: Option<bool>,
+    #[serde(default)]
+    negative_response_crosstalk_model: Option<String>,
+    #[serde(default)]
+    negative_response_characteristic_curve_model: Option<String>,
+    #[serde(default)]
+    negative_response_measured_model_id: Option<String>,
+    #[serde(default)]
+    negative_response_measured_confidence_min: Option<f64>,
+    #[serde(default)]
+    negative_response_held_out_delta_e00_rms_max: Option<f64>,
+    #[serde(default)]
+    negative_response_held_out_max_delta_e00_max: Option<f64>,
+    #[serde(default)]
+    negative_response_held_out_improvement_over_unit_slope_min: Option<f64>,
+    #[serde(default)]
+    negative_response_density_noise_gain_max: Option<f64>,
+    #[serde(default)]
+    negative_response_curve_extrapolated_ratio_max: Option<f64>,
+    #[serde(default)]
+    negative_response_signed_headroom_preserved: Option<bool>,
+    #[serde(default)]
+    negative_response_curve_interpolation: Option<String>,
     #[serde(default)]
     output_color_space: Option<String>,
     #[serde(default)]
@@ -491,6 +809,8 @@ struct FixtureExpectations {
     #[serde(default)]
     calibration_acceptance_status: Option<String>,
     #[serde(default)]
+    calibration_color_mapping_applied: Option<bool>,
+    #[serde(default)]
     calibration_confidence_min: Option<f64>,
     #[serde(default)]
     calibration_matrix_condition_number_max: Option<f64>,
@@ -501,6 +821,14 @@ struct FixtureExpectations {
     #[serde(default)]
     tone_color_trust_state: Option<String>,
     #[serde(default)]
+    neutral_safety_rescue_applied: Option<bool>,
+    #[serde(default)]
+    neutral_safety_rescue_preserved_ratio_gain_min: Option<f64>,
+    #[serde(default)]
+    neutral_safety_rescue_midtone_saturation_p95_reduction_min: Option<f64>,
+    #[serde(default)]
+    neutral_safety_rescue_reason_contains: Option<String>,
+    #[serde(default)]
     highlight_chroma_compressed_ratio_min: Option<f64>,
     #[serde(default)]
     highlight_chroma_compressed_ratio_max: Option<f64>,
@@ -508,6 +836,28 @@ struct FixtureExpectations {
     highlight_neutral_chroma_compressed_ratio_max: Option<f64>,
     #[serde(default)]
     shadow_chroma_compressed_ratio_max: Option<f64>,
+    #[serde(default)]
+    grain_reduction_enabled: Option<bool>,
+    #[serde(default)]
+    grain_reduction_applied_ratio_min: Option<f64>,
+    #[serde(default)]
+    grain_reduction_structure_excluded_ratio_min: Option<f64>,
+    #[serde(default)]
+    grain_reduction_flat_luma_p95_reduction_ratio_min: Option<f64>,
+    #[serde(default)]
+    grain_reduction_flat_chroma_p95_reduction_ratio_min: Option<f64>,
+    #[serde(default)]
+    grain_detail_review_required: Option<bool>,
+    #[serde(default)]
+    grain_detail_decision_supported: Option<bool>,
+    #[serde(default)]
+    grain_detail_luminance_probe_count_min: Option<usize>,
+    #[serde(default)]
+    grain_detail_chroma_probe_count_min: Option<usize>,
+    #[serde(default)]
+    grain_detail_luminance_p10_retention_min: Option<f64>,
+    #[serde(default)]
+    grain_detail_chroma_p10_retention_min: Option<f64>,
     #[serde(default)]
     selected_quality_score_max: Option<f64>,
     #[serde(default)]
@@ -530,6 +880,24 @@ struct FixtureExpectations {
     spatial_neutral_delta_p95_max: Option<f64>,
     #[serde(default)]
     post_scale_preserved_ratio_min: Option<f64>,
+    #[serde(default)]
+    render_luminance_range_p05_p95_min: Option<f64>,
+    #[serde(default)]
+    render_review_status: Option<String>,
+    #[serde(default)]
+    render_reviewable: Option<bool>,
+    #[serde(default)]
+    tone_output_confidence_status: Option<String>,
+    #[serde(default)]
+    tone_output_review_required: Option<bool>,
+    #[serde(default)]
+    tone_output_evidence_confidence_min: Option<f64>,
+    #[serde(default)]
+    render_to_mapped_luminance_range_ratio_min: Option<f64>,
+    #[serde(default)]
+    post_chroma_compression_clipped_high_ratio_max: Option<f64>,
+    #[serde(default)]
+    post_chroma_compression_clipped_low_ratio_max: Option<f64>,
     #[serde(default)]
     reference_patch_evaluation_required: bool,
     #[serde(default)]
@@ -564,6 +932,17 @@ struct FixtureExpectations {
 struct FixtureCoverageSummary {
     status: String,
     fixture_count: usize,
+    component_file_count: usize,
+    max_component_count: usize,
+    n_component_fixture_count: usize,
+    n_component_validation_ready_fixture_count: usize,
+    component_set_available_count: usize,
+    component_sha256_declared_set_count: usize,
+    component_sha256_computed_set_count: usize,
+    component_sha256_set_count: usize,
+    readable_tiff_set_count: usize,
+    tiff_layout_consistent_set_count: usize,
+    tiff_dimension_matched_set_count: usize,
     component_pair_available_count: usize,
     component_sha256_declared_pair_count: usize,
     component_sha256_computed_pair_count: usize,
@@ -572,6 +951,15 @@ struct FixtureCoverageSummary {
     tiff_layout_consistent_pair_count: usize,
     tiff_dimension_matched_pair_count: usize,
     validation_ready_fixture_count: usize,
+    render_dynamic_range_contract_fixture_count: usize,
+    stitch_normalization_contract_fixture_count: usize,
+    geometry_preparation_contract_fixture_count: usize,
+    geometry_accuracy_contract_fixture_count: usize,
+    orientation_accuracy_contract_fixture_count: usize,
+    negative_reconstruction_contract_fixture_count: usize,
+    grain_reduction_enabled_fixture_count: usize,
+    grain_detail_contract_fixture_count: usize,
+    grain_reduction_effect_contract_fixture_count: usize,
     summary_baseline_declared_count: usize,
     summary_baseline_file_count: usize,
     summary_baseline_parseable_count: usize,
@@ -611,6 +999,7 @@ struct FixtureCoverageSummary {
     missing_required_reference_evidence: Vec<String>,
     reference_patch_fixture_count: usize,
     reference_patch_count: usize,
+    approved_render_review_fixture_count: usize,
     debug_artifact_expectation_fixture_count: usize,
     debug_artifact_kinds_required: Vec<String>,
     missing_required_debug_artifact_kinds: Vec<String>,
@@ -629,18 +1018,55 @@ struct FixtureCoverageSummary {
 #[derive(Debug, Serialize)]
 struct FixtureCoverageEntry {
     name: String,
+    component_count: usize,
     component1: String,
     component1_exists: bool,
     component1_sha256: Option<FixtureSha256Probe>,
     component1_tiff: Option<FixtureTiffProbe>,
-    component2: String,
+    component2: Option<String>,
     component2_exists: bool,
     component2_sha256: Option<FixtureSha256Probe>,
     component2_tiff: Option<FixtureTiffProbe>,
     tiff_pair: Option<FixtureTiffPairProbe>,
+    additional_components: Vec<AdditionalFixtureComponentCoverage>,
+    all_components_exist: bool,
+    all_component_sha256_declared: bool,
+    all_component_sha256_computed: bool,
+    all_component_sha256_matched: bool,
+    all_components_readable_tiff: bool,
+    all_component_layouts_consistent: bool,
+    all_component_dimensions_matched: bool,
     output_dir: Option<String>,
     input_mode: Option<String>,
     bit_depth: Option<u8>,
+    grain_reduction: Option<String>,
+    grain_strength: Option<f64>,
+    grain_scale: Option<f64>,
+    grain_reduction_enabled_declared: bool,
+    grain_detail_contract_complete: bool,
+    grain_detail_contract_missing_fields: Vec<String>,
+    grain_reduction_effect_contract_complete: bool,
+    grain_reduction_effect_contract_missing_fields: Vec<String>,
+    render_dynamic_range_contract_declared: bool,
+    render_dynamic_range_contract_complete: bool,
+    render_dynamic_range_contract_missing_fields: Vec<String>,
+    stitch_normalization_contract_declared: bool,
+    stitch_normalization_contract_complete: bool,
+    stitch_normalization_contract_missing_fields: Vec<String>,
+    geometry_preparation_contract_declared: bool,
+    geometry_preparation_contract_complete: bool,
+    geometry_preparation_contract_missing_fields: Vec<String>,
+    geometry_accuracy_contract_declared: bool,
+    geometry_accuracy_contract_complete: bool,
+    geometry_accuracy_contract_missing_fields: Vec<String>,
+    orientation_accuracy_contract_declared: bool,
+    orientation_accuracy_contract_complete: bool,
+    orientation_accuracy_contract_missing_fields: Vec<String>,
+    negative_reconstruction_contract_declared: bool,
+    negative_reconstruction_contract_complete: bool,
+    negative_reconstruction_contract_missing_fields: Vec<String>,
+    deskew: Option<String>,
+    deskew_angle_degrees: Option<f64>,
     force_stitch: bool,
     force_no_stitch: bool,
     summary_baseline: Option<String>,
@@ -650,6 +1076,11 @@ struct FixtureCoverageEntry {
     summary_baseline_contract_missing_fields: Vec<String>,
     summary_baseline_valid: bool,
     summary_baseline_sha256: Option<FixtureSha256Probe>,
+    render_review: Option<String>,
+    render_review_exists: Option<bool>,
+    render_review_sha256: Option<FixtureSha256Probe>,
+    render_review_inspection: Option<render_review::RenderReviewInspection>,
+    approved_render_review: bool,
     calibration_profile: Option<String>,
     calibration_profile_exists: Option<bool>,
     calibration_profile_parse_status: Option<String>,
@@ -674,6 +1105,16 @@ struct FixtureCoverageEntry {
     action_items: Vec<String>,
     repair_plan: Vec<FixtureRepairPlanItem>,
     issues: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdditionalFixtureComponentCoverage {
+    component_number: usize,
+    path: String,
+    exists: bool,
+    sha256: Option<FixtureSha256Probe>,
+    tiff: Option<FixtureTiffProbe>,
+    comparison_to_component1: Option<FixtureTiffPairProbe>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -733,19 +1174,91 @@ struct FixtureSuiteSummary {
     issues: Vec<String>,
 }
 
+#[derive(Debug, Default, Serialize)]
+struct GeometryPreparationFixtureSuiteEvidence {
+    all_deskew_components_applied: Option<bool>,
+    expected_all_deskew_components_applied: Option<bool>,
+    minimum_deskew_retained_area_ratio: Option<f64>,
+    expected_minimum_deskew_retained_area_ratio: Option<f64>,
+    all_border_crop_components_cropped: Option<bool>,
+    expected_all_border_crop_components_cropped: Option<bool>,
+    minimum_removed_edge_count_per_component: Option<usize>,
+    expected_minimum_removed_edge_count_per_component: Option<usize>,
+    minimum_border_crop_retained_area_ratio: Option<f64>,
+    expected_minimum_border_crop_retained_area_ratio: Option<f64>,
+    maximum_border_crop_retained_area_ratio: Option<f64>,
+    expected_maximum_border_crop_retained_area_ratio: Option<f64>,
+    border_crop_rejected: Option<bool>,
+    expected_border_crop_rejected: Option<bool>,
+    deskew_correction_degrees: Option<f64>,
+    expected_deskew_correction_degrees: Option<f64>,
+    expected_deskew_correction_tolerance_degrees: Option<f64>,
+    border_crop_components: Vec<BorderCropComponentValidationSummary>,
+    expected_border_crop_components: Vec<BorderCropComponentExpectation>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct OrientationFixtureSuiteEvidence {
+    components: Vec<InputOrientationComponentValidationSummary>,
+    expected_components: Vec<OrientationComponentExpectation>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct NegativeReconstructionFixtureSuiteEvidence {
+    base_confidence: Option<f64>,
+    expected_base_confidence_min: Option<f64>,
+    density_inversion_skipped: Option<bool>,
+    expected_density_inversion_skipped: Option<bool>,
+    response_model: Option<String>,
+    expected_response_model: Option<String>,
+    response_source: Option<String>,
+    expected_response_source: Option<String>,
+    response_accepted: Option<bool>,
+    expected_response_accepted: Option<bool>,
+    response_review_required: Option<bool>,
+    expected_response_review_required: Option<bool>,
+    crosstalk_model: Option<String>,
+    expected_crosstalk_model: Option<String>,
+    characteristic_curve_model: Option<String>,
+    expected_characteristic_curve_model: Option<String>,
+    measured_model_id: Option<String>,
+    expected_measured_model_id: Option<String>,
+    measured_confidence: Option<f64>,
+    expected_measured_confidence_min: Option<f64>,
+    held_out_delta_e00_rms: Option<f64>,
+    expected_held_out_delta_e00_rms_max: Option<f64>,
+    held_out_delta_e00_max: Option<f64>,
+    expected_held_out_delta_e00_max: Option<f64>,
+    held_out_improvement_over_unit_slope: Option<f64>,
+    expected_held_out_improvement_over_unit_slope_min: Option<f64>,
+    maximum_density_noise_gain: Option<f64>,
+    expected_maximum_density_noise_gain: Option<f64>,
+    curve_extrapolated_any_ratio: Option<f64>,
+    expected_curve_extrapolated_any_ratio_max: Option<f64>,
+    signed_headroom_preserved: Option<bool>,
+    expected_signed_headroom_preserved: Option<bool>,
+    curve_interpolation: Option<String>,
+    expected_curve_interpolation: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct FixtureSuiteEntry {
     name: String,
     status: String,
+    component_count: usize,
     coverage_validation_ready: bool,
     coverage_issues: Vec<String>,
     coverage_action_items: Vec<String>,
     output_dir: String,
     output_path: Option<String>,
     output_modified_at: Option<String>,
+    output_width: Option<usize>,
+    output_height: Option<usize>,
     output_color_space: Option<String>,
     expected_output_color_space: Option<String>,
     output_file_icc_profile_matches_report: Option<bool>,
+    delivery_artifacts_intact: Option<bool>,
+    delivery_artifact_issues: Vec<String>,
     stale_render_artifact_count: Option<usize>,
     report_path: Option<String>,
     summary_json_path: Option<String>,
@@ -754,10 +1267,75 @@ struct FixtureSuiteEntry {
     summary_baseline_status: Option<String>,
     summary_baseline_write_status: Option<String>,
     summary_baseline_written_path: Option<String>,
+    deskew_status: Option<String>,
+    expected_deskew_status: Option<String>,
+    deskew_applied: Option<bool>,
+    expected_deskew_applied: Option<bool>,
+    deskew_review_required: Option<bool>,
+    expected_deskew_review_required: Option<bool>,
+    deskew_retained_area_ratio: Option<f64>,
+    expected_deskew_retained_area_ratio_min: Option<f64>,
+    geometry_preparation: GeometryPreparationFixtureSuiteEvidence,
+    input_orientation: OrientationFixtureSuiteEvidence,
     stitch_decision: Option<String>,
     expected_stitch_decision: Option<String>,
+    inferred_component_order: Vec<usize>,
+    expected_inferred_component_order: Vec<usize>,
+    technical_white_balance_status: Option<String>,
+    expected_technical_white_balance_status: Option<String>,
+    technical_white_balance_applied: Option<bool>,
+    expected_technical_white_balance_applied: Option<bool>,
+    technical_white_balance_review_required: Option<bool>,
+    expected_technical_white_balance_review_required: Option<bool>,
+    creative_temperature: Option<f64>,
+    expected_creative_temperature: Option<f64>,
+    creative_tint: Option<f64>,
+    expected_creative_tint: Option<f64>,
+    seam_exposure_model: Option<String>,
+    expected_seam_exposure_model: Option<String>,
+    seam_exposure_held_out_validation_passed: Option<bool>,
+    expected_seam_exposure_held_out_validation_passed: Option<bool>,
+    seam_exposure_held_out_improvement_over_gain: Option<f64>,
+    expected_seam_exposure_held_out_improvement_over_gain_min: Option<f64>,
+    seam_exposure_offset_normalized_abs_max: Option<f64>,
+    expected_seam_exposure_offset_normalized_abs_max: Option<f64>,
+    seam_exposure_spatial_slope_abs_max: Option<f64>,
+    expected_seam_exposure_spatial_slope_abs_min: Option<f64>,
+    expected_seam_exposure_spatial_slope_abs_max: Option<f64>,
+    seam_exposure_spatial_slope_agreement_ratio: Option<f64>,
+    expected_seam_exposure_spatial_slope_agreement_ratio_min: Option<f64>,
+    seam_exposure_held_out_spatial_improvement_over_best_constant: Option<f64>,
+    expected_seam_exposure_held_out_spatial_improvement_over_best_constant_min: Option<f64>,
+    seam_exposure_spatial_offset_slope_normalized_abs_max: Option<f64>,
+    expected_seam_exposure_spatial_offset_slope_normalized_abs_min: Option<f64>,
+    expected_seam_exposure_spatial_offset_slope_normalized_abs_max: Option<f64>,
+    seam_exposure_spatial_offset_endpoint_normalized_abs_max: Option<f64>,
+    expected_seam_exposure_spatial_offset_endpoint_normalized_abs_max: Option<f64>,
+    seam_exposure_spatial_affine_slope_agreement_ratio: Option<f64>,
+    expected_seam_exposure_spatial_affine_slope_agreement_ratio_min: Option<f64>,
+    seam_exposure_spatial_affine_center_offset_delta_normalized: Option<f64>,
+    expected_seam_exposure_spatial_affine_center_offset_delta_normalized_max: Option<f64>,
+    seam_exposure_held_out_spatial_gain_offset_improvement_over_best_simpler: Option<f64>,
+    expected_seam_exposure_held_out_spatial_gain_offset_improvement_over_best_simpler_min:
+        Option<f64>,
+    seam_blend_mode: Option<String>,
+    expected_seam_blend_required: bool,
+    expected_seam_blend_mode: Option<String>,
+    seam_blend_review_required: Option<bool>,
+    expected_seam_blend_review_required: Option<bool>,
+    seam_detail_review_required: Option<bool>,
+    expected_seam_detail_review_required: Option<bool>,
+    seam_detail_supported_scale_count: Option<usize>,
+    expected_seam_detail_supported_scale_count_min: Option<usize>,
+    seam_detail_max_symmetric_energy_ratio: Option<f64>,
+    expected_seam_detail_max_symmetric_energy_ratio_max: Option<f64>,
+    seam_gradient_ratio: Option<f64>,
+    expected_seam_gradient_ratio_max: Option<f64>,
+    seam_overlap_p95_abs_difference: Option<f64>,
+    expected_seam_overlap_p95_abs_difference_max: Option<f64>,
     base_estimate_source: Option<String>,
     expected_base_estimate_source: Option<String>,
+    negative_reconstruction: NegativeReconstructionFixtureSuiteEvidence,
     reference_evidence: Vec<String>,
     render_input_source: Option<String>,
     expected_render_input_source: Option<String>,
@@ -777,6 +1355,8 @@ struct FixtureSuiteEntry {
     calibration_roll_profile_id: Option<String>,
     calibration_requested_film_stock: Option<String>,
     calibration_acceptance_status: Option<String>,
+    calibration_color_mapping_applied: Option<bool>,
+    expected_calibration_color_mapping_applied: Option<bool>,
     calibration_confidence: Option<f64>,
     expected_calibration_confidence_min: Option<f64>,
     calibration_matrix_condition_number: Option<f64>,
@@ -815,6 +1395,14 @@ struct FixtureSuiteEntry {
     expected_candidate_risk: Option<String>,
     tone_color_trust_state: Option<String>,
     expected_tone_color_trust_state: Option<String>,
+    neutral_safety_rescue_applied: Option<bool>,
+    expected_neutral_safety_rescue_applied: Option<bool>,
+    neutral_safety_rescue_preserved_ratio_gain: Option<f64>,
+    expected_neutral_safety_rescue_preserved_ratio_gain_min: Option<f64>,
+    neutral_safety_rescue_midtone_saturation_p95_reduction: Option<f64>,
+    expected_neutral_safety_rescue_midtone_saturation_p95_reduction_min: Option<f64>,
+    neutral_safety_rescue_reason: Option<String>,
+    expected_neutral_safety_rescue_reason_contains: Option<String>,
     highlight_chroma_compressed_ratio: Option<f64>,
     expected_highlight_chroma_compressed_ratio_min: Option<f64>,
     expected_highlight_chroma_compressed_ratio_max: Option<f64>,
@@ -822,10 +1410,53 @@ struct FixtureSuiteEntry {
     expected_highlight_neutral_chroma_compressed_ratio_max: Option<f64>,
     shadow_chroma_compressed_ratio: Option<f64>,
     expected_shadow_chroma_compressed_ratio_max: Option<f64>,
+    effective_grain_reduction: Option<String>,
+    effective_grain_strength: Option<f64>,
+    effective_grain_scale: Option<f64>,
+    grain_reduction_enabled: Option<bool>,
+    expected_grain_reduction_enabled: Option<bool>,
+    grain_reduction_applied_ratio: Option<f64>,
+    expected_grain_reduction_applied_ratio_min: Option<f64>,
+    grain_reduction_structure_excluded_ratio: Option<f64>,
+    expected_grain_reduction_structure_excluded_ratio_min: Option<f64>,
+    grain_reduction_flat_luma_p95_reduction_ratio: Option<f64>,
+    expected_grain_reduction_flat_luma_p95_reduction_ratio_min: Option<f64>,
+    grain_reduction_flat_chroma_p95_reduction_ratio: Option<f64>,
+    expected_grain_reduction_flat_chroma_p95_reduction_ratio_min: Option<f64>,
+    grain_detail_review_required: Option<bool>,
+    expected_grain_detail_review_required: Option<bool>,
+    grain_detail_decision_supported: Option<bool>,
+    expected_grain_detail_decision_supported: Option<bool>,
+    grain_detail_luminance_probe_count: Option<usize>,
+    expected_grain_detail_luminance_probe_count_min: Option<usize>,
+    grain_detail_chroma_probe_count: Option<usize>,
+    expected_grain_detail_chroma_probe_count_min: Option<usize>,
+    grain_detail_luminance_p10_retention: Option<f64>,
+    expected_grain_detail_luminance_p10_retention_min: Option<f64>,
+    grain_detail_chroma_p10_retention: Option<f64>,
+    expected_grain_detail_chroma_p10_retention_min: Option<f64>,
     mapping_strategy: Option<String>,
     expected_mapping_strategy: Option<String>,
     post_scale_preserved_ratio: Option<f64>,
     expected_post_scale_preserved_ratio_min: Option<f64>,
+    render_luminance_range_p05_p95: Option<f64>,
+    expected_render_luminance_range_p05_p95_min: Option<f64>,
+    render_review_status: Option<String>,
+    expected_render_review_status: Option<String>,
+    render_reviewable: Option<bool>,
+    expected_render_reviewable: Option<bool>,
+    tone_output_confidence_status: Option<String>,
+    expected_tone_output_confidence_status: Option<String>,
+    tone_output_review_required: Option<bool>,
+    expected_tone_output_review_required: Option<bool>,
+    tone_output_evidence_confidence: Option<f64>,
+    expected_tone_output_evidence_confidence_min: Option<f64>,
+    render_to_mapped_luminance_range_ratio: Option<f64>,
+    expected_render_to_mapped_luminance_range_ratio_min: Option<f64>,
+    post_chroma_compression_clipped_high_ratio_max: Option<f64>,
+    expected_post_chroma_compression_clipped_high_ratio_max: Option<f64>,
+    post_chroma_compression_clipped_low_ratio_max: Option<f64>,
+    expected_post_chroma_compression_clipped_low_ratio_max: Option<f64>,
     reference_patch_evaluation_present: Option<bool>,
     reference_patch_patch_count: Option<usize>,
     reference_patch_selected_rms_delta_e: Option<f64>,
@@ -938,6 +1569,12 @@ struct RollSuiteSummary {
 #[derive(Debug, Clone, Serialize)]
 struct RollSuiteReviewSummary {
     frame_count: usize,
+    render_reviewable_count: usize,
+    render_not_reviewable_count: usize,
+    render_reviewable_unknown_count: usize,
+    tone_output_evaluated_count: usize,
+    tone_output_review_required_count: usize,
+    tone_output_unknown_count: usize,
     candidate_safe_count: usize,
     candidate_review_required_count: usize,
     candidate_unknown_count: usize,
@@ -947,6 +1584,9 @@ struct RollSuiteReviewSummary {
     reference_patch_evaluation_present_count: usize,
     reference_patch_evaluation_missing_count: usize,
     reference_patch_evaluation_unknown_count: usize,
+    render_review_status_counts: Vec<RollSuiteValueCount>,
+    tone_output_confidence_status_counts: Vec<RollSuiteValueCount>,
+    tone_output_review_reason_counts: Vec<RollSuiteValueCount>,
     candidate_risk_counts: Vec<RollSuiteValueCount>,
     tone_color_trust_state_counts: Vec<RollSuiteValueCount>,
     calibration_status_counts: Vec<RollSuiteValueCount>,
@@ -975,6 +1615,16 @@ struct RollSuiteComparison {
 
 #[derive(Debug, Clone, Serialize)]
 struct RollSuiteQualityComparison {
+    noise_reduction_enabled_count_delta: Option<isize>,
+    grain_detail_evaluated_count_delta: Option<isize>,
+    grain_detail_decision_supported_count_delta: Option<isize>,
+    grain_detail_review_required_count_delta: Option<isize>,
+    grain_detail_luminance_supported_count_delta: Option<isize>,
+    grain_detail_chroma_supported_count_delta: Option<isize>,
+    grain_detail_luminance_p10_retention_mean_delta: Option<f64>,
+    grain_detail_luminance_p10_retention_min_delta: Option<f64>,
+    grain_detail_chroma_p10_retention_mean_delta: Option<f64>,
+    grain_detail_chroma_p10_retention_min_delta: Option<f64>,
     render_luminance_range_p05_p95_mean_delta: Option<f64>,
     render_luminance_range_p05_p95_min_delta: Option<f64>,
     render_luminance_range_p05_p95_max_delta: Option<f64>,
@@ -1011,9 +1661,39 @@ struct RollSuiteFrameComparison {
     baseline_status: Option<String>,
     current_status: Option<String>,
     status_changed: bool,
+    baseline_render_review_status: Option<String>,
+    current_render_review_status: Option<String>,
+    render_review_status_changed: bool,
+    baseline_render_reviewable: Option<bool>,
+    current_render_reviewable: Option<bool>,
+    render_reviewable_changed: bool,
+    baseline_tone_output_confidence_status: Option<String>,
+    current_tone_output_confidence_status: Option<String>,
+    tone_output_confidence_status_changed: bool,
+    baseline_tone_output_review_required: Option<bool>,
+    current_tone_output_review_required: Option<bool>,
+    tone_output_review_required_changed: bool,
+    tone_output_evidence_confidence_delta: Option<f64>,
+    tone_output_render_to_mapped_luminance_range_ratio_delta: Option<f64>,
+    tone_output_maximum_post_tone_high_clip_ratio_delta: Option<f64>,
+    tone_output_maximum_post_tone_low_clip_ratio_delta: Option<f64>,
     baseline_candidate_risk: Option<String>,
     current_candidate_risk: Option<String>,
     candidate_risk_changed: bool,
+    baseline_grain_detail_review_required: Option<bool>,
+    current_grain_detail_review_required: Option<bool>,
+    grain_detail_review_required_changed: bool,
+    baseline_grain_detail_decision_supported: Option<bool>,
+    current_grain_detail_decision_supported: Option<bool>,
+    grain_detail_decision_supported_changed: bool,
+    baseline_grain_detail_luminance_supported: Option<bool>,
+    current_grain_detail_luminance_supported: Option<bool>,
+    grain_detail_luminance_supported_changed: bool,
+    baseline_grain_detail_chroma_supported: Option<bool>,
+    current_grain_detail_chroma_supported: Option<bool>,
+    grain_detail_chroma_supported_changed: bool,
+    grain_detail_luminance_p10_retention_delta: Option<f64>,
+    grain_detail_chroma_p10_retention_delta: Option<f64>,
     render_luminance_range_p05_p95_delta: Option<f64>,
     midtone_luminance_p50_delta: Option<f64>,
     shadow_saturation_p95_delta: Option<f64>,
@@ -1049,12 +1729,29 @@ struct RollSuiteQualitySummary {
     noise_reduction_enabled_count: usize,
     noise_reduction_applied_ratio_mean: Option<f64>,
     noise_reduction_applied_ratio_max: Option<f64>,
+    noise_reduction_structure_excluded_ratio_mean: Option<f64>,
+    noise_reduction_structure_excluded_ratio_min: Option<f64>,
     noise_reduction_texture_limited_ratio_mean: Option<f64>,
     noise_reduction_saturation_limited_ratio_mean: Option<f64>,
     noise_reduction_mean_abs_chroma_delta_mean: Option<f64>,
     noise_reduction_mean_abs_luma_delta_mean: Option<f64>,
     noise_reduction_max_abs_chroma_delta_max: Option<f64>,
     noise_reduction_max_abs_luma_delta_max: Option<f64>,
+    grain_detail_evaluated_count: usize,
+    grain_detail_decision_supported_count: usize,
+    grain_detail_review_required_count: usize,
+    grain_detail_luminance_supported_count: usize,
+    grain_detail_chroma_supported_count: usize,
+    grain_detail_luminance_probe_count_min: Option<usize>,
+    grain_detail_chroma_probe_count_min: Option<usize>,
+    grain_detail_luminance_median_retention_mean: Option<f64>,
+    grain_detail_luminance_median_retention_min: Option<f64>,
+    grain_detail_luminance_p10_retention_mean: Option<f64>,
+    grain_detail_luminance_p10_retention_min: Option<f64>,
+    grain_detail_chroma_median_retention_mean: Option<f64>,
+    grain_detail_chroma_median_retention_min: Option<f64>,
+    grain_detail_chroma_p10_retention_mean: Option<f64>,
+    grain_detail_chroma_p10_retention_min: Option<f64>,
     colorspace_post_scale_preserved_ratio_mean: Option<f64>,
     colorspace_post_scale_preserved_ratio_min: Option<f64>,
     render_luminance_range_p05_p95_mean: Option<f64>,
@@ -1133,6 +1830,8 @@ struct RollSuiteEntry {
     output_height: Option<usize>,
     output_color_space: Option<String>,
     output_file_icc_profile_matches_report: Option<bool>,
+    delivery_artifacts_intact: Option<bool>,
+    delivery_artifact_issues: Vec<String>,
     stale_render_artifact_count: Option<usize>,
     report_path: Option<String>,
     summary_json_path: Option<String>,
@@ -1144,6 +1843,17 @@ struct RollSuiteEntry {
     input_base_confidence: Option<f64>,
     render_review_status: Option<String>,
     render_reviewable: Option<bool>,
+    tone_output_evidence_evaluated: Option<bool>,
+    tone_output_evidence_confidence: Option<f64>,
+    tone_output_confidence_status: Option<String>,
+    tone_output_review_required: Option<bool>,
+    tone_output_review_reason: Option<String>,
+    confidence_limited_by_tone_output_evidence: Option<bool>,
+    input_luminance_range_p05_p95: Option<f64>,
+    mapped_luminance_range_p05_p95: Option<f64>,
+    render_to_mapped_luminance_range_ratio: Option<f64>,
+    maximum_post_tone_high_clip_ratio: Option<f64>,
+    maximum_post_tone_low_clip_ratio: Option<f64>,
     positive_input_likely_negative_like: Option<bool>,
     positive_input_accepted_high_warm_score: Option<bool>,
     positive_input_orange_mask_score: Option<f64>,
@@ -1197,15 +1907,30 @@ struct RollSuiteEntry {
     high_frequency_flat_chroma_to_luma_p95_ratio: Option<f64>,
     noise_reduction_enabled: Option<bool>,
     noise_reduction_applied_ratio: Option<f64>,
+    noise_reduction_structure_gate_start: Option<f64>,
+    noise_reduction_structure_gate_end: Option<f64>,
+    noise_reduction_structure_excluded_ratio: Option<f64>,
     noise_reduction_texture_limited_ratio: Option<f64>,
     noise_reduction_saturation_limited_ratio: Option<f64>,
     noise_reduction_mean_abs_chroma_delta: Option<f64>,
     noise_reduction_max_abs_chroma_delta: Option<f64>,
     noise_reduction_mean_abs_luma_delta: Option<f64>,
     noise_reduction_max_abs_luma_delta: Option<f64>,
+    grain_detail_evaluated: Option<bool>,
+    grain_detail_decision_supported: Option<bool>,
+    grain_detail_review_required: Option<bool>,
+    grain_detail_luminance_supported: Option<bool>,
+    grain_detail_chroma_supported: Option<bool>,
+    grain_detail_luminance_probe_count: Option<usize>,
+    grain_detail_chroma_probe_count: Option<usize>,
+    grain_detail_luminance_median_retention: Option<f64>,
+    grain_detail_luminance_p10_retention: Option<f64>,
+    grain_detail_chroma_median_retention: Option<f64>,
+    grain_detail_chroma_p10_retention: Option<f64>,
     calibration_status: Option<String>,
     calibration_source: Option<String>,
     calibration_acceptance_status: Option<String>,
+    calibration_color_mapping_applied: Option<bool>,
     calibration_confidence: Option<f64>,
     reference_patch_evaluation_present: Option<bool>,
     debug_artifact_count: Option<usize>,
@@ -1224,9 +1949,13 @@ fn run_roll_suite_child(cli: &ValidationCli) -> Result<(), Box<dyn std::error::E
         .component2
         .clone()
         .ok_or("--roll-suite-child requires --component2")?;
+    let inputs = if component1 == component2 && cli.force_no_stitch {
+        vec![component1]
+    } else {
+        vec![component1, component2]
+    };
     let pipeline_cli = PipelineCli {
-        component1,
-        component2,
+        inputs,
         output_dir: cli.output_dir.clone(),
         calibration_profile: cli.calibration_profile.clone(),
         calibration_library: cli.calibration_library.clone(),
@@ -1242,6 +1971,9 @@ fn run_roll_suite_child(cli: &ValidationCli) -> Result<(), Box<dyn std::error::E
         input_mode: cli.input_mode,
         render_intent: cli.render_intent,
         quality_mode: cli.quality_mode,
+        white_balance: cli.white_balance,
+        geometry: cli.geometry,
+        grain: cli.grain,
         write_master: cli.write_master,
         review_sidecar: cli.review_sidecar.clone(),
         write_review_sidecar: cli.write_review_sidecar.clone(),
@@ -1253,6 +1985,7 @@ fn run_roll_suite_child(cli: &ValidationCli) -> Result<(), Box<dyn std::error::E
         ica_tol: cli.ica_tol,
         bit_depth: cli.bit_depth,
         use_opencv: cli.use_opencv,
+        require_reviewable: false,
     };
 
     let report = scanstitch::pipeline::run(&pipeline_cli)?;
@@ -1265,13 +1998,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let cli = ValidationCli::parse();
     validate_input_mode_options(cli.input_mode, cli.render_input)?;
+    cli.geometry.validate()?;
+    cli.white_balance.validate()?;
     if cli.roll_suite_child {
         return run_roll_suite_child(&cli);
+    }
+
+    if cli.require_reviewable
+        && (cli.list_fixtures
+            || cli.write_orientation_review.is_some()
+            || cli.write_render_review.is_some()
+            || cli.fixture_coverage
+            || cli.synthetic_color_suite
+            || (cli.roll_inventory && !cli.roll_suite))
+    {
+        return Err("--require-reviewable requires a direct render/report, --fixture-suite, or --roll-suite; inventory, coverage, listing, orientation-review, render-review-draft, and synthetic-decision modes do not produce final renders".into());
     }
 
     let registry = load_fixture_registry(cli.fixture_registry.as_ref())?;
     let fixtures = &registry.fixtures;
 
+    if cli.write_orientation_review.is_some()
+        && (cli.list_fixtures
+            || cli.synthetic_color_suite
+            || cli.fixture_coverage
+            || cli.fixture_suite
+            || cli.roll_inventory
+            || cli.roll_suite
+            || cli.report.is_some()
+            || cli.write_render_review.is_some())
+    {
+        return Err("--write-orientation-review is a standalone decode/review mode and cannot be combined with listing, report, coverage, suite, or roll modes".into());
+    }
+    if cli.write_render_review.is_some() {
+        if cli.report.is_none() {
+            return Err("--write-render-review requires --report".into());
+        }
+        if cli.list_fixtures
+            || cli.synthetic_color_suite
+            || cli.fixture_coverage
+            || cli.fixture_suite
+            || cli.roll_inventory
+            || cli.roll_suite
+            || cli.write_orientation_review.is_some()
+            || cli.compare_report.is_some()
+            || cli.compare_summary.is_some()
+            || cli.write_summary_baseline.is_some()
+        {
+            return Err("--write-render-review is a standalone report-review draft mode and cannot be combined with listing, comparison, baseline, coverage, suite, inventory, or orientation-review modes".into());
+        }
+    }
+    if cli.render_review_grain_control_report.is_some() && cli.write_render_review.is_none() {
+        return Err("--render-review-grain-control-report requires --write-render-review".into());
+    }
     if cli.write_fixture_hash_registry.is_some() && !cli.fixture_coverage {
         return Err("--write-fixture-hash-registry requires --fixture-coverage".into());
     }
@@ -1321,7 +2100,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 name,
                 fixture.component1.display(),
-                fixture.component2.display(),
+                fixture
+                    .component2
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
                 fixture
                     .summary_baseline
                     .as_ref()
@@ -1336,6 +2119,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fixture.reference_evidence.join(","),
                 fixture.calibration_case.as_deref().unwrap_or(""),
                 fixture.description.as_deref().unwrap_or("")
+            );
+        }
+        return Ok(());
+    }
+
+    if let Some(output_dir) = &cli.write_orientation_review {
+        let (manifest, json_path, md_path) =
+            write_orientation_review_package(&cli, fixtures, output_dir)?;
+        if cli.print_json_summary {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&manifest)
+                    .expect("orientation review manifest should serialize")
+            );
+        }
+        if !cli.quiet {
+            println!("orientation_review_json={}", json_path.display());
+            println!("orientation_review_md={}", md_path.display());
+            println!(
+                "orientation_review_status={} components={} action=visually_approve_each_preview_then_copy_the_draft_and_set_upright_approved_true",
+                manifest.review_status,
+                manifest.orientation_components_expected.len()
+            );
+        }
+        return Ok(());
+    }
+
+    if let Some(output_dir) = &cli.write_render_review {
+        let report_path = cli
+            .report
+            .as_deref()
+            .expect("--write-render-review validation requires --report");
+        let draft = render_review::write_render_review_draft_with_grain_control(
+            &cli.fixture,
+            report_path,
+            cli.render_review_grain_control_report.as_deref(),
+            output_dir,
+        )?;
+        if cli.print_json_summary {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&draft.manifest)
+                    .expect("render review manifest should serialize")
+            );
+        }
+        if !cli.quiet {
+            println!("render_review_json={}", draft.json_path.display());
+            println!("render_review_md={}", draft.markdown_path.display());
+            println!(
+                "render_review_status={} technical_delivery_reviewable={} artifacts={} grain_control_bound={} action=inspect_exact_artifacts_then_complete_all_applicable_human_decisions",
+                draft.manifest.review_status,
+                draft.manifest.technical_delivery_reviewable,
+                draft.manifest.artifacts.len(),
+                draft.manifest.grain_reduction_control.is_some()
             );
         }
         return Ok(());
@@ -1397,6 +2234,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             comparison.issues.join(",")
                         }
                     );
+                }
+            }
+            if cli.require_reviewable {
+                let rejected = summary
+                    .frames
+                    .iter()
+                    .filter(|frame| {
+                        !final_render_is_reviewable(
+                            frame.render_review_status.as_deref(),
+                            frame.render_reviewable,
+                        ) || frame.delivery_artifacts_intact != Some(true)
+                    })
+                    .map(|frame| frame.name.clone())
+                    .collect::<Vec<_>>();
+                if !rejected.is_empty() {
+                    return Err(format!(
+                        "--require-reviewable rejected roll-suite frame(s): {}; reports and roll summary artifacts were retained",
+                        rejected.join(", ")
+                    )
+                    .into());
                 }
             }
             let mut all_issues = summary.issues.clone();
@@ -1467,7 +2324,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &cli,
                 &summary,
                 contact_sheet_path,
-                cli.write_roll_contact_sheet_index.as_ref(),
+                cli.write_roll_contact_sheet_index.as_deref(),
             )?;
         }
         if cli.print_json_summary {
@@ -1630,6 +2487,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             );
         }
+        if cli.require_reviewable {
+            let rejected = summary
+                .fixtures
+                .iter()
+                .filter(|fixture| {
+                    !final_render_is_reviewable(
+                        fixture.render_review_status.as_deref(),
+                        fixture.render_reviewable,
+                    ) || fixture.delivery_artifacts_intact != Some(true)
+                })
+                .map(|fixture| fixture.name.clone())
+                .collect::<Vec<_>>();
+            if !rejected.is_empty() {
+                return Err(format!(
+                    "--require-reviewable rejected fixture-suite output(s): {}; reports and fixture-suite summary artifacts were retained",
+                    rejected.join(", ")
+                )
+                .into());
+            }
+        }
         let selected_failures = selected_failures(&summary.issues, &cli.fail_on);
         if cli.strict && !summary.issues.is_empty() {
             return Err(format!(
@@ -1699,11 +2576,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let contents = std::fs::read_to_string(report_path)?;
         serde_json::from_str::<PipelineReport>(&contents)?
     } else {
-        let (component1, component2) = resolve_components(&cli, fixtures)?;
+        let inputs = resolve_inputs(&cli, fixtures)?;
         let output_dir = effective_output_dir(&cli, fixtures);
+        let input_mode = effective_input_mode(&cli, fixtures)?;
+        validate_input_mode_options(input_mode, cli.render_input)?;
+        let bit_depth = effective_bit_depth(&cli, fixtures)?;
+        let grain = effective_grain(&cli, fixtures)?;
+        let geometry = effective_geometry(&cli, fixtures)?;
+        let (force_stitch, force_no_stitch) = effective_force_settings(&cli, fixtures)?;
         let pipeline_cli = PipelineCli {
-            component1,
-            component2,
+            inputs,
             output_dir,
             calibration_profile: effective_calibration_profile(&cli, fixtures),
             calibration_library: effective_calibration_library(&cli, fixtures),
@@ -1716,20 +2598,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             base_color_reason: None,
             color_mode: cli.color_mode,
             render_input: cli.render_input,
-            input_mode: cli.input_mode,
+            input_mode,
             render_intent: cli.render_intent,
             quality_mode: cli.quality_mode,
+            white_balance: cli.white_balance,
+            geometry,
+            grain,
             write_master: cli.write_master,
             review_sidecar: cli.review_sidecar.clone(),
             write_review_sidecar: cli.write_review_sidecar.clone(),
             debug: cli.debug,
-            force_stitch: cli.force_stitch,
-            force_no_stitch: cli.force_no_stitch,
+            force_stitch,
+            force_no_stitch,
             transform: cli.transform.clone(),
             ica_max_iter: cli.ica_max_iter,
             ica_tol: cli.ica_tol,
-            bit_depth: cli.bit_depth,
+            bit_depth,
             use_opencv: cli.use_opencv,
+            require_reviewable: false,
         };
         let report = scanstitch::pipeline::run(&pipeline_cli)?;
         let report_path = pipeline_cli.output_dir.join("report.json");
@@ -1809,6 +2695,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         print_summary_table(&summary);
     }
+    if !summary.diagnostic_consistency_issues.is_empty() {
+        if !cli.quiet {
+            println!(
+                "diagnostic_consistency_issues={}",
+                summary.diagnostic_consistency_issues.join(",")
+            );
+        }
+        let selected_failures =
+            selected_failures(&summary.diagnostic_consistency_issues, &cli.fail_on);
+        if cli.strict {
+            return Err(format!(
+                "strict report consistency validation failed with issue(s): {}",
+                summary.diagnostic_consistency_issues.join(", ")
+            )
+            .into());
+        }
+        if !selected_failures.is_empty() {
+            return Err(format!(
+                "--fail-on matched diagnostic consistency issue(s): {}",
+                selected_failures.join(", ")
+            )
+            .into());
+        }
+    }
+    if cli.require_reviewable && !final_delivery_evidence_is_reviewable(&summary.render) {
+        let artifact_issues = delivery_artifact_integrity_issues(&summary.render);
+        return Err(format!(
+            "--require-reviewable rejected validation output: render_review_status={} render_reviewable={} delivery_artifact_issues={}; report and validation summary artifacts were retained",
+            summary
+                .render
+                .render_review_status
+                .as_deref()
+                .unwrap_or("missing"),
+            summary
+                .render
+                .render_reviewable
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "missing".to_string()),
+            if artifact_issues.is_empty() {
+                "none".to_string()
+            } else {
+                artifact_issues.join(",")
+            }
+        )
+        .into());
+    }
     if let Some(comparison) = &summary.comparison {
         if !cli.quiet {
             println!(
@@ -1877,16 +2809,23 @@ fn load_fixture_registry(
         "logan".to_string(),
         FixtureEntry {
             component1: PathBuf::from("LOGAN043.tif"),
-            component2: PathBuf::from("LOGAN044.tif"),
+            component2: Some(PathBuf::from("LOGAN044.tif")),
             component1_sha256: Some(
                 "62af658c26d41ab69ebc91d09a2a37d30f806123c1b4e507b464a334d836b329".to_string(),
             ),
             component2_sha256: Some(
                 "f220edf8704d4d81374ad2befe22c5fdcaf44faafa39228d9f2bf8409bd2a1eb".to_string(),
             ),
+            additional_components: Vec::new(),
             output_dir: Some(PathBuf::from("output/validation/logan")),
             input_mode: None,
             bit_depth: None,
+            grain_reduction: None,
+            grain_strength: None,
+            grain_scale: None,
+            deskew: None,
+            orientation_correction: None,
+            deskew_angle_degrees: None,
             force_stitch: false,
             force_no_stitch: false,
             calibration_profile: None,
@@ -1899,6 +2838,8 @@ fn load_fixture_registry(
             scene_tags: vec!["outdoor".to_string(), "logan-real-scan".to_string()],
             exposure_tags: vec!["normal-exposure".to_string()],
             reference_evidence: Vec::new(),
+            render_review: None,
+            render_review_sha256: None,
             calibration_case: Some("uncalibrated-image-derived".to_string()),
             expectations: FixtureExpectations {
                 stitch_decision: Some("accepted".to_string()),
@@ -1909,15 +2850,17 @@ fn load_fixture_registry(
                 selected_candidate: Some("gamut_trusted_image_matrix_blend".to_string()),
                 selected_candidate_rank: Some(1),
                 calibration_acceptance_status: Some("not_applicable".to_string()),
+                calibration_color_mapping_applied: Some(false),
                 candidate_risk: Some("review_neutral_support".to_string()),
                 tone_color_trust_state: Some("review_required".to_string()),
+                render_reviewable: Some(false),
                 ..FixtureExpectations::default()
             },
             summary_baseline: Some(PathBuf::from(
                 "tests/fixtures/baselines/logan_summary_baseline.json",
             )),
             summary_baseline_sha256: Some(
-                "67a6af19b70862ebc2aa381acda62c54adb80534229c338111a96f37d4320fae".to_string(),
+                "0f9f8a68159bfb8e1308f8692d18401d338b09c4a0970ef9194d16ef404de717".to_string(),
             ),
             description: Some("Local LOGAN split-frame pair".to_string()),
         },
@@ -1993,9 +2936,20 @@ fn fixture_hash_registry_snapshot(
             &mut fixture.component2_sha256,
             entry.component2_sha256.as_ref(),
         );
+        for (component, probe) in fixture
+            .additional_components
+            .iter_mut()
+            .zip(&entry.additional_components)
+        {
+            fill_hash_from_probe(&mut component.sha256, probe.sha256.as_ref());
+        }
         fill_hash_from_probe(
             &mut fixture.summary_baseline_sha256,
             entry.summary_baseline_sha256.as_ref(),
+        );
+        fill_hash_from_probe(
+            &mut fixture.render_review_sha256,
+            entry.render_review_sha256.as_ref(),
         );
         fill_hash_from_probe(
             &mut fixture.calibration_profile_sha256,
@@ -2021,7 +2975,8 @@ fn strip_empty_registry_snapshot_values(value: &mut serde_json::Value) -> bool {
         serde_json::Value::Object(map) => {
             let keys = map.keys().cloned().collect::<Vec<_>>();
             for key in keys {
-                let remove_default_false = (key == "reference_patch_evaluation_required"
+                let remove_default_false = (key == "seam_blend_required"
+                    || key == "reference_patch_evaluation_required"
                     || key == "debug_artifacts_required")
                     && map.get(&key) == Some(&serde_json::Value::Bool(false));
                 let remove_child = !remove_default_false
@@ -2135,6 +3090,871 @@ fn effective_pipeline_film_stock(
     )
 }
 
+fn geometry_for_fixture(
+    default: GeometryArgs,
+    fixture: Option<&FixtureEntry>,
+) -> Result<GeometryArgs, Box<dyn std::error::Error>> {
+    let Some(fixture) = fixture else {
+        return Ok(default);
+    };
+    let deskew = match fixture.deskew.as_deref() {
+        Some(label) => parse_deskew_mode_label(label)
+            .ok_or_else(|| format!("invalid fixture deskew mode `{label}`"))?,
+        None => default.deskew,
+    };
+    let orientation_correction = match fixture.orientation_correction.as_deref() {
+        Some(label) => parse_orientation_correction_label(label)
+            .ok_or_else(|| format!("invalid fixture orientation_correction `{label}`"))?,
+        None => default.orientation_correction,
+    };
+    let geometry = GeometryArgs {
+        orientation_correction,
+        deskew,
+        deskew_angle_degrees: fixture
+            .deskew_angle_degrees
+            .unwrap_or(default.deskew_angle_degrees),
+    };
+    geometry.validate()?;
+    Ok(geometry)
+}
+
+fn effective_geometry(
+    cli: &ValidationCli,
+    fixtures: &BTreeMap<String, FixtureEntry>,
+) -> Result<GeometryArgs, Box<dyn std::error::Error>> {
+    geometry_for_fixture(cli.geometry, fixtures.get(&cli.fixture))
+}
+
+fn effective_input_mode(
+    cli: &ValidationCli,
+    fixtures: &BTreeMap<String, FixtureEntry>,
+) -> Result<InputMode, Box<dyn std::error::Error>> {
+    match fixtures
+        .get(&cli.fixture)
+        .and_then(|fixture| fixture.input_mode.as_deref())
+    {
+        Some(label) => parse_input_mode_label(label)
+            .ok_or_else(|| format!("invalid fixture input_mode `{label}`").into()),
+        None => Ok(cli.input_mode),
+    }
+}
+
+fn effective_bit_depth(
+    cli: &ValidationCli,
+    fixtures: &BTreeMap<String, FixtureEntry>,
+) -> Result<u8, Box<dyn std::error::Error>> {
+    let bit_depth = fixtures
+        .get(&cli.fixture)
+        .and_then(|fixture| fixture.bit_depth)
+        .unwrap_or(cli.bit_depth);
+    if matches!(bit_depth, 14 | 16) {
+        Ok(bit_depth)
+    } else {
+        Err(format!("invalid fixture bit_depth `{bit_depth}`").into())
+    }
+}
+
+fn grain_for_fixture(
+    default: GrainReductionArgs,
+    fixture: Option<&FixtureEntry>,
+) -> Result<GrainReductionArgs, Box<dyn std::error::Error>> {
+    let grain_reduction = match fixture.and_then(|fixture| fixture.grain_reduction.as_deref()) {
+        Some(label) => parse_grain_reduction_mode_label(label)
+            .ok_or_else(|| format!("invalid fixture grain_reduction `{label}`"))?,
+        None => default.grain_reduction,
+    };
+    let grain = GrainReductionArgs {
+        grain_reduction,
+        grain_strength: fixture
+            .and_then(|fixture| fixture.grain_strength)
+            .unwrap_or(default.grain_strength),
+        grain_scale: fixture
+            .and_then(|fixture| fixture.grain_scale)
+            .unwrap_or(default.grain_scale),
+    };
+    if let Err(error) = validate_grain_settings(grain) {
+        return Err(error.into());
+    }
+    Ok(grain)
+}
+
+fn effective_grain(
+    cli: &ValidationCli,
+    fixtures: &BTreeMap<String, FixtureEntry>,
+) -> Result<GrainReductionArgs, Box<dyn std::error::Error>> {
+    grain_for_fixture(cli.grain, fixtures.get(&cli.fixture))
+}
+
+fn validate_grain_settings(grain: GrainReductionArgs) -> Result<(), String> {
+    if !grain.grain_strength.is_finite() || !(0.0..=1.0).contains(&grain.grain_strength) {
+        return Err("fixture grain_strength must be finite and between 0 and 1".to_string());
+    }
+    if !grain.grain_scale.is_finite() || !(0.5..=4.0).contains(&grain.grain_scale) {
+        return Err("fixture grain_scale must be finite and between 0.5 and 4".to_string());
+    }
+    Ok(())
+}
+
+fn fixture_declares_grain_reduction_enabled(fixture: &FixtureEntry) -> bool {
+    fixture
+        .grain_reduction
+        .as_deref()
+        .and_then(parse_grain_reduction_mode_label)
+        .is_some_and(GrainReductionMode::enabled)
+}
+
+fn fixture_grain_detail_contract_missing_fields(fixture: &FixtureEntry) -> Vec<String> {
+    if !fixture_declares_grain_reduction_enabled(fixture) {
+        return Vec::new();
+    }
+
+    let expectations = &fixture.expectations;
+    let mut missing = Vec::new();
+    if !fixture.grain_strength.is_some_and(|value| value > 0.0) {
+        missing.push("grain_strength>0".to_string());
+    }
+    if fixture.grain_scale.is_none() {
+        missing.push("grain_scale".to_string());
+    }
+    if expectations.grain_reduction_enabled != Some(true) {
+        missing.push("expectations.grain_reduction_enabled=true".to_string());
+    }
+    if expectations.grain_detail_review_required != Some(false) {
+        missing.push("expectations.grain_detail_review_required=false".to_string());
+    }
+    if expectations.grain_detail_decision_supported != Some(true) {
+        missing.push("expectations.grain_detail_decision_supported=true".to_string());
+    }
+    if expectations
+        .grain_detail_luminance_probe_count_min
+        .is_none_or(|value| value < GRAIN_DETAIL_MIN_PROBE_COUNT)
+    {
+        missing.push(format!(
+            "expectations.grain_detail_luminance_probe_count_min>={GRAIN_DETAIL_MIN_PROBE_COUNT}"
+        ));
+    }
+    if expectations
+        .grain_detail_chroma_probe_count_min
+        .is_none_or(|value| value < GRAIN_DETAIL_MIN_PROBE_COUNT)
+    {
+        missing.push(format!(
+            "expectations.grain_detail_chroma_probe_count_min>={GRAIN_DETAIL_MIN_PROBE_COUNT}"
+        ));
+    }
+    if !expectations
+        .grain_detail_luminance_p10_retention_min
+        .is_some_and(|value| value >= GRAIN_DETAIL_P10_RETENTION_MIN)
+    {
+        missing.push(format!(
+            "expectations.grain_detail_luminance_p10_retention_min>={GRAIN_DETAIL_P10_RETENTION_MIN:.2}"
+        ));
+    }
+    if !expectations
+        .grain_detail_chroma_p10_retention_min
+        .is_some_and(|value| value >= GRAIN_DETAIL_P10_RETENTION_MIN)
+    {
+        missing.push(format!(
+            "expectations.grain_detail_chroma_p10_retention_min>={GRAIN_DETAIL_P10_RETENTION_MIN:.2}"
+        ));
+    }
+    missing
+}
+
+fn fixture_grain_reduction_effect_contract_missing_fields(fixture: &FixtureEntry) -> Vec<String> {
+    if !fixture_declares_grain_reduction_enabled(fixture) {
+        return Vec::new();
+    }
+
+    let expectations = &fixture.expectations;
+    let mut missing = Vec::new();
+    if !fixture_grain_detail_contract_missing_fields(fixture).is_empty() {
+        missing.push("grain_detail_contract_complete".to_string());
+    }
+    if !expectations
+        .grain_reduction_applied_ratio_min
+        .is_some_and(|value| value > 0.0)
+    {
+        missing.push("expectations.grain_reduction_applied_ratio_min>0".to_string());
+    }
+    if !expectations
+        .grain_reduction_structure_excluded_ratio_min
+        .is_some_and(|value| value > 0.0)
+    {
+        missing.push("expectations.grain_reduction_structure_excluded_ratio_min>0".to_string());
+    }
+    if !expectations
+        .grain_reduction_flat_luma_p95_reduction_ratio_min
+        .is_some_and(|value| value > 0.0)
+    {
+        missing
+            .push("expectations.grain_reduction_flat_luma_p95_reduction_ratio_min>0".to_string());
+    }
+    if !expectations
+        .grain_reduction_flat_chroma_p95_reduction_ratio_min
+        .is_some_and(|value| value > 0.0)
+    {
+        missing
+            .push("expectations.grain_reduction_flat_chroma_p95_reduction_ratio_min>0".to_string());
+    }
+    missing
+}
+
+fn fixture_declares_render_dynamic_range_contract(fixture: &FixtureEntry) -> bool {
+    let expectations = &fixture.expectations;
+    expectations.post_scale_preserved_ratio_min.is_some()
+        || expectations.render_luminance_range_p05_p95_min.is_some()
+        || expectations.render_review_status.as_deref() == Some("reviewable")
+        || expectations.render_reviewable == Some(true)
+        || expectations.tone_output_confidence_status.is_some()
+        || expectations.tone_output_review_required.is_some()
+        || expectations.tone_output_evidence_confidence_min.is_some()
+        || expectations
+            .render_to_mapped_luminance_range_ratio_min
+            .is_some()
+        || expectations
+            .post_chroma_compression_clipped_high_ratio_max
+            .is_some()
+        || expectations
+            .post_chroma_compression_clipped_low_ratio_max
+            .is_some()
+}
+
+fn fixture_render_dynamic_range_contract_missing_fields(fixture: &FixtureEntry) -> Vec<String> {
+    let expectations = &fixture.expectations;
+    let mut missing = Vec::new();
+    if !expectations
+        .post_scale_preserved_ratio_min
+        .is_some_and(|value| value > 0.0)
+    {
+        missing.push("expectations.post_scale_preserved_ratio_min>0".to_string());
+    }
+    if !expectations
+        .render_luminance_range_p05_p95_min
+        .is_some_and(|value| value > 0.0)
+    {
+        missing.push("expectations.render_luminance_range_p05_p95_min>0".to_string());
+    }
+    if expectations.render_review_status.as_deref() != Some("reviewable") {
+        missing.push("expectations.render_review_status=reviewable".to_string());
+    }
+    if expectations.render_reviewable != Some(true) {
+        missing.push("expectations.render_reviewable=true".to_string());
+    }
+    if expectations.tone_output_confidence_status.as_deref()
+        != Some("supported_render_tonal_distribution")
+    {
+        missing.push(
+            "expectations.tone_output_confidence_status=supported_render_tonal_distribution"
+                .to_string(),
+        );
+    }
+    if expectations.tone_output_review_required != Some(false) {
+        missing.push("expectations.tone_output_review_required=false".to_string());
+    }
+    if !expectations
+        .tone_output_evidence_confidence_min
+        .is_some_and(|value| value > 0.0)
+    {
+        missing.push("expectations.tone_output_evidence_confidence_min>0".to_string());
+    }
+    if !expectations
+        .render_to_mapped_luminance_range_ratio_min
+        .is_some_and(|value| value > 0.0)
+    {
+        missing.push("expectations.render_to_mapped_luminance_range_ratio_min>0".to_string());
+    }
+    if !expectations
+        .post_chroma_compression_clipped_high_ratio_max
+        .is_some_and(|value| value < 1.0)
+    {
+        missing.push("expectations.post_chroma_compression_clipped_high_ratio_max<1".to_string());
+    }
+    if !expectations
+        .post_chroma_compression_clipped_low_ratio_max
+        .is_some_and(|value| value < 1.0)
+    {
+        missing.push("expectations.post_chroma_compression_clipped_low_ratio_max<1".to_string());
+    }
+    missing
+}
+
+fn fixture_declares_stitch_normalization_contract(fixture: &FixtureEntry) -> bool {
+    let expectations = &fixture.expectations;
+    matches!(
+        expectations.stitch_decision.as_deref(),
+        Some("accepted" | "accepted_sequence")
+    ) || expectations.seam_exposure_model.is_some()
+        || expectations
+            .seam_exposure_held_out_validation_passed
+            .is_some()
+        || expectations
+            .seam_exposure_offset_normalized_abs_max
+            .is_some()
+        || expectations.seam_blend_required
+        || expectations.seam_blend_mode.is_some()
+        || expectations.seam_blend_review_required.is_some()
+        || expectations.seam_detail_review_required.is_some()
+        || expectations.seam_detail_supported_scale_count_min.is_some()
+        || expectations
+            .seam_detail_max_symmetric_energy_ratio_max
+            .is_some()
+        || expectations.seam_gradient_ratio_max.is_some()
+        || expectations.seam_overlap_p95_abs_difference_max.is_some()
+}
+
+fn known_stitch_exposure_model(model: &str) -> bool {
+    matches!(
+        model,
+        "sequence_mixed"
+            | "identity"
+            | "gain_only_scalar"
+            | "gain_only_rgb"
+            | "gain_offset_rgb"
+            | "gain_spatial_y_rgb"
+            | "gain_offset_spatial_y_rgb"
+            | "gain_spatial_xy_rgb"
+            | "gain_offset_spatial_xy_rgb"
+            | "gain_spatial_quadratic_xy_rgb"
+            | "gain_offset_spatial_quadratic_xy_rgb"
+    )
+}
+
+fn fixture_stitch_normalization_contract_missing_fields(fixture: &FixtureEntry) -> Vec<String> {
+    let expectations = &fixture.expectations;
+    let mut missing = Vec::new();
+
+    if fixture.force_no_stitch {
+        missing.push("force_no_stitch=false".to_string());
+    }
+    if !matches!(
+        expectations.stitch_decision.as_deref(),
+        Some("accepted" | "accepted_sequence")
+    ) {
+        missing.push("expectations.stitch_decision=accepted|accepted_sequence".to_string());
+    }
+    let exposure_model = expectations.seam_exposure_model.as_deref();
+    if !exposure_model.is_some_and(known_stitch_exposure_model) {
+        missing.push("expectations.seam_exposure_model=known_model".to_string());
+    }
+    let expected_held_out_validation = exposure_model
+        .filter(|model| known_stitch_exposure_model(model))
+        .map(|model| model != "identity");
+    if let Some(expected) = expected_held_out_validation {
+        if expectations.seam_exposure_held_out_validation_passed != Some(expected) {
+            missing.push(format!(
+                "expectations.seam_exposure_held_out_validation_passed={expected}"
+            ));
+        }
+    } else if expectations
+        .seam_exposure_held_out_validation_passed
+        .is_none()
+    {
+        missing
+            .push("expectations.seam_exposure_held_out_validation_passed={true|false}".to_string());
+    }
+    if !expectations
+        .seam_exposure_offset_normalized_abs_max
+        .is_some_and(|value| (0.0..=STITCH_NORMALIZATION_MAX_OFFSET_RATIO).contains(&value))
+    {
+        missing.push(format!(
+            "expectations.seam_exposure_offset_normalized_abs_max<={STITCH_NORMALIZATION_MAX_OFFSET_RATIO:.2}"
+        ));
+    }
+    if !expectations.seam_blend_required {
+        missing.push("expectations.seam_blend_required=true".to_string());
+    }
+    if expectations.seam_blend_mode.as_deref() != Some("seam_aware_multiband") {
+        missing.push("expectations.seam_blend_mode=seam_aware_multiband".to_string());
+    }
+    if expectations.seam_blend_review_required != Some(false) {
+        missing.push("expectations.seam_blend_review_required=false".to_string());
+    }
+    if expectations.seam_detail_review_required != Some(false) {
+        missing.push("expectations.seam_detail_review_required=false".to_string());
+    }
+    if expectations
+        .seam_detail_supported_scale_count_min
+        .is_none_or(|value| value < STITCH_NORMALIZATION_MIN_DETAIL_SCALE_COUNT)
+    {
+        missing.push(format!(
+            "expectations.seam_detail_supported_scale_count_min>={STITCH_NORMALIZATION_MIN_DETAIL_SCALE_COUNT}"
+        ));
+    }
+    if !expectations
+        .seam_detail_max_symmetric_energy_ratio_max
+        .is_some_and(|value| (1.0..=STITCH_NORMALIZATION_MAX_DETAIL_ENERGY_RATIO).contains(&value))
+    {
+        missing.push(format!(
+            "expectations.seam_detail_max_symmetric_energy_ratio_max<={STITCH_NORMALIZATION_MAX_DETAIL_ENERGY_RATIO:.2}"
+        ));
+    }
+    if !expectations
+        .seam_gradient_ratio_max
+        .is_some_and(|value| (0.0..=STITCH_NORMALIZATION_MAX_GRADIENT_RATIO).contains(&value))
+    {
+        missing.push(format!(
+            "expectations.seam_gradient_ratio_max<={STITCH_NORMALIZATION_MAX_GRADIENT_RATIO:.2}"
+        ));
+    }
+    if !expectations
+        .seam_overlap_p95_abs_difference_max
+        .is_some_and(|value| (0.0..1.0).contains(&value))
+    {
+        missing.push("expectations.seam_overlap_p95_abs_difference_max<1".to_string());
+    }
+    missing
+}
+
+fn fixture_declares_geometry_preparation_contract(fixture: &FixtureEntry) -> bool {
+    let expectations = &fixture.expectations;
+    expectations.deskew_all_components_applied.is_some()
+        || expectations
+            .deskew_minimum_component_retained_area_ratio_min
+            .is_some()
+        || expectations.border_crop_all_components_cropped.is_some()
+        || expectations
+            .border_crop_minimum_removed_edge_count_per_component_min
+            .is_some()
+        || expectations.border_crop_retained_area_ratio_min.is_some()
+        || expectations.border_crop_retained_area_ratio_max.is_some()
+        || expectations.border_crop_rejected.is_some()
+}
+
+fn fixture_geometry_preparation_contract_missing_fields(fixture: &FixtureEntry) -> Vec<String> {
+    let expectations = &fixture.expectations;
+    let mut missing = Vec::new();
+    if expectations.deskew_status.as_deref() != Some("applied") {
+        missing.push("expectations.deskew_status=applied".to_string());
+    }
+    if expectations.deskew_applied != Some(true) {
+        missing.push("expectations.deskew_applied=true".to_string());
+    }
+    if expectations.deskew_all_components_applied != Some(true) {
+        missing.push("expectations.deskew_all_components_applied=true".to_string());
+    }
+    if expectations.deskew_review_required != Some(false) {
+        missing.push("expectations.deskew_review_required=false".to_string());
+    }
+    if expectations
+        .deskew_minimum_component_retained_area_ratio_min
+        .is_none_or(|value| value < GEOMETRY_PREPARATION_MIN_DESKEW_RETAINED_AREA_RATIO)
+    {
+        missing.push(format!(
+            "expectations.deskew_minimum_component_retained_area_ratio_min>={GEOMETRY_PREPARATION_MIN_DESKEW_RETAINED_AREA_RATIO:.2}"
+        ));
+    }
+    if expectations.border_crop_all_components_cropped != Some(true) {
+        missing.push("expectations.border_crop_all_components_cropped=true".to_string());
+    }
+    if expectations
+        .border_crop_minimum_removed_edge_count_per_component_min
+        .is_none_or(|value| value < GEOMETRY_PREPARATION_MIN_REMOVED_EDGES_PER_COMPONENT)
+    {
+        missing.push(format!(
+            "expectations.border_crop_minimum_removed_edge_count_per_component_min>={GEOMETRY_PREPARATION_MIN_REMOVED_EDGES_PER_COMPONENT}"
+        ));
+    }
+    if expectations
+        .border_crop_retained_area_ratio_min
+        .is_none_or(|value| value < GEOMETRY_PREPARATION_MIN_BORDER_RETAINED_AREA_RATIO)
+    {
+        missing.push(format!(
+            "expectations.border_crop_retained_area_ratio_min>={GEOMETRY_PREPARATION_MIN_BORDER_RETAINED_AREA_RATIO:.2}"
+        ));
+    }
+    if !expectations
+        .border_crop_retained_area_ratio_max
+        .is_some_and(|value| (0.0..1.0).contains(&value))
+    {
+        missing.push("expectations.border_crop_retained_area_ratio_max<1".to_string());
+    }
+    if expectations.border_crop_rejected != Some(false) {
+        missing.push("expectations.border_crop_rejected=false".to_string());
+    }
+    missing
+}
+
+fn fixture_declares_geometry_accuracy_contract(fixture: &FixtureEntry) -> bool {
+    let expectations = &fixture.expectations;
+    expectations.deskew_correction_degrees_expected.is_some()
+        || expectations.deskew_correction_tolerance_degrees.is_some()
+        || !expectations.border_crop_components_expected.is_empty()
+}
+
+fn fixture_geometry_accuracy_contract_missing_fields(fixture: &FixtureEntry) -> Vec<String> {
+    let expectations = &fixture.expectations;
+    let mut missing = fixture_geometry_preparation_contract_missing_fields(fixture);
+    if !expectations
+        .deskew_correction_degrees_expected
+        .is_some_and(|value| (-3.0..=3.0).contains(&value))
+    {
+        missing.push(
+            "expectations.deskew_correction_degrees_expected=-3..3_factual_target".to_string(),
+        );
+    }
+    if !expectations
+        .deskew_correction_tolerance_degrees
+        .is_some_and(|value| {
+            (0.0..=GEOMETRY_ACCURACY_MAX_DESKEW_TOLERANCE_DEGREES).contains(&value)
+        })
+    {
+        missing.push(format!(
+            "expectations.deskew_correction_tolerance_degrees<={GEOMETRY_ACCURACY_MAX_DESKEW_TOLERANCE_DEGREES:.2}"
+        ));
+    }
+    if expectations.border_crop_components_expected.len() != fixture.component_count() {
+        missing.push(format!(
+            "expectations.border_crop_components_expected=all_{}_components",
+            fixture.component_count()
+        ));
+    }
+    let mut component_indices = BTreeSet::new();
+    for component in &expectations.border_crop_components_expected {
+        if !(1..=fixture.component_count()).contains(&component.component_index) {
+            missing.push(format!(
+                "expectations.border_crop_components_expected.component_index={}_within_1..{}",
+                component.component_index,
+                fixture.component_count()
+            ));
+        } else if !component_indices.insert(component.component_index) {
+            missing.push(format!(
+                "expectations.border_crop_components_expected.component_index={}unique",
+                component.component_index
+            ));
+        }
+        if component.tolerance_px > GEOMETRY_ACCURACY_MAX_CROP_TOLERANCE_PX {
+            missing.push(format!(
+                "expectations.border_crop_components_expected.component_{}.tolerance_px<={GEOMETRY_ACCURACY_MAX_CROP_TOLERANCE_PX}",
+                component.component_index
+            ));
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+fn expected_orientation_transform(
+    tag_present: bool,
+    tag_value: Option<u16>,
+) -> Option<&'static str> {
+    match (tag_present, tag_value) {
+        (false, None) | (true, Some(1)) => Some("identity"),
+        (true, Some(2)) => Some("flip_horizontal"),
+        (true, Some(3)) => Some("rotate_180"),
+        (true, Some(4)) => Some("flip_vertical"),
+        (true, Some(5)) => Some("rotate_90_clockwise_then_flip_horizontal"),
+        (true, Some(6)) => Some("rotate_90_clockwise"),
+        (true, Some(7)) => Some("rotate_270_clockwise_then_flip_horizontal"),
+        (true, Some(8)) => Some("rotate_270_clockwise"),
+        _ => None,
+    }
+}
+
+fn fixture_orientation_correction(fixture: &FixtureEntry) -> OrientationCorrection {
+    fixture
+        .orientation_correction
+        .as_deref()
+        .and_then(parse_orientation_correction_label)
+        .unwrap_or(OrientationCorrection::None)
+}
+
+fn orientation_swaps_dimensions(tag_value: Option<u16>) -> bool {
+    matches!(tag_value, Some(5..=8))
+}
+
+fn fixture_declares_orientation_accuracy_contract(fixture: &FixtureEntry) -> bool {
+    !fixture
+        .expectations
+        .orientation_components_expected
+        .is_empty()
+}
+
+fn fixture_orientation_accuracy_contract_missing_fields(fixture: &FixtureEntry) -> Vec<String> {
+    let expectations = &fixture.expectations.orientation_components_expected;
+    let mut missing = Vec::new();
+    if expectations.len() != fixture.component_count() {
+        missing.push(format!(
+            "expectations.orientation_components_expected=all_{}_components",
+            fixture.component_count()
+        ));
+    }
+    let mut component_indices = BTreeSet::new();
+    for component in expectations {
+        let prefix = format!(
+            "expectations.orientation_components_expected.component_{}",
+            component.component_index
+        );
+        if !(1..=fixture.component_count()).contains(&component.component_index) {
+            missing.push(format!(
+                "expectations.orientation_components_expected.component_index={}_within_1..{}",
+                component.component_index,
+                fixture.component_count()
+            ));
+        } else if !component_indices.insert(component.component_index) {
+            missing.push(format!(
+                "expectations.orientation_components_expected.component_index={}_unique",
+                component.component_index
+            ));
+        }
+        if !component.upright_approved {
+            missing.push(format!("{prefix}.upright_approved=true"));
+        }
+        if !is_valid_sha256_hex(&component.decoded_pixel_sha256) {
+            missing.push(format!("{prefix}.decoded_pixel_sha256=64_hex"));
+        }
+        let metadata_transform =
+            expected_orientation_transform(component.tag_present, component.tag_value);
+        if metadata_transform.is_none() {
+            missing.push(if component.tag_present {
+                format!("{prefix}.tag_value=1..8_when_tag_present")
+            } else {
+                format!("{prefix}.tag_value=null_when_tag_absent")
+            });
+        }
+        let correction = fixture_orientation_correction(fixture);
+        let effective_tag = metadata_transform
+            .is_some()
+            .then(|| tiff_io::compose_orientation_tags(component.tag_value, correction.exif_tag()))
+            .flatten();
+        let expected_transform = effective_tag
+            .map(|tag| tiff_io::orientation_transform_name(Some(tag)))
+            .or_else(|| {
+                (!component.tag_present && correction == OrientationCorrection::None)
+                    .then_some("identity")
+            });
+        if expected_transform.is_some_and(|expected| component.transform != expected) {
+            missing.push(format!(
+                "{prefix}.transform={}",
+                expected_transform.unwrap_or("known_transform")
+            ));
+        }
+        let expected_applied = (component.tag_present && component.tag_value != Some(1))
+            || correction != OrientationCorrection::None;
+        if expected_transform.is_some() && component.applied != expected_applied {
+            missing.push(format!("{prefix}.applied={expected_applied}"));
+        }
+        if component.source_width == 0 || component.source_height == 0 {
+            missing.push(format!("{prefix}.source_dimensions>0"));
+        } else {
+            let (expected_width, expected_height) = if orientation_swaps_dimensions(effective_tag) {
+                (component.source_height, component.source_width)
+            } else {
+                (component.source_width, component.source_height)
+            };
+            if component.output_width != expected_width
+                || component.output_height != expected_height
+            {
+                missing.push(format!(
+                    "{prefix}.output_dimensions={expected_width}x{expected_height}"
+                ));
+            }
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+fn fixture_declares_negative_reconstruction_contract(fixture: &FixtureEntry) -> bool {
+    let expectations = &fixture.expectations;
+    expectations.density_inversion_skipped.is_some()
+        || expectations.negative_response_model.is_some()
+        || expectations.negative_response_source.is_some()
+        || expectations.negative_response_accepted.is_some()
+        || expectations.negative_response_review_required.is_some()
+        || expectations.negative_response_measured_model_id.is_some()
+        || expectations
+            .negative_response_curve_extrapolated_ratio_max
+            .is_some()
+}
+
+fn trusted_negative_base_source(source: &str) -> bool {
+    matches!(
+        source,
+        "working_edges"
+            | "horizontal_base_region"
+            | "vertical_base_region"
+            | "pre_crop_rebate_measurement"
+            | "component_consensus"
+            | "roll_consensus_base"
+    )
+}
+
+fn fixture_negative_reconstruction_contract_missing_fields(fixture: &FixtureEntry) -> Vec<String> {
+    let expectations = &fixture.expectations;
+    let mut missing = Vec::new();
+    if fixture.input_mode.as_deref() != Some("negative") {
+        missing.push("input_mode=negative".to_string());
+    }
+    if !expectations
+        .base_estimate_source
+        .as_deref()
+        .is_some_and(trusted_negative_base_source)
+    {
+        missing.push("expectations.base_estimate_source=measured_base_source".to_string());
+    }
+    if expectations
+        .base_confidence_min
+        .is_none_or(|value| value < NEGATIVE_RECONSTRUCTION_MIN_BASE_CONFIDENCE)
+    {
+        missing.push(format!(
+            "expectations.base_confidence_min>={NEGATIVE_RECONSTRUCTION_MIN_BASE_CONFIDENCE:.2}"
+        ));
+    }
+    if expectations.density_inversion_skipped != Some(false) {
+        missing.push("expectations.density_inversion_skipped=false".to_string());
+    }
+    if expectations.negative_response_model.as_deref() != Some("measured_nonlinear_dye_separation")
+    {
+        missing.push(
+            "expectations.negative_response_model=measured_nonlinear_dye_separation".to_string(),
+        );
+    }
+    if expectations.negative_response_source.as_deref()
+        != Some("measured_roll_target_with_held_out_validation")
+    {
+        missing.push(
+            "expectations.negative_response_source=measured_roll_target_with_held_out_validation"
+                .to_string(),
+        );
+    }
+    if expectations.negative_response_accepted != Some(true) {
+        missing.push("expectations.negative_response_accepted=true".to_string());
+    }
+    if expectations.negative_response_review_required != Some(false) {
+        missing.push("expectations.negative_response_review_required=false".to_string());
+    }
+    if expectations.negative_response_crosstalk_model.as_deref()
+        != Some("measured_3x3_scanner_density_to_film_layers")
+    {
+        missing.push(
+            "expectations.negative_response_crosstalk_model=measured_3x3_scanner_density_to_film_layers"
+                .to_string(),
+        );
+    }
+    if expectations
+        .negative_response_characteristic_curve_model
+        .as_deref()
+        != Some("measured_monotone_pchip_density_to_scene_log_exposure")
+    {
+        missing.push(
+            "expectations.negative_response_characteristic_curve_model=measured_monotone_pchip_density_to_scene_log_exposure"
+                .to_string(),
+        );
+    }
+    if expectations
+        .negative_response_measured_model_id
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        missing.push("expectations.negative_response_measured_model_id=nonempty".to_string());
+    }
+    if expectations
+        .negative_response_measured_confidence_min
+        .is_none_or(|value| value < NEGATIVE_RECONSTRUCTION_MIN_MEASURED_CONFIDENCE)
+    {
+        missing.push(format!(
+            "expectations.negative_response_measured_confidence_min>={NEGATIVE_RECONSTRUCTION_MIN_MEASURED_CONFIDENCE:.2}"
+        ));
+    }
+    if !expectations
+        .negative_response_held_out_delta_e00_rms_max
+        .is_some_and(|value| {
+            (0.0..=NEGATIVE_RECONSTRUCTION_MAX_HELD_OUT_DELTA_E00_RMS).contains(&value)
+        })
+    {
+        missing.push(format!(
+            "expectations.negative_response_held_out_delta_e00_rms_max<={NEGATIVE_RECONSTRUCTION_MAX_HELD_OUT_DELTA_E00_RMS:.1}"
+        ));
+    }
+    if !expectations
+        .negative_response_held_out_max_delta_e00_max
+        .is_some_and(|value| {
+            (0.0..=NEGATIVE_RECONSTRUCTION_MAX_HELD_OUT_DELTA_E00_MAX).contains(&value)
+        })
+    {
+        missing.push(format!(
+            "expectations.negative_response_held_out_max_delta_e00_max<={NEGATIVE_RECONSTRUCTION_MAX_HELD_OUT_DELTA_E00_MAX:.1}"
+        ));
+    }
+    if expectations
+        .negative_response_held_out_improvement_over_unit_slope_min
+        .is_none_or(|value| value < NEGATIVE_RECONSTRUCTION_MIN_BASELINE_IMPROVEMENT)
+    {
+        missing.push(format!(
+            "expectations.negative_response_held_out_improvement_over_unit_slope_min>={NEGATIVE_RECONSTRUCTION_MIN_BASELINE_IMPROVEMENT:.2}"
+        ));
+    }
+    if !expectations
+        .negative_response_density_noise_gain_max
+        .is_some_and(|value| {
+            (0.0..=NEGATIVE_RECONSTRUCTION_MAX_DENSITY_NOISE_GAIN).contains(&value)
+        })
+    {
+        missing.push(format!(
+            "expectations.negative_response_density_noise_gain_max<={NEGATIVE_RECONSTRUCTION_MAX_DENSITY_NOISE_GAIN:.1}"
+        ));
+    }
+    if !expectations
+        .negative_response_curve_extrapolated_ratio_max
+        .is_some_and(|value| {
+            (0.0..=NEGATIVE_RECONSTRUCTION_MAX_EXTRAPOLATION_RATIO).contains(&value)
+        })
+    {
+        missing.push(format!(
+            "expectations.negative_response_curve_extrapolated_ratio_max<={NEGATIVE_RECONSTRUCTION_MAX_EXTRAPOLATION_RATIO:.2}"
+        ));
+    }
+    if expectations.negative_response_signed_headroom_preserved != Some(true) {
+        missing.push("expectations.negative_response_signed_headroom_preserved=true".to_string());
+    }
+    if expectations
+        .negative_response_curve_interpolation
+        .as_deref()
+        != Some("monotone_piecewise_cubic_hermite_with_endpoint_tangent_extrapolation")
+    {
+        missing.push(
+            "expectations.negative_response_curve_interpolation=monotone_piecewise_cubic_hermite_with_endpoint_tangent_extrapolation"
+                .to_string(),
+        );
+    }
+    if expectations.render_input_source.as_deref() != Some("direct_density_transmittance") {
+        missing.push("expectations.render_input_source=direct_density_transmittance".to_string());
+    }
+    if expectations.calibration_acceptance_status.as_deref() != Some("accepted") {
+        missing.push("expectations.calibration_acceptance_status=accepted".to_string());
+    }
+    if expectations.calibration_color_mapping_applied != Some(true) {
+        missing.push("expectations.calibration_color_mapping_applied=true".to_string());
+    }
+    if expectations.candidate_risk.as_deref() != Some("safe") {
+        missing.push("expectations.candidate_risk=safe".to_string());
+    }
+    if expectations.tone_color_trust_state.as_deref() != Some("trusted") {
+        missing.push("expectations.tone_color_trust_state=trusted".to_string());
+    }
+    if expectations.output_color_space.as_deref() != Some("linear_prophoto_rgb_d50") {
+        missing.push("expectations.output_color_space=linear_prophoto_rgb_d50".to_string());
+    }
+    missing
+}
+
+fn effective_force_settings(
+    cli: &ValidationCli,
+    fixtures: &BTreeMap<String, FixtureEntry>,
+) -> Result<(bool, bool), Box<dyn std::error::Error>> {
+    let fixture = fixtures.get(&cli.fixture);
+    let force_stitch = cli.force_stitch || fixture.is_some_and(|fixture| fixture.force_stitch);
+    let force_no_stitch =
+        cli.force_no_stitch || fixture.is_some_and(|fixture| fixture.force_no_stitch);
+    if force_stitch && force_no_stitch {
+        Err("effective fixture settings request both force-stitch and force-no-stitch".into())
+    } else {
+        Ok((force_stitch, force_no_stitch))
+    }
+}
+
 fn pipeline_film_stock(
     cli_film_stock: Option<&String>,
     fixture: Option<&FixtureEntry>,
@@ -2230,7 +4050,9 @@ fn validate_fixture_registry(registry: &FixtureRegistry) -> Vec<String> {
 
 fn validate_fixture_entry(name: &str, fixture: &FixtureEntry, issues: &mut Vec<String>) {
     validate_required_path(name, "component1", &fixture.component1, issues);
-    validate_required_path(name, "component2", &fixture.component2, issues);
+    if let Some(component2) = &fixture.component2 {
+        validate_required_path(name, "component2", component2, issues);
+    }
     validate_optional_sha256(
         name,
         "component1_sha256",
@@ -2243,16 +4065,104 @@ fn validate_fixture_entry(name: &str, fixture: &FixtureEntry, issues: &mut Vec<S
         fixture.component2_sha256.as_deref(),
         issues,
     );
+    if fixture.component2_sha256.is_some() && fixture.component2.is_none() {
+        issues.push(format!("{name}:component2_sha256_without_component2"));
+    }
+    if !fixture.additional_components.is_empty() && fixture.component2.is_none() {
+        issues.push(format!("{name}:additional_components_without_component2"));
+    }
+    for (offset, component) in fixture.additional_components.iter().enumerate() {
+        let component_number = offset + 3;
+        validate_required_path(
+            name,
+            &format!("additional_components[{offset}].path"),
+            &component.path,
+            issues,
+        );
+        validate_optional_sha256(
+            name,
+            &format!("additional_components[{offset}].sha256"),
+            component.sha256.as_deref(),
+            issues,
+        );
+        if component.path == fixture.component1
+            || fixture
+                .component2
+                .as_ref()
+                .is_some_and(|component2| component.path == *component2)
+        {
+            issues.push(format!("{name}:component{component_number}_path_duplicate"));
+        }
+        if fixture.additional_components[..offset]
+            .iter()
+            .any(|previous| previous.path == component.path)
+        {
+            issues.push(format!("{name}:component{component_number}_path_duplicate"));
+        }
+    }
     validate_optional_path(name, "output_dir", fixture.output_dir.as_deref(), issues);
     validate_optional_input_mode_label(name, fixture.input_mode.as_deref(), issues);
+    validate_optional_deskew_mode_label(name, fixture.deskew.as_deref(), issues);
+    validate_optional_orientation_correction_label(
+        name,
+        fixture.orientation_correction.as_deref(),
+        issues,
+    );
     if fixture
         .bit_depth
         .is_some_and(|bit_depth| !matches!(bit_depth, 14 | 16))
     {
         issues.push(format!("{name}:bit_depth_invalid"));
     }
+    let fixture_grain_mode = fixture
+        .grain_reduction
+        .as_deref()
+        .and_then(parse_grain_reduction_mode_label);
+    if let Some(label) = fixture.grain_reduction.as_deref() {
+        if label.trim().is_empty() {
+            issues.push(format!("{name}:grain_reduction_empty"));
+        } else if fixture_grain_mode.is_none() {
+            issues.push(format!("{name}:grain_reduction_invalid:{label}"));
+        }
+    }
+    if fixture
+        .grain_strength
+        .is_some_and(|strength| !strength.is_finite() || !(0.0..=1.0).contains(&strength))
+    {
+        issues.push(format!("{name}:grain_strength_invalid"));
+    }
+    if fixture
+        .grain_scale
+        .is_some_and(|scale| !scale.is_finite() || !(0.5..=4.0).contains(&scale))
+    {
+        issues.push(format!("{name}:grain_scale_invalid"));
+    }
+    if let (Some(mode), Some(expected_enabled)) = (
+        fixture_grain_mode,
+        fixture.expectations.grain_reduction_enabled,
+    ) {
+        if mode.enabled() != expected_enabled {
+            issues.push(format!(
+                "{name}:grain_reduction_conflicts_with_enabled_expectation"
+            ));
+        }
+    }
+    if fixture
+        .deskew_angle_degrees
+        .is_some_and(|angle| !angle.is_finite() || !(-3.0..=3.0).contains(&angle))
+    {
+        issues.push(format!("{name}:deskew_angle_degrees_invalid"));
+    }
+    if fixture.deskew_angle_degrees.is_some() && fixture.deskew.as_deref() != Some("manual") {
+        issues.push(format!(
+            "{name}:deskew_angle_degrees_requires_manual_deskew"
+        ));
+    }
     if fixture.force_stitch && fixture.force_no_stitch {
         issues.push(format!("{name}:force_stitch_and_force_no_stitch"));
+    }
+    if fixture.force_stitch && fixture.component_count() < 2 {
+        issues.push(format!("{name}:force_stitch_requires_multiple_components"));
     }
     validate_optional_path(
         name,
@@ -2264,6 +4174,18 @@ fn validate_fixture_entry(name: &str, fixture: &FixtureEntry, issues: &mut Vec<S
         name,
         "summary_baseline_sha256",
         fixture.summary_baseline_sha256.as_deref(),
+        issues,
+    );
+    validate_optional_path(
+        name,
+        "render_review",
+        fixture.render_review.as_deref(),
+        issues,
+    );
+    validate_optional_sha256(
+        name,
+        "render_review_sha256",
+        fixture.render_review_sha256.as_deref(),
         issues,
     );
     validate_optional_path(
@@ -2309,7 +4231,12 @@ fn validate_fixture_entry(name: &str, fixture: &FixtureEntry, issues: &mut Vec<S
         fixture.calibration_case.as_deref(),
         issues,
     );
-    validate_fixture_expectations(name, &fixture.expectations, issues);
+    validate_fixture_expectations(
+        name,
+        &fixture.expectations,
+        fixture.component_count(),
+        issues,
+    );
     validate_optional_label(name, "description", fixture.description.as_deref(), issues);
     validate_unique_non_empty_values(&format!("{name}:scene_tag"), &fixture.scene_tags, issues);
     validate_unique_non_empty_values(
@@ -2328,13 +4255,26 @@ fn validate_fixture_entry(name: &str, fixture: &FixtureEntry, issues: &mut Vec<S
             "{name}:calibration_profile_and_calibration_library_both_declared"
         ));
     }
-    if fixture.component1_sha256.is_some() != fixture.component2_sha256.is_some() {
+    if fixture.component2.is_some()
+        && fixture.component1_sha256.is_some() != fixture.component2_sha256.is_some()
+    {
         issues.push(format!("{name}:component_sha256_pair_incomplete"));
+    }
+    let declared_component_hashes = fixture
+        .component_hashes()
+        .iter()
+        .filter(|hash| hash.is_some())
+        .count();
+    if declared_component_hashes > 0 && declared_component_hashes != fixture.component_count() {
+        issues.push(format!("{name}:component_sha256_set_incomplete"));
     }
     if fixture.summary_baseline_sha256.is_some() && fixture.summary_baseline.is_none() {
         issues.push(format!(
             "{name}:summary_baseline_sha256_without_summary_baseline"
         ));
+    }
+    if fixture.render_review_sha256.is_some() && fixture.render_review.is_none() {
+        issues.push(format!("{name}:render_review_sha256_without_render_review"));
     }
     if fixture.calibration_profile_sha256.is_some() && fixture.calibration_profile.is_none() {
         issues.push(format!(
@@ -2400,8 +4340,137 @@ fn validate_fixture_entry(name: &str, fixture: &FixtureEntry, issues: &mut Vec<S
 fn validate_fixture_expectations(
     fixture_name: &str,
     expectations: &FixtureExpectations,
+    component_count: usize,
     issues: &mut Vec<String>,
 ) {
+    validate_optional_label(
+        fixture_name,
+        "expectations.deskew_status",
+        expectations.deskew_status.as_deref(),
+        issues,
+    );
+    if expectations
+        .deskew_retained_area_ratio_min
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.deskew_retained_area_ratio_min_out_of_range"
+        ));
+    }
+    for (field, value) in [
+        (
+            "deskew_minimum_component_retained_area_ratio_min",
+            expectations.deskew_minimum_component_retained_area_ratio_min,
+        ),
+        (
+            "border_crop_retained_area_ratio_min",
+            expectations.border_crop_retained_area_ratio_min,
+        ),
+        (
+            "border_crop_retained_area_ratio_max",
+            expectations.border_crop_retained_area_ratio_max,
+        ),
+    ] {
+        if value.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+            issues.push(format!("{fixture_name}:expectations.{field}_out_of_range"));
+        }
+    }
+    if expectations
+        .border_crop_retained_area_ratio_min
+        .zip(expectations.border_crop_retained_area_ratio_max)
+        .is_some_and(|(minimum, maximum)| minimum > maximum)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.border_crop_retained_area_ratio_bounds_inverted"
+        ));
+    }
+    if expectations.border_crop_minimum_removed_edge_count_per_component_min == Some(0) {
+        issues.push(format!(
+            "{fixture_name}:expectations.border_crop_minimum_removed_edge_count_per_component_min_out_of_range"
+        ));
+    }
+    if expectations
+        .deskew_correction_degrees_expected
+        .is_some_and(|value| !value.is_finite() || !(-3.0..=3.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.deskew_correction_degrees_expected_out_of_range"
+        ));
+    }
+    if expectations
+        .deskew_correction_tolerance_degrees
+        .is_some_and(|value| !value.is_finite() || !(0.0..=3.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.deskew_correction_tolerance_degrees_out_of_range"
+        ));
+    }
+    let mut crop_component_indices = BTreeSet::new();
+    for component in &expectations.border_crop_components_expected {
+        if !(1..=component_count).contains(&component.component_index) {
+            issues.push(format!(
+                "{fixture_name}:expectations.border_crop_components_expected_component_out_of_range:{}",
+                component.component_index
+            ));
+        } else if !crop_component_indices.insert(component.component_index) {
+            issues.push(format!(
+                "{fixture_name}:expectations.border_crop_components_expected_component_duplicate:{}",
+                component.component_index
+            ));
+        }
+        if component.tolerance_px > 64 {
+            issues.push(format!(
+                "{fixture_name}:expectations.border_crop_components_expected_tolerance_out_of_range:{}",
+                component.component_index
+            ));
+        }
+    }
+    let mut orientation_component_indices = BTreeSet::new();
+    for component in &expectations.orientation_components_expected {
+        if !(1..=component_count).contains(&component.component_index) {
+            issues.push(format!(
+                "{fixture_name}:expectations.orientation_components_expected_component_out_of_range:{}",
+                component.component_index
+            ));
+        } else if !orientation_component_indices.insert(component.component_index) {
+            issues.push(format!(
+                "{fixture_name}:expectations.orientation_components_expected_component_duplicate:{}",
+                component.component_index
+            ));
+        }
+        if component.tag_present != component.tag_value.is_some()
+            || component
+                .tag_value
+                .is_some_and(|value| !(1..=8).contains(&value))
+        {
+            issues.push(format!(
+                "{fixture_name}:expectations.orientation_components_expected_tag_invalid:{}",
+                component.component_index
+            ));
+        }
+        if component.transform.trim().is_empty() {
+            issues.push(format!(
+                "{fixture_name}:expectations.orientation_components_expected_transform_empty:{}",
+                component.component_index
+            ));
+        }
+        if !is_valid_sha256_hex(&component.decoded_pixel_sha256) {
+            issues.push(format!(
+                "{fixture_name}:expectations.orientation_components_expected_decoded_pixel_sha256_invalid:{}",
+                component.component_index
+            ));
+        }
+        if component.source_width == 0
+            || component.source_height == 0
+            || component.output_width == 0
+            || component.output_height == 0
+        {
+            issues.push(format!(
+                "{fixture_name}:expectations.orientation_components_expected_dimensions_out_of_range:{}",
+                component.component_index
+            ));
+        }
+    }
     validate_optional_label(
         fixture_name,
         "expectations.stitch_decision",
@@ -2410,10 +4479,267 @@ fn validate_fixture_expectations(
     );
     validate_optional_label(
         fixture_name,
+        "expectations.technical_white_balance_status",
+        expectations.technical_white_balance_status.as_deref(),
+        issues,
+    );
+    if !expectations.inferred_component_order.is_empty() {
+        if expectations.inferred_component_order.len() != component_count {
+            issues.push(format!(
+                "{fixture_name}:expectations.inferred_component_order_length_mismatch"
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for &component_number in &expectations.inferred_component_order {
+            if !(1..=component_count).contains(&component_number) {
+                issues.push(format!(
+                    "{fixture_name}:expectations.inferred_component_order_out_of_range:{component_number}"
+                ));
+            } else if !seen.insert(component_number) {
+                issues.push(format!(
+                    "{fixture_name}:expectations.inferred_component_order_duplicate:{component_number}"
+                ));
+            }
+        }
+    }
+    if expectations
+        .creative_temperature
+        .is_some_and(|value| !value.is_finite() || !(-1.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.creative_temperature_out_of_range"
+        ));
+    }
+    if expectations
+        .creative_tint
+        .is_some_and(|value| !value.is_finite() || !(-1.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.creative_tint_out_of_range"
+        ));
+    }
+    validate_optional_label(
+        fixture_name,
+        "expectations.seam_exposure_model",
+        expectations.seam_exposure_model.as_deref(),
+        issues,
+    );
+    if expectations
+        .seam_exposure_held_out_improvement_over_gain_min
+        .is_some_and(|value| !value.is_finite() || value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_exposure_held_out_improvement_over_gain_min_out_of_range"
+        ));
+    }
+    if expectations
+        .seam_exposure_offset_normalized_abs_max
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_exposure_offset_normalized_abs_max_out_of_range"
+        ));
+    }
+    if expectations
+        .seam_exposure_spatial_slope_abs_min
+        .is_some_and(|value| !value.is_finite() || value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_exposure_spatial_slope_abs_min_out_of_range"
+        ));
+    }
+    if expectations
+        .seam_exposure_spatial_slope_abs_max
+        .is_some_and(|value| !value.is_finite() || value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_exposure_spatial_slope_abs_max_out_of_range"
+        ));
+    }
+    if expectations
+        .seam_exposure_spatial_slope_abs_min
+        .zip(expectations.seam_exposure_spatial_slope_abs_max)
+        .is_some_and(|(minimum, maximum)| minimum > maximum)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_exposure_spatial_slope_bounds_inverted"
+        ));
+    }
+    if expectations
+        .seam_exposure_spatial_slope_agreement_ratio_min
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_exposure_spatial_slope_agreement_ratio_min_out_of_range"
+        ));
+    }
+    if expectations
+        .seam_exposure_held_out_spatial_improvement_over_best_constant_min
+        .is_some_and(|value| !value.is_finite() || value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_exposure_held_out_spatial_improvement_over_best_constant_min_out_of_range"
+        ));
+    }
+    if expectations
+        .seam_exposure_spatial_offset_slope_normalized_abs_min
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_exposure_spatial_offset_slope_normalized_abs_min_out_of_range"
+        ));
+    }
+    if expectations
+        .seam_exposure_spatial_offset_slope_normalized_abs_max
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_exposure_spatial_offset_slope_normalized_abs_max_out_of_range"
+        ));
+    }
+    if expectations
+        .seam_exposure_spatial_offset_slope_normalized_abs_min
+        .zip(expectations.seam_exposure_spatial_offset_slope_normalized_abs_max)
+        .is_some_and(|(minimum, maximum)| minimum > maximum)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_exposure_spatial_offset_slope_bounds_inverted"
+        ));
+    }
+    if expectations
+        .seam_exposure_spatial_offset_endpoint_normalized_abs_max
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_exposure_spatial_offset_endpoint_normalized_abs_max_out_of_range"
+        ));
+    }
+    if expectations
+        .seam_exposure_spatial_affine_slope_agreement_ratio_min
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_exposure_spatial_affine_slope_agreement_ratio_min_out_of_range"
+        ));
+    }
+    if expectations
+        .seam_exposure_spatial_affine_center_offset_delta_normalized_max
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_exposure_spatial_affine_center_offset_delta_normalized_max_out_of_range"
+        ));
+    }
+    if expectations
+        .seam_exposure_held_out_spatial_gain_offset_improvement_over_best_simpler_min
+        .is_some_and(|value| !value.is_finite() || value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_exposure_held_out_spatial_gain_offset_improvement_over_best_simpler_min_out_of_range"
+        ));
+    }
+    if expectations
+        .seam_exposure_spatial_2d_horizontal_slope_agreement_ratio_min
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_exposure_spatial_2d_horizontal_slope_agreement_ratio_min_out_of_range"
+        ));
+    }
+    if expectations.seam_exposure_spatial_2d_distinct_columns_min == Some(0) {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_exposure_spatial_2d_distinct_columns_min_out_of_range"
+        ));
+    }
+    if expectations
+        .seam_exposure_held_out_spatial_2d_improvement_over_best_simpler_min
+        .is_some_and(|value| !value.is_finite() || value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_exposure_held_out_spatial_2d_improvement_over_best_simpler_min_out_of_range"
+        ));
+    }
+    validate_optional_label(
+        fixture_name,
+        "expectations.seam_blend_mode",
+        expectations.seam_blend_mode.as_deref(),
+        issues,
+    );
+    validate_optional_label(
+        fixture_name,
         "expectations.base_estimate_source",
         expectations.base_estimate_source.as_deref(),
         issues,
     );
+    for (field, value) in [
+        ("base_confidence_min", expectations.base_confidence_min),
+        (
+            "negative_response_measured_confidence_min",
+            expectations.negative_response_measured_confidence_min,
+        ),
+        (
+            "negative_response_curve_extrapolated_ratio_max",
+            expectations.negative_response_curve_extrapolated_ratio_max,
+        ),
+    ] {
+        if value.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+            issues.push(format!("{fixture_name}:expectations.{field}_out_of_range"));
+        }
+    }
+    for (field, value) in [
+        (
+            "negative_response_held_out_delta_e00_rms_max",
+            expectations.negative_response_held_out_delta_e00_rms_max,
+        ),
+        (
+            "negative_response_held_out_max_delta_e00_max",
+            expectations.negative_response_held_out_max_delta_e00_max,
+        ),
+        (
+            "negative_response_held_out_improvement_over_unit_slope_min",
+            expectations.negative_response_held_out_improvement_over_unit_slope_min,
+        ),
+        (
+            "negative_response_density_noise_gain_max",
+            expectations.negative_response_density_noise_gain_max,
+        ),
+    ] {
+        if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
+            issues.push(format!("{fixture_name}:expectations.{field}_out_of_range"));
+        }
+    }
+    for (field, value) in [
+        (
+            "expectations.negative_response_model",
+            expectations.negative_response_model.as_deref(),
+        ),
+        (
+            "expectations.negative_response_source",
+            expectations.negative_response_source.as_deref(),
+        ),
+        (
+            "expectations.negative_response_crosstalk_model",
+            expectations.negative_response_crosstalk_model.as_deref(),
+        ),
+        (
+            "expectations.negative_response_characteristic_curve_model",
+            expectations
+                .negative_response_characteristic_curve_model
+                .as_deref(),
+        ),
+        (
+            "expectations.negative_response_measured_model_id",
+            expectations.negative_response_measured_model_id.as_deref(),
+        ),
+        (
+            "expectations.negative_response_curve_interpolation",
+            expectations
+                .negative_response_curve_interpolation
+                .as_deref(),
+        ),
+    ] {
+        validate_optional_label(fixture_name, field, value, issues);
+    }
     validate_optional_label(
         fixture_name,
         "expectations.output_color_space",
@@ -2468,6 +4794,26 @@ fn validate_fixture_expectations(
         expectations.tone_color_trust_state.as_deref(),
         issues,
     );
+    validate_optional_label(
+        fixture_name,
+        "expectations.neutral_safety_rescue_reason_contains",
+        expectations
+            .neutral_safety_rescue_reason_contains
+            .as_deref(),
+        issues,
+    );
+    validate_optional_label(
+        fixture_name,
+        "expectations.render_review_status",
+        expectations.render_review_status.as_deref(),
+        issues,
+    );
+    validate_optional_label(
+        fixture_name,
+        "expectations.tone_output_confidence_status",
+        expectations.tone_output_confidence_status.as_deref(),
+        issues,
+    );
     validate_unique_non_empty_values(
         &format!("{fixture_name}:expectations.debug_artifact_kinds_required"),
         &expectations.debug_artifact_kinds_required,
@@ -2502,6 +4848,104 @@ fn validate_fixture_expectations(
     {
         issues.push(format!(
             "{fixture_name}:expectations.selected_quality_score_max_out_of_range"
+        ));
+    }
+    if expectations
+        .seam_detail_supported_scale_count_min
+        .is_some_and(|value| value == 0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_detail_supported_scale_count_min_out_of_range"
+        ));
+    }
+    if expectations
+        .seam_detail_max_symmetric_energy_ratio_max
+        .is_some_and(|value| !value.is_finite() || value < 1.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_detail_max_symmetric_energy_ratio_max_out_of_range"
+        ));
+    }
+    if expectations
+        .seam_gradient_ratio_max
+        .is_some_and(|value| !value.is_finite() || value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_gradient_ratio_max_out_of_range"
+        ));
+    }
+    if expectations
+        .seam_overlap_p95_abs_difference_max
+        .is_some_and(|value| !value.is_finite() || value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.seam_overlap_p95_abs_difference_max_out_of_range"
+        ));
+    }
+    for (field, value) in [
+        (
+            "grain_reduction_applied_ratio_min",
+            expectations.grain_reduction_applied_ratio_min,
+        ),
+        (
+            "grain_reduction_structure_excluded_ratio_min",
+            expectations.grain_reduction_structure_excluded_ratio_min,
+        ),
+        (
+            "grain_reduction_flat_luma_p95_reduction_ratio_min",
+            expectations.grain_reduction_flat_luma_p95_reduction_ratio_min,
+        ),
+        (
+            "grain_reduction_flat_chroma_p95_reduction_ratio_min",
+            expectations.grain_reduction_flat_chroma_p95_reduction_ratio_min,
+        ),
+    ] {
+        if value.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+            issues.push(format!("{fixture_name}:expectations.{field}_out_of_range"));
+        }
+    }
+    for (field, value) in [
+        (
+            "grain_detail_luminance_probe_count_min",
+            expectations.grain_detail_luminance_probe_count_min,
+        ),
+        (
+            "grain_detail_chroma_probe_count_min",
+            expectations.grain_detail_chroma_probe_count_min,
+        ),
+    ] {
+        if value.is_some_and(|value| value == 0) {
+            issues.push(format!("{fixture_name}:expectations.{field}_out_of_range"));
+        }
+    }
+    for (field, value) in [
+        (
+            "grain_detail_luminance_p10_retention_min",
+            expectations.grain_detail_luminance_p10_retention_min,
+        ),
+        (
+            "grain_detail_chroma_p10_retention_min",
+            expectations.grain_detail_chroma_p10_retention_min,
+        ),
+    ] {
+        if value.is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value)) {
+            issues.push(format!("{fixture_name}:expectations.{field}_out_of_range"));
+        }
+    }
+    if expectations
+        .neutral_safety_rescue_preserved_ratio_gain_min
+        .is_some_and(|value| !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.neutral_safety_rescue_preserved_ratio_gain_min_out_of_range"
+        ));
+    }
+    if expectations
+        .neutral_safety_rescue_midtone_saturation_p95_reduction_min
+        .is_some_and(|value| !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.neutral_safety_rescue_midtone_saturation_p95_reduction_min_out_of_range"
         ));
     }
     if expectations
@@ -2633,6 +5077,46 @@ fn validate_fixture_expectations(
         ));
     }
     if expectations
+        .render_luminance_range_p05_p95_min
+        .is_some_and(|value| !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.render_luminance_range_p05_p95_min_out_of_range"
+        ));
+    }
+    if expectations
+        .tone_output_evidence_confidence_min
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.tone_output_evidence_confidence_min_out_of_range"
+        ));
+    }
+    if expectations
+        .render_to_mapped_luminance_range_ratio_min
+        .is_some_and(|value| !value.is_finite() || value < 0.0)
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.render_to_mapped_luminance_range_ratio_min_out_of_range"
+        ));
+    }
+    if expectations
+        .post_chroma_compression_clipped_high_ratio_max
+        .is_some_and(|value| !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.post_chroma_compression_clipped_high_ratio_max_out_of_range"
+        ));
+    }
+    if expectations
+        .post_chroma_compression_clipped_low_ratio_max
+        .is_some_and(|value| !(0.0..=1.0).contains(&value))
+    {
+        issues.push(format!(
+            "{fixture_name}:expectations.post_chroma_compression_clipped_low_ratio_max_out_of_range"
+        ));
+    }
+    if expectations
         .reference_patch_rms_delta_e_max
         .is_some_and(|value| value < 0.0)
     {
@@ -2704,6 +5188,36 @@ fn validate_optional_input_mode_label(
     }
 }
 
+fn validate_optional_deskew_mode_label(
+    fixture_name: &str,
+    value: Option<&str>,
+    issues: &mut Vec<String>,
+) {
+    if let Some(value) = value {
+        if value.trim().is_empty() {
+            issues.push(format!("{fixture_name}:deskew_empty"));
+        } else if parse_deskew_mode_label(value).is_none() {
+            issues.push(format!("{fixture_name}:deskew_invalid:{value}"));
+        }
+    }
+}
+
+fn validate_optional_orientation_correction_label(
+    fixture_name: &str,
+    value: Option<&str>,
+    issues: &mut Vec<String>,
+) {
+    if let Some(value) = value {
+        if value.trim().is_empty() {
+            issues.push(format!("{fixture_name}:orientation_correction_empty"));
+        } else if parse_orientation_correction_label(value).is_none() {
+            issues.push(format!(
+                "{fixture_name}:orientation_correction_invalid:{value}"
+            ));
+        }
+    }
+}
+
 fn validate_optional_sha256(
     fixture_name: &str,
     field_name: &str,
@@ -2771,6 +5285,48 @@ fn fixture_coverage_summary(
         entries.push(entry);
     }
 
+    let component_file_count = entries.iter().map(|entry| entry.component_count).sum();
+    let max_component_count = entries
+        .iter()
+        .map(|entry| entry.component_count)
+        .max()
+        .unwrap_or(0);
+    let n_component_fixture_count = entries
+        .iter()
+        .filter(|entry| entry.component_count > 2)
+        .count();
+    let n_component_validation_ready_fixture_count = entries
+        .iter()
+        .filter(|entry| entry.component_count > 2 && entry.validation_ready)
+        .count();
+    let component_set_available_count = entries
+        .iter()
+        .filter(|entry| entry.all_components_exist)
+        .count();
+    let component_sha256_declared_set_count = entries
+        .iter()
+        .filter(|entry| entry.all_component_sha256_declared)
+        .count();
+    let component_sha256_computed_set_count = entries
+        .iter()
+        .filter(|entry| entry.all_component_sha256_computed)
+        .count();
+    let component_sha256_set_count = entries
+        .iter()
+        .filter(|entry| entry.validation_ready && entry.all_component_sha256_matched)
+        .count();
+    let readable_tiff_set_count = entries
+        .iter()
+        .filter(|entry| entry.all_components_readable_tiff)
+        .count();
+    let tiff_layout_consistent_set_count = entries
+        .iter()
+        .filter(|entry| entry.all_component_layouts_consistent)
+        .count();
+    let tiff_dimension_matched_set_count = entries
+        .iter()
+        .filter(|entry| entry.all_component_dimensions_matched)
+        .count();
     let component_pair_available_count = entries
         .iter()
         .filter(|entry| entry.component1_exists && entry.component2_exists)
@@ -2849,6 +5405,42 @@ fn fixture_coverage_summary(
     let validation_ready_fixture_count = entries
         .iter()
         .filter(|entry| entry.validation_ready)
+        .count();
+    let render_dynamic_range_contract_fixture_count = entries
+        .iter()
+        .filter(|entry| entry.validation_ready && entry.render_dynamic_range_contract_complete)
+        .count();
+    let stitch_normalization_contract_fixture_count = entries
+        .iter()
+        .filter(|entry| entry.validation_ready && entry.stitch_normalization_contract_complete)
+        .count();
+    let geometry_preparation_contract_fixture_count = entries
+        .iter()
+        .filter(|entry| entry.validation_ready && entry.geometry_preparation_contract_complete)
+        .count();
+    let geometry_accuracy_contract_fixture_count = entries
+        .iter()
+        .filter(|entry| entry.validation_ready && entry.geometry_accuracy_contract_complete)
+        .count();
+    let orientation_accuracy_contract_fixture_count = entries
+        .iter()
+        .filter(|entry| entry.validation_ready && entry.orientation_accuracy_contract_complete)
+        .count();
+    let negative_reconstruction_contract_fixture_count = entries
+        .iter()
+        .filter(|entry| entry.validation_ready && entry.negative_reconstruction_contract_complete)
+        .count();
+    let grain_reduction_enabled_fixture_count = entries
+        .iter()
+        .filter(|entry| entry.validation_ready && entry.grain_reduction_enabled_declared)
+        .count();
+    let grain_detail_contract_fixture_count = entries
+        .iter()
+        .filter(|entry| entry.validation_ready && entry.grain_detail_contract_complete)
+        .count();
+    let grain_reduction_effect_contract_fixture_count = entries
+        .iter()
+        .filter(|entry| entry.validation_ready && entry.grain_reduction_effect_contract_complete)
         .count();
     let summary_baseline_declared_count = entries
         .iter()
@@ -3006,6 +5598,10 @@ fn fixture_coverage_summary(
         .filter(|entry| entry.validation_ready)
         .filter_map(|entry| entry.calibration_reference_patch_count)
         .sum::<usize>();
+    let approved_render_review_fixture_count = entries
+        .iter()
+        .filter(|entry| entry.validation_ready && entry.approved_render_review)
+        .count();
     let debug_artifact_expectation_fixture_count = entries
         .iter()
         .filter(|entry| {
@@ -3056,6 +5652,17 @@ fn fixture_coverage_summary(
     let mut action_items = fixture_coverage_action_items(
         requirements,
         validation_ready_fixture_count,
+        render_dynamic_range_contract_fixture_count,
+        stitch_normalization_contract_fixture_count,
+        geometry_preparation_contract_fixture_count,
+        geometry_accuracy_contract_fixture_count,
+        orientation_accuracy_contract_fixture_count,
+        negative_reconstruction_contract_fixture_count,
+        grain_reduction_enabled_fixture_count,
+        grain_detail_contract_fixture_count,
+        grain_reduction_effect_contract_fixture_count,
+        n_component_validation_ready_fixture_count,
+        component_sha256_set_count,
         component_pair_available_count,
         component_sha256_pair_count,
         readable_tiff_pair_count,
@@ -3076,6 +5683,7 @@ fn fixture_coverage_summary(
         reference_evidence.len(),
         reference_patch_fixture_count,
         reference_patch_count,
+        approved_render_review_fixture_count,
         debug_artifact_expectation_fixture_count,
         film_stock_calibration_pairs.len(),
         scene_exposure_pairs.len(),
@@ -3113,6 +5721,17 @@ fn fixture_coverage_summary(
     apply_coverage_requirements(
         requirements,
         validation_ready_fixture_count,
+        render_dynamic_range_contract_fixture_count,
+        stitch_normalization_contract_fixture_count,
+        geometry_preparation_contract_fixture_count,
+        geometry_accuracy_contract_fixture_count,
+        orientation_accuracy_contract_fixture_count,
+        negative_reconstruction_contract_fixture_count,
+        grain_reduction_enabled_fixture_count,
+        grain_detail_contract_fixture_count,
+        grain_reduction_effect_contract_fixture_count,
+        n_component_validation_ready_fixture_count,
+        component_sha256_set_count,
         component_pair_available_count,
         component_sha256_pair_count,
         readable_tiff_pair_count,
@@ -3133,6 +5752,7 @@ fn fixture_coverage_summary(
         &reference_evidence,
         reference_patch_fixture_count,
         reference_patch_count,
+        approved_render_review_fixture_count,
         debug_artifact_expectation_fixture_count,
         &debug_artifact_kinds_required,
         &film_stock_calibration_pairs,
@@ -3147,6 +5767,17 @@ fn fixture_coverage_summary(
             "review_required".to_string()
         },
         fixture_count: entries.len(),
+        component_file_count,
+        max_component_count,
+        n_component_fixture_count,
+        n_component_validation_ready_fixture_count,
+        component_set_available_count,
+        component_sha256_declared_set_count,
+        component_sha256_computed_set_count,
+        component_sha256_set_count,
+        readable_tiff_set_count,
+        tiff_layout_consistent_set_count,
+        tiff_dimension_matched_set_count,
         component_pair_available_count,
         component_sha256_declared_pair_count,
         component_sha256_computed_pair_count,
@@ -3155,6 +5786,15 @@ fn fixture_coverage_summary(
         tiff_layout_consistent_pair_count,
         tiff_dimension_matched_pair_count,
         validation_ready_fixture_count,
+        render_dynamic_range_contract_fixture_count,
+        stitch_normalization_contract_fixture_count,
+        geometry_preparation_contract_fixture_count,
+        geometry_accuracy_contract_fixture_count,
+        orientation_accuracy_contract_fixture_count,
+        negative_reconstruction_contract_fixture_count,
+        grain_reduction_enabled_fixture_count,
+        grain_detail_contract_fixture_count,
+        grain_reduction_effect_contract_fixture_count,
         summary_baseline_declared_count,
         summary_baseline_file_count,
         summary_baseline_parseable_count,
@@ -3194,6 +5834,7 @@ fn fixture_coverage_summary(
         missing_required_reference_evidence,
         reference_patch_fixture_count,
         reference_patch_count,
+        approved_render_review_fixture_count,
         debug_artifact_expectation_fixture_count,
         debug_artifact_kinds_required,
         missing_required_debug_artifact_kinds,
@@ -3214,6 +5855,17 @@ fn fixture_coverage_summary(
 fn fixture_coverage_action_items(
     requirements: &FixtureCoverageRequirements,
     validation_ready_fixture_count: usize,
+    render_dynamic_range_contract_fixture_count: usize,
+    stitch_normalization_contract_fixture_count: usize,
+    geometry_preparation_contract_fixture_count: usize,
+    geometry_accuracy_contract_fixture_count: usize,
+    orientation_accuracy_contract_fixture_count: usize,
+    negative_reconstruction_contract_fixture_count: usize,
+    grain_reduction_enabled_fixture_count: usize,
+    grain_detail_contract_fixture_count: usize,
+    grain_reduction_effect_contract_fixture_count: usize,
+    n_component_validation_ready_fixture_count: usize,
+    component_sha256_set_count: usize,
     component_pair_available_count: usize,
     component_sha256_pair_count: usize,
     readable_tiff_pair_count: usize,
@@ -3234,6 +5886,7 @@ fn fixture_coverage_action_items(
     reference_evidence_type_count: usize,
     reference_patch_fixture_count: usize,
     reference_patch_count: usize,
+    approved_render_review_fixture_count: usize,
     debug_artifact_expectation_fixture_count: usize,
     film_stock_calibration_pair_count: usize,
     scene_exposure_pair_count: usize,
@@ -3254,6 +5907,72 @@ fn fixture_coverage_action_items(
         "add_validation_ready_fixtures",
         requirements.min_fixtures,
         validation_ready_fixture_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_complete_render_dynamic_range_contracts_for_validation_ready_fixtures",
+        requirements.min_render_dynamic_range_contract_fixtures,
+        render_dynamic_range_contract_fixture_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_complete_stitch_normalization_contracts_for_validation_ready_fixtures",
+        requirements.min_stitch_normalization_contract_fixtures,
+        stitch_normalization_contract_fixture_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_complete_geometry_preparation_contracts_for_validation_ready_fixtures",
+        requirements.min_geometry_preparation_contract_fixtures,
+        geometry_preparation_contract_fixture_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_complete_geometry_accuracy_contracts_for_validation_ready_fixtures",
+        requirements.min_geometry_accuracy_contract_fixtures,
+        geometry_accuracy_contract_fixture_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_complete_orientation_accuracy_contracts_for_validation_ready_fixtures",
+        requirements.min_orientation_accuracy_contract_fixtures,
+        orientation_accuracy_contract_fixture_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_complete_negative_reconstruction_contracts_for_validation_ready_fixtures",
+        requirements.min_negative_reconstruction_contract_fixtures,
+        negative_reconstruction_contract_fixture_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_validation_ready_grain_reduction_enabled_fixtures",
+        requirements.min_grain_reduction_enabled_fixtures,
+        grain_reduction_enabled_fixture_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_complete_grain_detail_contracts_for_validation_ready_fixtures",
+        requirements.min_grain_detail_contract_fixtures,
+        grain_detail_contract_fixture_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_complete_grain_reduction_effect_contracts_for_validation_ready_fixtures",
+        requirements.min_grain_reduction_effect_contract_fixtures,
+        grain_reduction_effect_contract_fixture_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "add_validation_ready_n_component_fixtures",
+        requirements.min_n_component_fixtures,
+        n_component_validation_ready_fixture_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
+        "pin_complete_component_sha256_sets_for_validation_ready_fixtures",
+        requirements.min_component_sha256_sets,
+        component_sha256_set_count,
     );
     push_fixture_coverage_min_action(
         &mut actions,
@@ -3389,6 +6108,12 @@ fn fixture_coverage_action_items(
     );
     push_fixture_coverage_min_action(
         &mut actions,
+        "add_hash_bound_approved_render_reviews",
+        requirements.min_approved_render_review_fixtures,
+        approved_render_review_fixture_count,
+    );
+    push_fixture_coverage_min_action(
+        &mut actions,
         "add_debug_artifact_expectation_fixtures",
         requirements.min_debug_artifact_expectation_fixtures,
         debug_artifact_expectation_fixture_count,
@@ -3488,15 +6213,17 @@ fn fixture_coverage_entry_actions(entry: &FixtureCoverageEntry) -> Vec<String> {
             "replace_component1_with_minimum_bit_depth_tiff_for_fixture:{name}"
         ));
     }
-    if !entry.component2_exists {
-        actions.push(format!("provide_component2_for_fixture:{name}"));
-    } else if fixture_coverage_entry_has_issue_prefix(entry, "component2_tiff_") {
-        actions.push(format!("repair_component2_tiff_for_fixture:{name}"));
-    }
-    if fixture_coverage_entry_has_issue(entry, "component2_tiff_bits_below_min") {
-        actions.push(format!(
-            "replace_component2_with_minimum_bit_depth_tiff_for_fixture:{name}"
-        ));
+    if entry.component2.is_some() {
+        if !entry.component2_exists {
+            actions.push(format!("provide_component2_for_fixture:{name}"));
+        } else if fixture_coverage_entry_has_issue_prefix(entry, "component2_tiff_") {
+            actions.push(format!("repair_component2_tiff_for_fixture:{name}"));
+        }
+        if fixture_coverage_entry_has_issue(entry, "component2_tiff_bits_below_min") {
+            actions.push(format!(
+                "replace_component2_with_minimum_bit_depth_tiff_for_fixture:{name}"
+            ));
+        }
     }
     if fixture_coverage_entry_has_issue(entry, "tiff_pair_layout_mismatch") {
         actions.push(format!(
@@ -3513,6 +6240,45 @@ fn fixture_coverage_entry_actions(entry: &FixtureCoverageEntry) -> Vec<String> {
     }
     if fixture_coverage_entry_has_issue_prefix(entry, "component2_sha256_") {
         actions.push(format!("update_component2_sha256_for_fixture:{name}"));
+    }
+    for component in &entry.additional_components {
+        let number = component.component_number;
+        let issue_prefix = format!("component{number}_");
+        if !component.exists {
+            actions.push(format!(
+                "provide_additional_component_for_fixture:{name}:{number}"
+            ));
+        } else if fixture_coverage_entry_has_issue_prefix(entry, &format!("{issue_prefix}tiff_")) {
+            actions.push(format!(
+                "repair_additional_component_tiff_for_fixture:{name}:{number}"
+            ));
+        }
+        if fixture_coverage_entry_has_issue(entry, &format!("{issue_prefix}tiff_bits_below_min")) {
+            actions.push(format!(
+                "replace_additional_component_with_minimum_bit_depth_tiff_for_fixture:{name}:{number}"
+            ));
+        }
+        if fixture_coverage_entry_has_issue_prefix(entry, &format!("{issue_prefix}sha256_")) {
+            actions.push(format!(
+                "update_additional_component_sha256_for_fixture:{name}:{number}"
+            ));
+        }
+        if fixture_coverage_entry_has_issue(
+            entry,
+            &format!("component{number}_layout_mismatch_component1"),
+        ) {
+            actions.push(format!(
+                "replace_additional_component_with_layout_matched_tiff_for_fixture:{name}:{number}"
+            ));
+        }
+        if fixture_coverage_entry_has_issue(
+            entry,
+            &format!("component{number}_dimensions_mismatch_component1"),
+        ) {
+            actions.push(format!(
+                "replace_additional_component_with_dimension_matched_tiff_for_fixture:{name}:{number}"
+            ));
+        }
     }
 
     match (
@@ -3535,6 +6301,19 @@ fn fixture_coverage_entry_actions(entry: &FixtureCoverageEntry) -> Vec<String> {
     }
     if fixture_coverage_entry_has_issue_prefix(entry, "summary_baseline_sha256_") {
         actions.push(format!("update_summary_baseline_sha256_for_fixture:{name}"));
+    }
+
+    if entry.render_review.is_some() {
+        if entry.render_review_exists == Some(false) {
+            actions.push(format!("provide_render_review_for_fixture:{name}"));
+        } else if !entry.approved_render_review {
+            actions.push(format!("complete_render_review_for_fixture:{name}"));
+        }
+        if fixture_coverage_entry_has_issue_prefix(entry, "render_review_sha256_")
+            || fixture_coverage_entry_has_issue(entry, "render_review_sha256_not_declared")
+        {
+            actions.push(format!("update_render_review_sha256_for_fixture:{name}"));
+        }
     }
 
     match (
@@ -3593,6 +6372,50 @@ fn fixture_coverage_entry_actions(entry: &FixtureCoverageEntry) -> Vec<String> {
     ) {
         actions.push(format!("add_reference_patches_for_fixture:{name}"));
     }
+    if entry.grain_reduction_enabled_declared && !entry.grain_detail_contract_complete {
+        actions.push(format!("complete_grain_detail_contract_for_fixture:{name}"));
+    }
+    if entry.grain_reduction_enabled_declared && !entry.grain_reduction_effect_contract_complete {
+        actions.push(format!(
+            "complete_grain_reduction_effect_contract_for_fixture:{name}"
+        ));
+    }
+    if entry.render_dynamic_range_contract_declared && !entry.render_dynamic_range_contract_complete
+    {
+        actions.push(format!(
+            "complete_render_dynamic_range_contract_for_fixture:{name}"
+        ));
+    }
+    if entry.stitch_normalization_contract_declared && !entry.stitch_normalization_contract_complete
+    {
+        actions.push(format!(
+            "complete_stitch_normalization_contract_for_fixture:{name}"
+        ));
+    }
+    if entry.geometry_preparation_contract_declared && !entry.geometry_preparation_contract_complete
+    {
+        actions.push(format!(
+            "complete_geometry_preparation_contract_for_fixture:{name}"
+        ));
+    }
+    if entry.geometry_accuracy_contract_declared && !entry.geometry_accuracy_contract_complete {
+        actions.push(format!(
+            "complete_geometry_accuracy_contract_for_fixture:{name}"
+        ));
+    }
+    if entry.orientation_accuracy_contract_declared && !entry.orientation_accuracy_contract_complete
+    {
+        actions.push(format!(
+            "complete_orientation_accuracy_contract_for_fixture:{name}"
+        ));
+    }
+    if entry.negative_reconstruction_contract_declared
+        && !entry.negative_reconstruction_contract_complete
+    {
+        actions.push(format!(
+            "complete_negative_reconstruction_contract_for_fixture:{name}"
+        ));
+    }
     actions
 }
 
@@ -3609,37 +6432,90 @@ fn fixture_coverage_repair_plan_item(
     action: &str,
 ) -> FixtureRepairPlanItem {
     let mut paths = Vec::new();
+    let additional_component = action
+        .rsplit_once(':')
+        .and_then(|(_, number)| number.parse::<usize>().ok())
+        .and_then(|number| {
+            entry
+                .additional_components
+                .iter()
+                .find(|component| component.component_number == number)
+        });
     let details = if action.starts_with("provide_component1_for_fixture:") {
         paths.push(entry.component1.clone());
         "Provide the first component TIFF declared by the fixture registry.".to_string()
     } else if action.starts_with("provide_component2_for_fixture:") {
-        paths.push(entry.component2.clone());
+        push_optional_path(&mut paths, entry.component2.as_ref());
         "Provide the second component TIFF declared by the fixture registry.".to_string()
     } else if action.starts_with("repair_component1_tiff_for_fixture:") {
         paths.push(entry.component1.clone());
         "Replace or repair component1 so it is a readable supported TIFF.".to_string()
     } else if action.starts_with("repair_component2_tiff_for_fixture:") {
-        paths.push(entry.component2.clone());
+        push_optional_path(&mut paths, entry.component2.as_ref());
         "Replace or repair component2 so it is a readable supported TIFF.".to_string()
     } else if action.starts_with("replace_component1_with_minimum_bit_depth_tiff_for_fixture:") {
         paths.push(entry.component1.clone());
         "Replace component1 with a TIFF that satisfies the registry minimum bit depth.".to_string()
     } else if action.starts_with("replace_component2_with_minimum_bit_depth_tiff_for_fixture:") {
-        paths.push(entry.component2.clone());
+        push_optional_path(&mut paths, entry.component2.as_ref());
         "Replace component2 with a TIFF that satisfies the registry minimum bit depth.".to_string()
     } else if action.starts_with("replace_component_pair_with_layout_matched_tiffs_for_fixture:") {
-        paths.extend([entry.component1.clone(), entry.component2.clone()]);
+        paths.push(entry.component1.clone());
+        push_optional_path(&mut paths, entry.component2.as_ref());
         "Replace the component pair with TIFFs whose color type, bit depth, channel count, and alpha layout match.".to_string()
     } else if action.starts_with("replace_component_pair_with_dimension_matched_tiffs_for_fixture:")
     {
-        paths.extend([entry.component1.clone(), entry.component2.clone()]);
+        paths.push(entry.component1.clone());
+        push_optional_path(&mut paths, entry.component2.as_ref());
         "Replace the component pair with TIFFs whose dimensions match.".to_string()
     } else if action.starts_with("update_component1_sha256_for_fixture:") {
         paths.push(entry.component1.clone());
         "Update component1_sha256 after intentionally replacing or accepting the local component file.".to_string()
     } else if action.starts_with("update_component2_sha256_for_fixture:") {
-        paths.push(entry.component2.clone());
+        push_optional_path(&mut paths, entry.component2.as_ref());
         "Update component2_sha256 after intentionally replacing or accepting the local component file.".to_string()
+    } else if action.starts_with("provide_additional_component_for_fixture:") {
+        if let Some(component) = additional_component {
+            paths.push(component.path.clone());
+        }
+        "Provide the additional component TIFF declared by the fixture registry.".to_string()
+    } else if action.starts_with("repair_additional_component_tiff_for_fixture:") {
+        if let Some(component) = additional_component {
+            paths.push(component.path.clone());
+        }
+        "Replace or repair the additional component so it is a readable supported TIFF.".to_string()
+    } else if action
+        .starts_with("replace_additional_component_with_minimum_bit_depth_tiff_for_fixture:")
+    {
+        if let Some(component) = additional_component {
+            paths.push(component.path.clone());
+        }
+        "Replace the additional component with a TIFF that satisfies the registry minimum bit depth."
+            .to_string()
+    } else if action.starts_with("update_additional_component_sha256_for_fixture:") {
+        if let Some(component) = additional_component {
+            paths.push(component.path.clone());
+        }
+        "Update the additional component SHA-256 after intentionally replacing or accepting the file."
+            .to_string()
+    } else if action
+        .starts_with("replace_additional_component_with_layout_matched_tiff_for_fixture:")
+    {
+        paths.push(entry.component1.clone());
+        if let Some(component) = additional_component {
+            paths.push(component.path.clone());
+        }
+        "Replace the additional component with a TIFF whose channel layout matches component1."
+            .to_string()
+    } else if action
+        .starts_with("replace_additional_component_with_dimension_matched_tiff_for_fixture:")
+    {
+        paths.push(entry.component1.clone());
+        if let Some(component) = additional_component {
+            paths.push(component.path.clone());
+        }
+        "Replace the additional component with a TIFF whose dimensions are compatible with component1."
+            .to_string()
     } else if action.starts_with("declare_summary_baseline_for_fixture:") {
         "Declare a summary_baseline path for this fixture.".to_string()
     } else if action.starts_with("provide_summary_baseline_for_fixture:") {
@@ -3656,6 +6532,16 @@ fn fixture_coverage_repair_plan_item(
         push_optional_path(&mut paths, entry.summary_baseline.as_ref());
         "Update summary_baseline_sha256 after intentionally replacing or accepting the baseline."
             .to_string()
+    } else if action.starts_with("provide_render_review_for_fixture:") {
+        push_optional_path(&mut paths, entry.render_review.as_ref());
+        "Provide the hash-bound render-review manifest declared by the fixture registry."
+            .to_string()
+    } else if action.starts_with("complete_render_review_for_fixture:") {
+        push_optional_path(&mut paths, entry.render_review.as_ref());
+        "Inspect the exact report and delivery artifacts, then complete every applicable decision with specific notes, reviewer identity, review time, and overall notes. Technical review failures cannot be overridden by human approval.".to_string()
+    } else if action.starts_with("update_render_review_sha256_for_fixture:") {
+        push_optional_path(&mut paths, entry.render_review.as_ref());
+        "Pin render_review_sha256 only after intentionally accepting the completed human-review manifest; any later edit must invalidate the fixture.".to_string()
     } else if action.starts_with("provide_calibration_profile_for_fixture:") {
         push_optional_path(&mut paths, entry.calibration_profile.as_ref());
         "Provide the external calibration profile declared by the fixture registry.".to_string()
@@ -3688,6 +6574,56 @@ fn fixture_coverage_repair_plan_item(
         push_optional_path(&mut paths, entry.calibration_profile.as_ref());
         push_optional_path(&mut paths, entry.calibration_library.as_ref());
         "Add target/reference patches to the selected calibration evidence for reference-patch validation.".to_string()
+    } else if action.starts_with("complete_grain_detail_contract_for_fixture:") {
+        format!(
+            "Pin nonzero grain strength, grain scale, enabled/no-review/support expectations, and both-channel >= {GRAIN_DETAIL_MIN_PROBE_COUNT} probe / >= {GRAIN_DETAIL_P10_RETENTION_MIN:.2} p10-retention floors. Missing: {}.",
+            entry.grain_detail_contract_missing_fields.join(", ")
+        )
+    } else if action.starts_with("complete_grain_reduction_effect_contract_for_fixture:") {
+        format!(
+            "Complete the grain-detail contract and pin positive minimum applied-pixel, exact structure-excluded, and flat-area luminance/chroma p95 residual-reduction ratios. Missing: {}.",
+            entry
+                .grain_reduction_effect_contract_missing_fields
+                .join(", ")
+        )
+    } else if action.starts_with("complete_render_dynamic_range_contract_for_fixture:") {
+        format!(
+            "Pin reviewable final delivery, supported/no-review tone-output evidence, positive tone confidence and render-to-mapped range retention, positive post-scale preservation and p05-p95 render-luminance span, plus fixture-approved maximum post-tone high/low channel clipping ratios below 1. Missing: {}.",
+            entry
+                .render_dynamic_range_contract_missing_fields
+                .join(", ")
+        )
+    } else if action.starts_with("complete_stitch_normalization_contract_for_fixture:") {
+        format!(
+            "Pin an accepted stitch, a known exposure-normalization model with model-appropriate held-out validation and <= {STITCH_NORMALIZATION_MAX_OFFSET_RATIO:.2} normalized offset, seam-aware multiband blending with no review, >= {STITCH_NORMALIZATION_MIN_DETAIL_SCALE_COUNT} supported detail scales, <= {STITCH_NORMALIZATION_MAX_DETAIL_ENERGY_RATIO:.2} detail-energy imbalance, <= {STITCH_NORMALIZATION_MAX_GRADIENT_RATIO:.2} seam-gradient ratio, and < 1 overlap p95 difference. Missing: {}.",
+            entry
+                .stitch_normalization_contract_missing_fields
+                .join(", ")
+        )
+    } else if action.starts_with("complete_geometry_preparation_contract_for_fixture:") {
+        format!(
+            "Pin all-component applied/no-review deskew with >= {GEOMETRY_PREPARATION_MIN_DESKEW_RETAINED_AREA_RATIO:.2} retained area, plus four-edge all-component scanner-border cropping, >= {GEOMETRY_PREPARATION_MIN_BORDER_RETAINED_AREA_RATIO:.2} retained border-crop area, a maximum below 1, and no rejected crop. Missing: {}.",
+            entry
+                .geometry_preparation_contract_missing_fields
+                .join(", ")
+        )
+    } else if action.starts_with("complete_geometry_accuracy_contract_for_fixture:") {
+        format!(
+            "Pin the approved deskew correction within <= {GEOMETRY_ACCURACY_MAX_DESKEW_TOLERANCE_DEGREES:.2} degrees and every component's expected top/bottom/left/right crop within <= {GEOMETRY_ACCURACY_MAX_CROP_TOLERANCE_PX} pixels, in addition to the complete preparation contract. Missing: {}.",
+            entry.geometry_accuracy_contract_missing_fields.join(", ")
+        )
+    } else if action.starts_with("complete_orientation_accuracy_contract_for_fixture:") {
+        format!(
+            "Pin every component's EXIF-orientation tag presence/value, named decoded transform, applied flag, original scanner dimensions, and oriented output dimensions. Missing or inconsistent: {}.",
+            entry.orientation_accuracy_contract_missing_fields.join(", ")
+        )
+    } else if action.starts_with("complete_negative_reconstruction_contract_for_fixture:") {
+        format!(
+            "Pin a measured film-base source, >= {NEGATIVE_RECONSTRUCTION_MIN_BASE_CONFIDENCE:.2} base confidence, measured nonlinear 3x3 dye separation/PCHIP response with held-out DeltaE00 and <= {NEGATIVE_RECONSTRUCTION_MAX_DENSITY_NOISE_GAIN:.1} noise-gain gates, <= {NEGATIVE_RECONSTRUCTION_MAX_EXTRAPOLATION_RATIO:.2} curve extrapolation, signed headroom, direct-density rendering, accepted calibration, safe/trusted color, and linear ProPhoto output. Missing: {}.",
+            entry
+                .negative_reconstruction_contract_missing_fields
+                .join(", ")
+        )
     } else {
         "Resolve the fixture coverage action reported by the validation harness.".to_string()
     };
@@ -3725,6 +6661,17 @@ fn fixture_coverage_entry_has_issue(entry: &FixtureCoverageEntry, suffix: &str) 
 fn apply_coverage_requirements(
     requirements: &FixtureCoverageRequirements,
     fixture_count: usize,
+    render_dynamic_range_contract_fixture_count: usize,
+    stitch_normalization_contract_fixture_count: usize,
+    geometry_preparation_contract_fixture_count: usize,
+    geometry_accuracy_contract_fixture_count: usize,
+    orientation_accuracy_contract_fixture_count: usize,
+    negative_reconstruction_contract_fixture_count: usize,
+    grain_reduction_enabled_fixture_count: usize,
+    grain_detail_contract_fixture_count: usize,
+    grain_reduction_effect_contract_fixture_count: usize,
+    n_component_fixture_count: usize,
+    component_sha256_set_count: usize,
     component_pair_available_count: usize,
     component_sha256_pair_count: usize,
     readable_tiff_pair_count: usize,
@@ -3745,6 +6692,7 @@ fn apply_coverage_requirements(
     reference_evidence: &[String],
     reference_patch_fixture_count: usize,
     reference_patch_count: usize,
+    approved_render_review_fixture_count: usize,
     debug_artifact_expectation_fixture_count: usize,
     debug_artifact_kinds_required: &[String],
     film_stock_calibration_pairs: &[String],
@@ -3755,6 +6703,72 @@ fn apply_coverage_requirements(
         requirements.min_fixtures,
         fixture_count,
         "fixture_coverage_min_fixtures_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_render_dynamic_range_contract_fixtures,
+        render_dynamic_range_contract_fixture_count,
+        "fixture_coverage_min_render_dynamic_range_contract_fixtures_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_stitch_normalization_contract_fixtures,
+        stitch_normalization_contract_fixture_count,
+        "fixture_coverage_min_stitch_normalization_contract_fixtures_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_geometry_preparation_contract_fixtures,
+        geometry_preparation_contract_fixture_count,
+        "fixture_coverage_min_geometry_preparation_contract_fixtures_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_geometry_accuracy_contract_fixtures,
+        geometry_accuracy_contract_fixture_count,
+        "fixture_coverage_min_geometry_accuracy_contract_fixtures_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_orientation_accuracy_contract_fixtures,
+        orientation_accuracy_contract_fixture_count,
+        "fixture_coverage_min_orientation_accuracy_contract_fixtures_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_negative_reconstruction_contract_fixtures,
+        negative_reconstruction_contract_fixture_count,
+        "fixture_coverage_min_negative_reconstruction_contract_fixtures_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_grain_reduction_enabled_fixtures,
+        grain_reduction_enabled_fixture_count,
+        "fixture_coverage_min_grain_reduction_enabled_fixtures_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_grain_detail_contract_fixtures,
+        grain_detail_contract_fixture_count,
+        "fixture_coverage_min_grain_detail_contract_fixtures_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_grain_reduction_effect_contract_fixtures,
+        grain_reduction_effect_contract_fixture_count,
+        "fixture_coverage_min_grain_reduction_effect_contract_fixtures_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_n_component_fixtures,
+        n_component_fixture_count,
+        "fixture_coverage_min_n_component_fixtures_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_component_sha256_sets,
+        component_sha256_set_count,
+        "fixture_coverage_min_component_sha256_sets_not_met",
         issues,
     );
     push_min_requirement_issue(
@@ -3887,6 +6901,12 @@ fn apply_coverage_requirements(
         requirements.min_reference_patch_count,
         reference_patch_count,
         "fixture_coverage_min_reference_patch_count_not_met",
+        issues,
+    );
+    push_min_requirement_issue(
+        requirements.min_approved_render_review_fixtures,
+        approved_render_review_fixture_count,
+        "fixture_coverage_min_approved_render_review_fixtures_not_met",
         issues,
     );
     push_min_requirement_issue(
@@ -4421,6 +7441,12 @@ fn optional_f64(value: Option<f64>) -> String {
         .unwrap_or_else(|| "not set".to_string())
 }
 
+fn optional_bool(value: Option<bool>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "not set".to_string())
+}
+
 fn optional_f64_vec(value: Option<&[f64]>) -> String {
     value
         .map(|values| {
@@ -4439,6 +7465,10 @@ fn optional_delta_f64(value: Option<f64>) -> String {
         .unwrap_or_default()
 }
 
+fn optional_delta_isize(value: Option<isize>) -> String {
+    value.map(|value| format!("{value:+}")).unwrap_or_default()
+}
+
 fn fixture_coverage_entry(
     name: &str,
     fixture: &FixtureEntry,
@@ -4447,11 +7477,14 @@ fn fixture_coverage_entry(
 ) -> FixtureCoverageEntry {
     let mut issues = Vec::new();
     let component1_exists = fixture.component1.exists();
-    let component2_exists = fixture.component2.exists();
+    let component2_exists = fixture
+        .component2
+        .as_ref()
+        .is_some_and(|component2| component2.exists());
     if !component1_exists {
         issues.push(format!("{name}:component1_missing"));
     }
-    if !component2_exists {
+    if fixture.component2.is_some() && !component2_exists {
         issues.push(format!("{name}:component2_missing"));
     }
     let component1_sha256 = probe_fixture_component_sha256(
@@ -4459,11 +7492,13 @@ fn fixture_coverage_entry(
         fixture.component1_sha256.as_deref(),
         compute_fixture_hashes,
     );
-    let component2_sha256 = probe_fixture_component_sha256(
-        &fixture.component2,
-        fixture.component2_sha256.as_deref(),
-        compute_fixture_hashes,
-    );
+    let component2_sha256 = fixture.component2.as_ref().and_then(|component2| {
+        probe_fixture_component_sha256(
+            component2,
+            fixture.component2_sha256.as_deref(),
+            compute_fixture_hashes,
+        )
+    });
     validate_fixture_component_sha256_probe(
         name,
         "component1",
@@ -4477,7 +7512,10 @@ fn fixture_coverage_entry(
         &mut issues,
     );
     let component1_tiff = component1_exists.then(|| probe_fixture_tiff(&fixture.component1));
-    let component2_tiff = component2_exists.then(|| probe_fixture_tiff(&fixture.component2));
+    let component2_tiff = fixture
+        .component2
+        .as_ref()
+        .and_then(|component2| component2_exists.then(|| probe_fixture_tiff(component2)));
     let tiff_pair = fixture_tiff_pair_probe(component1_tiff.as_ref(), component2_tiff.as_ref());
     validate_fixture_tiff_probe(
         name,
@@ -4494,6 +7532,126 @@ fn fixture_coverage_entry(
         &mut issues,
     );
     validate_fixture_tiff_pair_probe(name, tiff_pair.as_ref(), &mut issues);
+    let mut additional_components = Vec::with_capacity(fixture.additional_components.len());
+    for (offset, component) in fixture.additional_components.iter().enumerate() {
+        let component_number = offset + 3;
+        let component_label = format!("component{component_number}");
+        let exists = component.path.exists();
+        if !exists {
+            issues.push(format!("{name}:{component_label}_missing"));
+        }
+        let sha256 = probe_fixture_component_sha256(
+            &component.path,
+            component.sha256.as_deref(),
+            compute_fixture_hashes,
+        );
+        validate_fixture_component_sha256_probe(
+            name,
+            &component_label,
+            sha256.as_ref(),
+            &mut issues,
+        );
+        let tiff = exists.then(|| probe_fixture_tiff(&component.path));
+        validate_fixture_tiff_probe(
+            name,
+            &component_label,
+            tiff.as_ref(),
+            requirements.min_tiff_bits_per_sample,
+            &mut issues,
+        );
+        let comparison_to_component1 =
+            fixture_tiff_pair_probe(component1_tiff.as_ref(), tiff.as_ref());
+        if let Some(comparison) = &comparison_to_component1 {
+            if !comparison.dimension_matched {
+                issues.push(format!(
+                    "{name}:{component_label}_dimensions_mismatch_component1"
+                ));
+            }
+            if !comparison.layout_consistent {
+                issues.push(format!(
+                    "{name}:{component_label}_layout_mismatch_component1"
+                ));
+            }
+        }
+        additional_components.push(AdditionalFixtureComponentCoverage {
+            component_number,
+            path: component.path.display().to_string(),
+            exists,
+            sha256,
+            tiff,
+            comparison_to_component1,
+        });
+    }
+    let component2_exists_or_absent = fixture.component2.is_none() || component2_exists;
+    let all_components_exist = component1_exists
+        && component2_exists_or_absent
+        && additional_components
+            .iter()
+            .all(|component| component.exists);
+    let all_component_sha256_declared = component1_sha256
+        .as_ref()
+        .is_some_and(|probe| probe.expected_sha256.is_some())
+        && (fixture.component2.is_none()
+            || component2_sha256
+                .as_ref()
+                .is_some_and(|probe| probe.expected_sha256.is_some()))
+        && additional_components.iter().all(|component| {
+            component
+                .sha256
+                .as_ref()
+                .is_some_and(|probe| probe.expected_sha256.is_some())
+        });
+    let all_component_sha256_computed = component1_sha256
+        .as_ref()
+        .is_some_and(|probe| probe.actual_sha256.is_some())
+        && (fixture.component2.is_none()
+            || component2_sha256
+                .as_ref()
+                .is_some_and(|probe| probe.actual_sha256.is_some()))
+        && additional_components.iter().all(|component| {
+            component
+                .sha256
+                .as_ref()
+                .is_some_and(|probe| probe.actual_sha256.is_some())
+        });
+    let all_component_sha256_matched = component1_sha256
+        .as_ref()
+        .is_some_and(|probe| probe.matched)
+        && (fixture.component2.is_none()
+            || component2_sha256
+                .as_ref()
+                .is_some_and(|probe| probe.matched))
+        && additional_components
+            .iter()
+            .all(|component| component.sha256.as_ref().is_some_and(|probe| probe.matched));
+    let all_components_readable_tiff = component1_tiff.as_ref().is_some_and(|probe| probe.readable)
+        && (fixture.component2.is_none()
+            || component2_tiff.as_ref().is_some_and(|probe| probe.readable))
+        && additional_components
+            .iter()
+            .all(|component| component.tiff.as_ref().is_some_and(|probe| probe.readable));
+    let all_component_layouts_consistent = all_components_readable_tiff
+        && (fixture.component2.is_none()
+            || tiff_pair
+                .as_ref()
+                .is_some_and(|comparison| comparison.layout_consistent))
+        && additional_components.iter().all(|component| {
+            component
+                .comparison_to_component1
+                .as_ref()
+                .is_some_and(|comparison| comparison.layout_consistent)
+        });
+    let all_component_dimensions_matched = all_components_readable_tiff
+        && (fixture.component2.is_none()
+            || tiff_pair
+                .as_ref()
+                .is_some_and(|comparison| comparison.dimension_matched))
+        && additional_components.iter().all(|component| {
+            component
+                .comparison_to_component1
+                .as_ref()
+                .is_some_and(|comparison| comparison.dimension_matched)
+        });
     if fixture.scene_tags.is_empty() {
         issues.push(format!("{name}:scene_tags_not_declared"));
     }
@@ -4570,6 +7728,52 @@ fn fixture_coverage_entry(
         summary_baseline_sha256.as_ref(),
         &mut issues,
     );
+
+    let render_review_exists = fixture.render_review.as_ref().map(|path| path.exists());
+    if render_review_exists == Some(false) {
+        issues.push(format!("{name}:render_review_missing"));
+    }
+    let render_review_sha256 = fixture.render_review.as_ref().and_then(|path| {
+        probe_fixture_component_sha256(
+            path,
+            fixture.render_review_sha256.as_deref(),
+            compute_fixture_hashes,
+        )
+    });
+    validate_fixture_component_sha256_probe(
+        name,
+        "render_review",
+        render_review_sha256.as_ref(),
+        &mut issues,
+    );
+    if fixture.render_review.is_some() && fixture.render_review_sha256.is_none() {
+        issues.push(format!("{name}:render_review_sha256_not_declared"));
+    }
+    let render_review_inspection = fixture
+        .render_review
+        .as_ref()
+        .filter(|path| path.exists())
+        .map(|path| {
+            render_review::inspect_render_review_manifest_for_inputs(
+                path,
+                name,
+                &fixture.pipeline_inputs(),
+            )
+        });
+    if let Some(inspection) = &render_review_inspection {
+        issues.extend(
+            inspection
+                .issues
+                .iter()
+                .map(|issue| format!("{name}:render_review:{issue}")),
+        );
+    }
+    let approved_render_review = render_review_inspection
+        .as_ref()
+        .is_some_and(|inspection| inspection.approved)
+        && render_review_sha256
+            .as_ref()
+            .is_some_and(|probe| probe.matched);
 
     let calibration_profile_sha256 = fixture.calibration_profile.as_ref().and_then(|path| {
         probe_fixture_component_sha256(
@@ -4682,26 +7886,109 @@ fn fixture_coverage_entry(
             "{name}:reference_patch_evaluation_required_without_calibration_patches"
         ));
     }
-    let validation_ready =
-        component1_exists && component2_exists && summary_baseline_valid && issues.is_empty();
+    let validation_ready = all_components_exist && summary_baseline_valid && issues.is_empty();
+    let grain_reduction_enabled_declared = fixture_declares_grain_reduction_enabled(fixture);
+    let grain_detail_contract_missing_fields =
+        fixture_grain_detail_contract_missing_fields(fixture);
+    let grain_detail_contract_complete =
+        grain_reduction_enabled_declared && grain_detail_contract_missing_fields.is_empty();
+    let grain_reduction_effect_contract_missing_fields =
+        fixture_grain_reduction_effect_contract_missing_fields(fixture);
+    let grain_reduction_effect_contract_complete = grain_reduction_enabled_declared
+        && grain_reduction_effect_contract_missing_fields.is_empty();
+    let render_dynamic_range_contract_declared =
+        fixture_declares_render_dynamic_range_contract(fixture);
+    let render_dynamic_range_contract_missing_fields =
+        fixture_render_dynamic_range_contract_missing_fields(fixture);
+    let render_dynamic_range_contract_complete = render_dynamic_range_contract_declared
+        && render_dynamic_range_contract_missing_fields.is_empty();
+    let stitch_normalization_contract_declared =
+        fixture_declares_stitch_normalization_contract(fixture);
+    let stitch_normalization_contract_missing_fields =
+        fixture_stitch_normalization_contract_missing_fields(fixture);
+    let stitch_normalization_contract_complete = stitch_normalization_contract_declared
+        && stitch_normalization_contract_missing_fields.is_empty();
+    let geometry_preparation_contract_declared =
+        fixture_declares_geometry_preparation_contract(fixture);
+    let geometry_preparation_contract_missing_fields =
+        fixture_geometry_preparation_contract_missing_fields(fixture);
+    let geometry_preparation_contract_complete = geometry_preparation_contract_declared
+        && geometry_preparation_contract_missing_fields.is_empty();
+    let geometry_accuracy_contract_declared = fixture_declares_geometry_accuracy_contract(fixture);
+    let geometry_accuracy_contract_missing_fields =
+        fixture_geometry_accuracy_contract_missing_fields(fixture);
+    let geometry_accuracy_contract_complete =
+        geometry_accuracy_contract_declared && geometry_accuracy_contract_missing_fields.is_empty();
+    let orientation_accuracy_contract_declared =
+        fixture_declares_orientation_accuracy_contract(fixture);
+    let orientation_accuracy_contract_missing_fields =
+        fixture_orientation_accuracy_contract_missing_fields(fixture);
+    let orientation_accuracy_contract_complete = orientation_accuracy_contract_declared
+        && orientation_accuracy_contract_missing_fields.is_empty();
+    let negative_reconstruction_contract_declared =
+        fixture_declares_negative_reconstruction_contract(fixture);
+    let negative_reconstruction_contract_missing_fields =
+        fixture_negative_reconstruction_contract_missing_fields(fixture);
+    let negative_reconstruction_contract_complete = negative_reconstruction_contract_declared
+        && negative_reconstruction_contract_missing_fields.is_empty();
 
     let mut entry = FixtureCoverageEntry {
         name: name.to_string(),
+        component_count: fixture.component_count(),
         component1: fixture.component1.display().to_string(),
         component1_exists,
         component1_sha256,
         component1_tiff,
-        component2: fixture.component2.display().to_string(),
+        component2: fixture
+            .component2
+            .as_ref()
+            .map(|path| path.display().to_string()),
         component2_exists,
         component2_sha256,
         component2_tiff,
         tiff_pair,
+        additional_components,
+        all_components_exist,
+        all_component_sha256_declared,
+        all_component_sha256_computed,
+        all_component_sha256_matched,
+        all_components_readable_tiff,
+        all_component_layouts_consistent,
+        all_component_dimensions_matched,
         output_dir: fixture
             .output_dir
             .as_ref()
             .map(|path| path.display().to_string()),
         input_mode: fixture.input_mode.clone(),
         bit_depth: fixture.bit_depth,
+        grain_reduction: fixture.grain_reduction.clone(),
+        grain_strength: fixture.grain_strength,
+        grain_scale: fixture.grain_scale,
+        grain_reduction_enabled_declared,
+        grain_detail_contract_complete,
+        grain_detail_contract_missing_fields,
+        grain_reduction_effect_contract_complete,
+        grain_reduction_effect_contract_missing_fields,
+        render_dynamic_range_contract_declared,
+        render_dynamic_range_contract_complete,
+        render_dynamic_range_contract_missing_fields,
+        stitch_normalization_contract_declared,
+        stitch_normalization_contract_complete,
+        stitch_normalization_contract_missing_fields,
+        geometry_preparation_contract_declared,
+        geometry_preparation_contract_complete,
+        geometry_preparation_contract_missing_fields,
+        geometry_accuracy_contract_declared,
+        geometry_accuracy_contract_complete,
+        geometry_accuracy_contract_missing_fields,
+        orientation_accuracy_contract_declared,
+        orientation_accuracy_contract_complete,
+        orientation_accuracy_contract_missing_fields,
+        negative_reconstruction_contract_declared,
+        negative_reconstruction_contract_complete,
+        negative_reconstruction_contract_missing_fields,
+        deskew: fixture.deskew.clone(),
+        deskew_angle_degrees: fixture.deskew_angle_degrees,
         force_stitch: fixture.force_stitch,
         force_no_stitch: fixture.force_no_stitch,
         summary_baseline: fixture
@@ -4714,6 +8001,14 @@ fn fixture_coverage_entry(
         summary_baseline_contract_missing_fields,
         summary_baseline_valid,
         summary_baseline_sha256,
+        render_review: fixture
+            .render_review
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        render_review_exists,
+        render_review_sha256,
+        render_review_inspection,
+        approved_render_review,
         calibration_profile: fixture
             .calibration_profile
             .as_ref()
@@ -4756,6 +8051,27 @@ fn fixture_coverage_to_markdown(summary: &FixtureCoverageSummary) -> String {
     out.push_str(&format!("- status: `{}`\n", summary.status));
     out.push_str(&format!("- fixtures: `{}`\n", summary.fixture_count));
     out.push_str(&format!(
+        "- component files declared: `{}` (maximum per fixture: `{}`)\n",
+        summary.component_file_count, summary.max_component_count
+    ));
+    out.push_str(&format!(
+        "- N-component fixtures declared / validation-ready: `{}` / `{}`\n",
+        summary.n_component_fixture_count, summary.n_component_validation_ready_fixture_count
+    ));
+    out.push_str(&format!(
+        "- complete component sets available / SHA-256 declared / computed / matched: `{}` / `{}` / `{}` / `{}`\n",
+        summary.component_set_available_count,
+        summary.component_sha256_declared_set_count,
+        summary.component_sha256_computed_set_count,
+        summary.component_sha256_set_count
+    ));
+    out.push_str(&format!(
+        "- complete TIFF sets readable / layout-consistent / dimension-matched: `{}` / `{}` / `{}`\n",
+        summary.readable_tiff_set_count,
+        summary.tiff_layout_consistent_set_count,
+        summary.tiff_dimension_matched_set_count
+    ));
+    out.push_str(&format!(
         "- component pairs available: `{}`\n",
         summary.component_pair_available_count
     ));
@@ -4786,6 +8102,42 @@ fn fixture_coverage_to_markdown(summary: &FixtureCoverageSummary) -> String {
     out.push_str(&format!(
         "- validation-ready fixtures: `{}`\n",
         summary.validation_ready_fixture_count
+    ));
+    out.push_str(&format!(
+        "- validation-ready complete render-dynamic-range contracts: `{}`\n",
+        summary.render_dynamic_range_contract_fixture_count
+    ));
+    out.push_str(&format!(
+        "- validation-ready complete stitch-normalization contracts: `{}`\n",
+        summary.stitch_normalization_contract_fixture_count
+    ));
+    out.push_str(&format!(
+        "- validation-ready complete geometry-preparation contracts: `{}`\n",
+        summary.geometry_preparation_contract_fixture_count
+    ));
+    out.push_str(&format!(
+        "- validation-ready complete geometry-accuracy contracts: `{}`\n",
+        summary.geometry_accuracy_contract_fixture_count
+    ));
+    out.push_str(&format!(
+        "- validation-ready complete orientation-accuracy contracts: `{}`\n",
+        summary.orientation_accuracy_contract_fixture_count
+    ));
+    out.push_str(&format!(
+        "- validation-ready complete negative-reconstruction contracts: `{}`\n",
+        summary.negative_reconstruction_contract_fixture_count
+    ));
+    out.push_str(&format!(
+        "- validation-ready grain-reduction-enabled fixtures: `{}`\n",
+        summary.grain_reduction_enabled_fixture_count
+    ));
+    out.push_str(&format!(
+        "- validation-ready complete grain-detail contracts: `{}`\n",
+        summary.grain_detail_contract_fixture_count
+    ));
+    out.push_str(&format!(
+        "- validation-ready complete grain-reduction-effect contracts: `{}`\n",
+        summary.grain_reduction_effect_contract_fixture_count
     ));
     out.push_str(&format!(
         "- summary baselines parseable: `{}`\n",
@@ -4920,6 +8272,10 @@ fn fixture_coverage_to_markdown(summary: &FixtureCoverageSummary) -> String {
         summary.reference_patch_count
     ));
     out.push_str(&format!(
+        "- validation-ready hash-bound approved render reviews: `{}`\n\n",
+        summary.approved_render_review_fixture_count
+    ));
+    out.push_str(&format!(
         "- validation-ready debug-artifact expectation fixtures: `{}`\n",
         summary.debug_artifact_expectation_fixture_count
     ));
@@ -4962,12 +8318,92 @@ fn fixture_coverage_to_markdown(summary: &FixtureCoverageSummary) -> String {
         optional_usize(summary.coverage_requirements.min_fixtures)
     ));
     out.push_str(&format!(
+        "- min complete render-dynamic-range-contract fixtures: `{}`\n",
+        optional_usize(
+            summary
+                .coverage_requirements
+                .min_render_dynamic_range_contract_fixtures
+        )
+    ));
+    out.push_str(&format!(
+        "- min complete stitch-normalization-contract fixtures: `{}`\n",
+        optional_usize(
+            summary
+                .coverage_requirements
+                .min_stitch_normalization_contract_fixtures
+        )
+    ));
+    out.push_str(&format!(
+        "- min complete geometry-preparation-contract fixtures: `{}`\n",
+        optional_usize(
+            summary
+                .coverage_requirements
+                .min_geometry_preparation_contract_fixtures
+        )
+    ));
+    out.push_str(&format!(
+        "- min complete geometry-accuracy-contract fixtures: `{}`\n",
+        optional_usize(
+            summary
+                .coverage_requirements
+                .min_geometry_accuracy_contract_fixtures
+        )
+    ));
+    out.push_str(&format!(
+        "- min complete orientation-accuracy-contract fixtures: `{}`\n",
+        optional_usize(
+            summary
+                .coverage_requirements
+                .min_orientation_accuracy_contract_fixtures
+        )
+    ));
+    out.push_str(&format!(
+        "- min complete negative-reconstruction-contract fixtures: `{}`\n",
+        optional_usize(
+            summary
+                .coverage_requirements
+                .min_negative_reconstruction_contract_fixtures
+        )
+    ));
+    out.push_str(&format!(
+        "- min grain-reduction-enabled fixtures: `{}`\n",
+        optional_usize(
+            summary
+                .coverage_requirements
+                .min_grain_reduction_enabled_fixtures
+        )
+    ));
+    out.push_str(&format!(
+        "- min complete grain-detail-contract fixtures: `{}`\n",
+        optional_usize(
+            summary
+                .coverage_requirements
+                .min_grain_detail_contract_fixtures
+        )
+    ));
+    out.push_str(&format!(
+        "- min complete grain-reduction-effect-contract fixtures: `{}`\n",
+        optional_usize(
+            summary
+                .coverage_requirements
+                .min_grain_reduction_effect_contract_fixtures
+        )
+    ));
+    out.push_str(&format!(
         "- min component pairs: `{}`\n",
         optional_usize(summary.coverage_requirements.min_component_pairs)
     ));
     out.push_str(&format!(
         "- min component SHA-256 pairs: `{}`\n",
         optional_usize(summary.coverage_requirements.min_component_sha256_pairs)
+    ));
+    out.push_str(&format!(
+        "- min validation-ready N-component fixtures: `{}`\n",
+        optional_usize(summary.coverage_requirements.min_n_component_fixtures)
+    ));
+    out.push_str(&format!(
+        "- min complete component SHA-256 sets: `{}`\n",
+        optional_usize(summary.coverage_requirements.min_component_sha256_sets)
     ));
     out.push_str(&format!(
         "- min readable TIFF pairs: `{}`\n",
@@ -5066,6 +8502,14 @@ fn fixture_coverage_to_markdown(summary: &FixtureCoverageSummary) -> String {
         optional_usize(summary.coverage_requirements.min_reference_patch_count)
     ));
     out.push_str(&format!(
+        "- min hash-bound approved render-review fixtures: `{}`\n",
+        optional_usize(
+            summary
+                .coverage_requirements
+                .min_approved_render_review_fixtures
+        )
+    ));
+    out.push_str(&format!(
         "- min debug-artifact expectation fixtures: `{}`\n",
         optional_usize(
             summary
@@ -5133,10 +8577,10 @@ fn fixture_coverage_to_markdown(summary: &FixtureCoverageSummary) -> String {
             .required_debug_artifact_kinds
             .join(", ")
     ));
-    out.push_str("| Fixture | Ready | Components | SHA-256 | TIFF | Baseline | Baseline SHA-256 | Calibration | Calibration SHA-256 | Reference patches | Film stock | Scene tags | Exposure tags | Reference evidence | Calibration case | Debug expectations | Actions | Issues |\n");
-    out.push_str("|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|\n");
+    out.push_str("| Fixture | Ready | Dynamic range | Stitch normalization | Geometry preparation / orientation | Negative reconstruction | Grain | Components | SHA-256 | TIFF | Baseline | Baseline SHA-256 | Render review | Calibration | Calibration SHA-256 | Reference patches | Film stock | Scene tags | Exposure tags | Reference evidence | Calibration case | Debug expectations | Actions | Issues |\n");
+    out.push_str("|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|\n");
     for fixture in &summary.fixtures {
-        let components = if fixture.component1_exists && fixture.component2_exists {
+        let components = if fixture.all_components_exist {
             "ok"
         } else {
             "missing"
@@ -5153,6 +8597,7 @@ fn fixture_coverage_to_markdown(summary: &FixtureCoverageSummary) -> String {
             .map(|contract| format!("{baseline}/{contract}"))
             .unwrap_or_else(|| baseline.to_string());
         let baseline_sha256 = fixture_sha256_probe_label(fixture.summary_baseline_sha256.as_ref());
+        let render_review = fixture_coverage_render_review_label(fixture);
         let calibration = if let Some(profile) = &fixture.calibration_profile {
             let status = fixture
                 .calibration_profile_parse_status
@@ -5178,6 +8623,11 @@ fn fixture_coverage_to_markdown(summary: &FixtureCoverageSummary) -> String {
         let exposure_tags = fixture.exposure_tags.join(", ");
         let reference_evidence = fixture.reference_evidence.join(", ");
         let calibration_case = fixture.calibration_case.as_deref().unwrap_or("");
+        let dynamic_range = fixture_coverage_dynamic_range_label(fixture);
+        let stitch_normalization = fixture_coverage_stitch_normalization_label(fixture);
+        let geometry_preparation = fixture_coverage_geometry_preparation_label(fixture);
+        let negative_reconstruction = fixture_coverage_negative_reconstruction_label(fixture);
+        let grain = fixture_coverage_grain_label(fixture);
         let debug_expectations = fixture_coverage_debug_expectation_label(fixture);
         let actions = if fixture.action_items.is_empty() {
             "none".to_string()
@@ -5190,18 +8640,24 @@ fn fixture_coverage_to_markdown(summary: &FixtureCoverageSummary) -> String {
             fixture.issues.join(", ")
         };
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             fixture.name,
             if fixture.validation_ready {
                 "yes"
             } else {
                 "no"
             },
+            dynamic_range,
+            stitch_normalization,
+            geometry_preparation,
+            negative_reconstruction,
+            grain,
             components,
             sha256,
             tiff,
             baseline,
             baseline_sha256,
+            render_review,
             calibration,
             calibration_sha256,
             reference_patches,
@@ -5224,7 +8680,23 @@ fn fixture_coverage_to_markdown(summary: &FixtureCoverageSummary) -> String {
     out
 }
 
+fn fixture_coverage_render_review_label(fixture: &FixtureCoverageEntry) -> String {
+    let Some(path) = fixture.render_review.as_deref() else {
+        return String::new();
+    };
+    let status = fixture
+        .render_review_inspection
+        .as_ref()
+        .map(|inspection| inspection.status.as_str())
+        .unwrap_or("missing");
+    let hash = fixture_sha256_probe_label(fixture.render_review_sha256.as_ref());
+    format!("{path} ({status}; SHA-256 {hash})")
+}
+
 fn fixture_sha256_pair_label(fixture: &FixtureCoverageEntry) -> String {
+    if fixture.component2.is_none() {
+        return fixture_sha256_probe_label(fixture.component1_sha256.as_ref());
+    }
     match (
         fixture.component1_sha256.as_ref(),
         fixture.component2_sha256.as_ref(),
@@ -5271,7 +8743,131 @@ fn fixture_coverage_debug_expectation_label(fixture: &FixtureCoverageEntry) -> S
     parts.join("; ")
 }
 
+fn fixture_coverage_dynamic_range_label(fixture: &FixtureCoverageEntry) -> String {
+    if !fixture.render_dynamic_range_contract_declared {
+        return String::new();
+    }
+    if fixture.render_dynamic_range_contract_complete {
+        "contract=complete".to_string()
+    } else {
+        format!(
+            "contract=incomplete ({})",
+            fixture
+                .render_dynamic_range_contract_missing_fields
+                .join(", ")
+        )
+    }
+}
+
+fn fixture_coverage_stitch_normalization_label(fixture: &FixtureCoverageEntry) -> String {
+    if !fixture.stitch_normalization_contract_declared {
+        return String::new();
+    }
+    if fixture.stitch_normalization_contract_complete {
+        "contract=complete".to_string()
+    } else {
+        format!(
+            "contract=incomplete ({})",
+            fixture
+                .stitch_normalization_contract_missing_fields
+                .join(", ")
+        )
+    }
+}
+
+fn fixture_coverage_geometry_preparation_label(fixture: &FixtureCoverageEntry) -> String {
+    let mut parts = Vec::new();
+    if fixture.geometry_preparation_contract_declared {
+        if fixture.geometry_preparation_contract_complete {
+            parts.push("preparation=complete".to_string());
+        } else {
+            parts.push(format!(
+                "preparation=incomplete ({})",
+                fixture
+                    .geometry_preparation_contract_missing_fields
+                    .join(", ")
+            ));
+        }
+    }
+    if fixture.geometry_accuracy_contract_declared {
+        if fixture.geometry_accuracy_contract_complete {
+            parts.push("accuracy=complete".to_string());
+        } else {
+            parts.push(format!(
+                "accuracy=incomplete ({})",
+                fixture.geometry_accuracy_contract_missing_fields.join(", ")
+            ));
+        }
+    }
+    if fixture.orientation_accuracy_contract_declared {
+        if fixture.orientation_accuracy_contract_complete {
+            parts.push("orientation=complete".to_string());
+        } else {
+            parts.push(format!(
+                "orientation=incomplete ({})",
+                fixture
+                    .orientation_accuracy_contract_missing_fields
+                    .join(", ")
+            ));
+        }
+    }
+    parts.join("; ")
+}
+
+fn fixture_coverage_negative_reconstruction_label(fixture: &FixtureCoverageEntry) -> String {
+    if !fixture.negative_reconstruction_contract_declared {
+        return String::new();
+    }
+    if fixture.negative_reconstruction_contract_complete {
+        "contract=complete".to_string()
+    } else {
+        format!(
+            "contract=incomplete ({})",
+            fixture
+                .negative_reconstruction_contract_missing_fields
+                .join(", ")
+        )
+    }
+}
+
+fn fixture_coverage_grain_label(fixture: &FixtureCoverageEntry) -> String {
+    let Some(mode) = fixture.grain_reduction.as_deref() else {
+        return String::new();
+    };
+    let mut parts = vec![mode.to_string()];
+    if let Some(strength) = fixture.grain_strength {
+        parts.push(format!("strength={strength:.3}"));
+    }
+    if let Some(scale) = fixture.grain_scale {
+        parts.push(format!("scale={scale:.3}"));
+    }
+    if fixture.grain_reduction_enabled_declared {
+        if fixture.grain_detail_contract_complete {
+            parts.push("detail-contract=complete".to_string());
+        } else {
+            parts.push(format!(
+                "detail-contract=incomplete ({})",
+                fixture.grain_detail_contract_missing_fields.join(", ")
+            ));
+        }
+        if fixture.grain_reduction_effect_contract_complete {
+            parts.push("effect-contract=complete".to_string());
+        } else {
+            parts.push(format!(
+                "effect-contract=incomplete ({})",
+                fixture
+                    .grain_reduction_effect_contract_missing_fields
+                    .join(", ")
+            ));
+        }
+    }
+    parts.join("; ")
+}
+
 fn fixture_tiff_pair_label(fixture: &FixtureCoverageEntry) -> String {
+    if fixture.component2.is_none() {
+        return fixture_tiff_probe_label(fixture.component1_tiff.as_ref());
+    }
     let labels = format!(
         "{}/{}",
         fixture_tiff_probe_label(fixture.component1_tiff.as_ref()),
@@ -5373,6 +8969,41 @@ fn parse_input_mode_label(value: &str) -> Option<InputMode> {
     match value {
         "negative" => Some(InputMode::Negative),
         "positive" => Some(InputMode::Positive),
+        _ => None,
+    }
+}
+
+fn parse_grain_reduction_mode_label(value: &str) -> Option<GrainReductionMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" => Some(GrainReductionMode::Off),
+        "on" => Some(GrainReductionMode::On),
+        _ => None,
+    }
+}
+
+fn parse_deskew_mode_label(value: &str) -> Option<DeskewMode> {
+    match value {
+        "auto" => Some(DeskewMode::Auto),
+        "manual" => Some(DeskewMode::Manual),
+        "off" => Some(DeskewMode::Off),
+        _ => None,
+    }
+}
+
+fn parse_orientation_correction_label(value: &str) -> Option<OrientationCorrection> {
+    match value {
+        "none" => Some(OrientationCorrection::None),
+        "flip-horizontal" => Some(OrientationCorrection::FlipHorizontal),
+        "rotate-180" => Some(OrientationCorrection::Rotate180),
+        "flip-vertical" => Some(OrientationCorrection::FlipVertical),
+        "rotate-90-clockwise-then-flip-horizontal" => {
+            Some(OrientationCorrection::Rotate90ClockwiseThenFlipHorizontal)
+        }
+        "rotate-90-clockwise" => Some(OrientationCorrection::Rotate90Clockwise),
+        "rotate-270-clockwise-then-flip-horizontal" => {
+            Some(OrientationCorrection::Rotate270ClockwiseThenFlipHorizontal)
+        }
+        "rotate-270-clockwise" => Some(OrientationCorrection::Rotate270Clockwise),
         _ => None,
     }
 }
@@ -5587,7 +9218,7 @@ fn roll_fixture_registry_scaffold(
         let name = format!("{roll_slug}-{frame_slug}");
         let component = PathBuf::from(&frame.path);
         let mut expectations = FixtureExpectations {
-            stitch_decision: Some("skipped_pre_score".to_string()),
+            stitch_decision: Some("skipped_single_input".to_string()),
             output_color_space: Some("linear_prophoto_rgb_d50".to_string()),
             ..FixtureExpectations::default()
         };
@@ -5597,13 +9228,21 @@ fn roll_fixture_registry_scaffold(
         }
 
         let mut fixture = FixtureEntry {
-            component1: component.clone(),
-            component2: component,
+            component1: component,
+            component2: None,
             component1_sha256: None,
             component2_sha256: None,
+            additional_components: Vec::new(),
             output_dir: Some(output_root.join(&frame_slug)),
             input_mode: Some(cli.input_mode.as_str().to_string()),
             bit_depth: Some(cli.bit_depth),
+            grain_reduction: Some(cli.grain.grain_reduction.as_str().to_string()),
+            grain_strength: Some(cli.grain.grain_strength),
+            grain_scale: Some(cli.grain.grain_scale),
+            deskew: Some(cli.geometry.deskew.as_str().to_string()),
+            orientation_correction: Some(cli.geometry.orientation_correction.as_str().to_string()),
+            deskew_angle_degrees: (cli.geometry.deskew == DeskewMode::Manual)
+                .then_some(cli.geometry.deskew_angle_degrees),
             force_stitch: false,
             force_no_stitch: true,
             calibration_profile: cli.calibration_profile.clone(),
@@ -5616,6 +9255,8 @@ fn roll_fixture_registry_scaffold(
             scene_tags: scene_tags.clone(),
             exposure_tags: exposure_tags.clone(),
             reference_evidence: Vec::new(),
+            render_review: None,
+            render_review_sha256: None,
             calibration_case: roll_fixture_calibration_case(cli),
             expectations,
             summary_baseline: Some(
@@ -5722,6 +9363,18 @@ fn validate_roll_fixture_metadata(
         );
         validate_optional_path(
             key,
+            "render_review",
+            entry.render_review.as_deref(),
+            &mut issues,
+        );
+        validate_optional_sha256(
+            key,
+            "render_review_sha256",
+            entry.render_review_sha256.as_deref(),
+            &mut issues,
+        );
+        validate_optional_path(
+            key,
             "calibration_profile",
             entry.calibration_profile.as_deref(),
             &mut issues,
@@ -5782,7 +9435,7 @@ fn validate_roll_fixture_metadata(
                 &mut issues,
             );
         }
-        validate_fixture_expectations(key, &entry.expectations, &mut issues);
+        validate_fixture_expectations(key, &entry.expectations, 2, &mut issues);
         if entry.calibration_profile.is_some() && entry.calibration_library.is_some() {
             issues.push(format!(
                 "{key}:calibration_profile_and_calibration_library_both_declared"
@@ -5792,6 +9445,9 @@ fn validate_roll_fixture_metadata(
             issues.push(format!(
                 "{key}:summary_baseline_sha256_without_summary_baseline"
             ));
+        }
+        if entry.render_review_sha256.is_some() && entry.render_review.is_none() {
+            issues.push(format!("{key}:render_review_sha256_without_render_review"));
         }
         if entry.calibration_profile_sha256.is_some() && entry.calibration_profile.is_none() {
             issues.push(format!(
@@ -5863,6 +9519,8 @@ fn roll_fixture_metadata_template(
                 scene_tags: (!scene_tags.is_empty()).then_some(scene_tags.clone()),
                 exposure_tags: (!exposure_tags.is_empty()).then_some(exposure_tags.clone()),
                 reference_evidence: None,
+                render_review: None,
+                render_review_sha256: None,
                 calibration_case: roll_fixture_calibration_case(cli),
                 expectations: FixtureExpectations::default(),
                 summary_baseline: None,
@@ -5907,8 +9565,8 @@ fn roll_fixture_metadata_template(
 fn write_roll_contact_sheet(
     cli: &ValidationCli,
     inventory: &RollInventorySummary,
-    sheet_path: &PathBuf,
-    index_path: Option<&PathBuf>,
+    sheet_path: &Path,
+    index_path: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut selection_issues = Vec::new();
     let selected_frames = roll_suite_render_frames(cli, &inventory.frames, &mut selection_issues);
@@ -6000,6 +9658,135 @@ fn write_roll_contact_sheet(
     Ok(())
 }
 
+fn write_orientation_review_package(
+    cli: &ValidationCli,
+    fixtures: &BTreeMap<String, FixtureEntry>,
+    output_dir: &Path,
+) -> Result<(OrientationReviewManifest, PathBuf, PathBuf), Box<dyn std::error::Error>> {
+    let inputs = resolve_orientation_review_inputs(cli, fixtures)?;
+    let input_mode = effective_input_mode(cli, fixtures)?;
+    let bit_depth = effective_bit_depth(cli, fixtures)?;
+    let geometry = effective_geometry(cli, fixtures)?;
+    let preview_transform = if input_mode == InputMode::Negative {
+        "per_channel_stretch_inverted_gamma_orientation_only"
+    } else {
+        "per_channel_stretch_gamma_orientation_only"
+    };
+    let mut previews = Vec::with_capacity(inputs.len());
+    let mut expectations = Vec::with_capacity(inputs.len());
+
+    for (index, path) in inputs.iter().enumerate() {
+        let component_index = index + 1;
+        let mut loaded = tiff_io::load_tiff_u16(path, bit_depth).map_err(|error| {
+            format!(
+                "failed to decode orientation-review component {component_index} {}: {error}",
+                path.display()
+            )
+        })?;
+        tiff_io::apply_orientation_correction_u16(
+            &mut loaded,
+            geometry.orientation_correction.exif_tag(),
+            geometry.orientation_correction.as_str(),
+            bit_depth,
+        )?;
+        let preview = decoded_orientation_preview(
+            &loaded.image,
+            input_mode,
+            ORIENTATION_REVIEW_PREVIEW_MAX_WIDTH,
+            ORIENTATION_REVIEW_PREVIEW_MAX_HEIGHT,
+        )?;
+        let preview_name = format!("component-{component_index:02}-orientation-preview.png");
+        let preview_path = output_dir.join(&preview_name);
+        write_rgb_image(&preview_path, &preview)?;
+        let orientation = &loaded.diagnostics.orientation;
+        let correction = &loaded.diagnostics.orientation_correction;
+        previews.push(OrientationReviewPreview {
+            component_index,
+            source_path: path.to_string_lossy().to_string(),
+            preview_path: preview_name,
+        });
+        expectations.push(OrientationComponentExpectation {
+            component_index,
+            upright_approved: false,
+            decoded_pixel_sha256: loaded.diagnostics.decoded_pixel_sha256.clone(),
+            tag_present: orientation.tag_value.is_some(),
+            tag_value: orientation.tag_value,
+            transform: correction.effective_transform.clone(),
+            applied: orientation.applied || correction.applied,
+            source_width: orientation.source_width,
+            source_height: orientation.source_height,
+            output_width: correction.output_width,
+            output_height: correction.output_height,
+        });
+    }
+
+    let manifest = OrientationReviewManifest {
+        schema_version: 1,
+        fixture: cli.fixture.clone(),
+        review_status: "requires_human_approval",
+        instructions: "Inspect every preview for semantic uprightness. Only after approval, copy orientation_components_expected into the fixture registry and change each upright_approved value to true. The preview stretch/inversion is for orientation review, not colour approval.",
+        input_mode: input_mode.as_str().to_string(),
+        working_bit_depth: bit_depth,
+        orientation_correction: geometry.orientation_correction.as_str().to_string(),
+        preview_transform,
+        previews,
+        orientation_components_expected: expectations,
+    };
+    let json_path = output_dir.join("orientation-review.json");
+    let md_path = output_dir.join("orientation-review.md");
+    write_text(
+        &json_path,
+        &serde_json::to_string_pretty(&manifest)
+            .expect("orientation review manifest should serialize"),
+    )?;
+    write_text(&md_path, &orientation_review_to_markdown(&manifest))?;
+    Ok((manifest, json_path, md_path))
+}
+
+fn orientation_review_to_markdown(manifest: &OrientationReviewManifest) -> String {
+    let mut out = String::from("# Orientation Review Draft\n\n");
+    out.push_str(
+        "Status: `requires_human_approval`. This package never approves its own output.\n\n",
+    );
+    out.push_str(&format!("{}\n\n", manifest.instructions));
+    out.push_str(&format!(
+        "Fixture: `{}`. Input mode: `{}`. Working bit depth: `{}`. Metadata-relative orientation correction: `{}`. Preview transform: `{}`.\n\n",
+        manifest.fixture,
+        manifest.input_mode,
+        manifest.working_bit_depth,
+        manifest.orientation_correction,
+        manifest.preview_transform
+    ));
+    out.push_str("| Component | Preview | Decoded pixel SHA-256 | Tag | Transform | Applied | Source | Output |\n");
+    out.push_str("|-|-|-|-|-|-|-|-|\n");
+    for (preview, expected) in manifest
+        .previews
+        .iter()
+        .zip(&manifest.orientation_components_expected)
+    {
+        let tag = expected
+            .tag_value
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "absent".to_string());
+        out.push_str(&format!(
+            "| {} | [{}]({}) | `{}` | {} | `{}` | {} | {}x{} | {}x{} |\n",
+            expected.component_index,
+            preview.preview_path,
+            preview.preview_path,
+            expected.decoded_pixel_sha256,
+            tag,
+            expected.transform,
+            expected.applied,
+            expected.source_width,
+            expected.source_height,
+            expected.output_width,
+            expected.output_height
+        ));
+    }
+    out.push_str("\nThe JSON draft deliberately leaves every `upright_approved` value `false`. A digest match proves only that strict validation saw the same decoded pixels; the reviewer supplies the semantic uprightness decision.\n");
+    out
+}
+
 fn draw_tile_background(sheet: &mut RgbImage, x: u32, y: u32, width: u32, height: u32) {
     for yy in y..(y + height).min(sheet.height()) {
         for xx in x..(x + width).min(sheet.width()) {
@@ -6026,14 +9813,29 @@ fn roll_frame_contact_thumbnail(
     bit_depth: u8,
 ) -> Result<RgbImage, Box<dyn std::error::Error>> {
     let loaded = tiff_io::load_tiff_u16(Path::new(&frame.path), bit_depth)?;
-    let image = loaded.image;
+    decoded_orientation_preview(
+        &loaded.image,
+        input_mode,
+        ROLL_CONTACT_SHEET_THUMB_WIDTH,
+        ROLL_CONTACT_SHEET_THUMB_HEIGHT,
+    )
+}
+
+fn decoded_orientation_preview(
+    image: &Array3<u16>,
+    input_mode: InputMode,
+    max_width: u32,
+    max_height: u32,
+) -> Result<RgbImage, Box<dyn std::error::Error>> {
     let (height, width, channels) = image.dim();
-    if width == 0 || height == 0 || channels < 3 {
-        return Err(format!("{} has unsupported image dimensions", frame.name).into());
+    if width == 0 || height == 0 || channels < 3 || max_width == 0 || max_height == 0 {
+        return Err(
+            "cannot build an orientation preview from empty or unsupported dimensions".into(),
+        );
     }
-    let (mins, maxes) = sampled_channel_min_max(&image);
-    let scale = (ROLL_CONTACT_SHEET_THUMB_WIDTH as f64 / width as f64)
-        .min(ROLL_CONTACT_SHEET_THUMB_HEIGHT as f64 / height as f64)
+    let (mins, maxes) = sampled_channel_min_max(image);
+    let scale = (max_width as f64 / width as f64)
+        .min(max_height as f64 / height as f64)
         .max(1.0 / width.max(height) as f64);
     let thumb_width = ((width as f64 * scale).round() as u32).max(1);
     let thumb_height = ((height as f64 * scale).round() as u32).max(1);
@@ -6159,6 +9961,12 @@ fn apply_roll_fixture_metadata_entry(fixture: &mut FixtureEntry, entry: &RollFix
     if let Some(values) = &entry.reference_evidence {
         fixture.reference_evidence = values.clone();
     }
+    if let Some(value) = &entry.render_review {
+        fixture.render_review = Some(value.clone());
+    }
+    if let Some(value) = &entry.render_review_sha256 {
+        fixture.render_review_sha256 = Some(value.clone());
+    }
     if let Some(value) = &entry.calibration_case {
         fixture.calibration_case = Some(value.clone());
     }
@@ -6190,8 +9998,65 @@ fn merge_fixture_expectations(base: &mut FixtureExpectations, overlay: FixtureEx
         };
     }
 
+    merge_option!(deskew_all_components_applied);
+    merge_option!(deskew_minimum_component_retained_area_ratio_min);
+    merge_option!(border_crop_all_components_cropped);
+    merge_option!(border_crop_minimum_removed_edge_count_per_component_min);
+    merge_option!(border_crop_retained_area_ratio_min);
+    merge_option!(border_crop_retained_area_ratio_max);
+    merge_option!(border_crop_rejected);
+    merge_option!(deskew_correction_degrees_expected);
+    merge_option!(deskew_correction_tolerance_degrees);
+    merge_vec!(border_crop_components_expected);
+    merge_vec!(orientation_components_expected);
     merge_option!(stitch_decision);
+    merge_option!(seam_exposure_model);
+    merge_option!(seam_exposure_held_out_validation_passed);
+    merge_option!(seam_exposure_held_out_improvement_over_gain_min);
+    merge_option!(seam_exposure_offset_normalized_abs_max);
+    merge_option!(seam_exposure_spatial_slope_abs_min);
+    merge_option!(seam_exposure_spatial_slope_abs_max);
+    merge_option!(seam_exposure_spatial_slope_agreement_ratio_min);
+    merge_option!(seam_exposure_held_out_spatial_improvement_over_best_constant_min);
+    merge_option!(seam_exposure_spatial_offset_slope_normalized_abs_min);
+    merge_option!(seam_exposure_spatial_offset_slope_normalized_abs_max);
+    merge_option!(seam_exposure_spatial_offset_endpoint_normalized_abs_max);
+    merge_option!(seam_exposure_spatial_affine_slope_agreement_ratio_min);
+    merge_option!(seam_exposure_spatial_affine_center_offset_delta_normalized_max);
+    merge_option!(seam_exposure_held_out_spatial_gain_offset_improvement_over_best_simpler_min);
+    merge_option!(seam_exposure_spatial_2d_gain_accepted);
+    merge_option!(seam_exposure_spatial_2d_gain_offset_accepted);
+    merge_option!(seam_exposure_spatial_quadratic_gain_accepted);
+    merge_option!(seam_exposure_spatial_quadratic_gain_offset_accepted);
+    merge_option!(seam_exposure_spatial_2d_distinct_columns_min);
+    merge_option!(seam_exposure_spatial_2d_horizontal_slope_agreement_ratio_min);
+    merge_option!(seam_exposure_held_out_spatial_2d_improvement_over_best_simpler_min);
+    base.seam_blend_required |= overlay.seam_blend_required;
+    merge_option!(seam_blend_mode);
+    merge_option!(seam_blend_review_required);
+    merge_option!(seam_detail_review_required);
+    merge_option!(seam_detail_supported_scale_count_min);
+    merge_option!(seam_detail_max_symmetric_energy_ratio_max);
+    merge_option!(seam_gradient_ratio_max);
+    merge_option!(seam_overlap_p95_abs_difference_max);
     merge_option!(base_estimate_source);
+    merge_option!(base_confidence_min);
+    merge_option!(density_inversion_skipped);
+    merge_option!(negative_response_model);
+    merge_option!(negative_response_source);
+    merge_option!(negative_response_accepted);
+    merge_option!(negative_response_review_required);
+    merge_option!(negative_response_crosstalk_model);
+    merge_option!(negative_response_characteristic_curve_model);
+    merge_option!(negative_response_measured_model_id);
+    merge_option!(negative_response_measured_confidence_min);
+    merge_option!(negative_response_held_out_delta_e00_rms_max);
+    merge_option!(negative_response_held_out_max_delta_e00_max);
+    merge_option!(negative_response_held_out_improvement_over_unit_slope_min);
+    merge_option!(negative_response_density_noise_gain_max);
+    merge_option!(negative_response_curve_extrapolated_ratio_max);
+    merge_option!(negative_response_signed_headroom_preserved);
+    merge_option!(negative_response_curve_interpolation);
     merge_option!(output_color_space);
     merge_option!(render_input_source);
     merge_option!(render_input_reason_contains);
@@ -6200,15 +10065,31 @@ fn merge_fixture_expectations(base: &mut FixtureExpectations, overlay: FixtureEx
     merge_option!(selected_candidate);
     merge_option!(selected_candidate_rank);
     merge_option!(calibration_acceptance_status);
+    merge_option!(calibration_color_mapping_applied);
     merge_option!(calibration_confidence_min);
     merge_option!(calibration_matrix_condition_number_max);
     merge_vec!(calibration_rejection_details_required);
     merge_option!(candidate_risk);
     merge_option!(tone_color_trust_state);
+    merge_option!(neutral_safety_rescue_applied);
+    merge_option!(neutral_safety_rescue_preserved_ratio_gain_min);
+    merge_option!(neutral_safety_rescue_midtone_saturation_p95_reduction_min);
+    merge_option!(neutral_safety_rescue_reason_contains);
     merge_option!(highlight_chroma_compressed_ratio_min);
     merge_option!(highlight_chroma_compressed_ratio_max);
     merge_option!(highlight_neutral_chroma_compressed_ratio_max);
     merge_option!(shadow_chroma_compressed_ratio_max);
+    merge_option!(grain_reduction_enabled);
+    merge_option!(grain_reduction_applied_ratio_min);
+    merge_option!(grain_reduction_structure_excluded_ratio_min);
+    merge_option!(grain_reduction_flat_luma_p95_reduction_ratio_min);
+    merge_option!(grain_reduction_flat_chroma_p95_reduction_ratio_min);
+    merge_option!(grain_detail_review_required);
+    merge_option!(grain_detail_decision_supported);
+    merge_option!(grain_detail_luminance_probe_count_min);
+    merge_option!(grain_detail_chroma_probe_count_min);
+    merge_option!(grain_detail_luminance_p10_retention_min);
+    merge_option!(grain_detail_chroma_p10_retention_min);
     merge_option!(selected_quality_score_max);
     merge_option!(technical_safety_score_max);
     merge_option!(color_fidelity_score_max);
@@ -6220,6 +10101,15 @@ fn merge_fixture_expectations(base: &mut FixtureExpectations, overlay: FixtureEx
     merge_option!(saturation_preservation_median_ratio_min);
     merge_option!(spatial_neutral_delta_p95_max);
     merge_option!(post_scale_preserved_ratio_min);
+    merge_option!(render_luminance_range_p05_p95_min);
+    merge_option!(render_review_status);
+    merge_option!(render_reviewable);
+    merge_option!(tone_output_confidence_status);
+    merge_option!(tone_output_review_required);
+    merge_option!(tone_output_evidence_confidence_min);
+    merge_option!(render_to_mapped_luminance_range_ratio_min);
+    merge_option!(post_chroma_compression_clipped_high_ratio_max);
+    merge_option!(post_chroma_compression_clipped_low_ratio_max);
     base.reference_patch_evaluation_required |= overlay.reference_patch_evaluation_required;
     merge_option!(reference_patch_count_min);
     merge_option!(reference_patch_hue_family_regression_count_max);
@@ -6464,6 +10354,30 @@ fn summarize_roll_suite_review(
 ) -> RollSuiteReviewSummary {
     RollSuiteReviewSummary {
         frame_count: frames.len(),
+        render_reviewable_count: frames
+            .iter()
+            .filter(|frame| frame.render_reviewable == Some(true))
+            .count(),
+        render_not_reviewable_count: frames
+            .iter()
+            .filter(|frame| frame.render_reviewable == Some(false))
+            .count(),
+        render_reviewable_unknown_count: frames
+            .iter()
+            .filter(|frame| frame.render_reviewable.is_none())
+            .count(),
+        tone_output_evaluated_count: frames
+            .iter()
+            .filter(|frame| frame.tone_output_evidence_evaluated == Some(true))
+            .count(),
+        tone_output_review_required_count: frames
+            .iter()
+            .filter(|frame| frame.tone_output_review_required == Some(true))
+            .count(),
+        tone_output_unknown_count: frames
+            .iter()
+            .filter(|frame| frame.tone_output_review_required.is_none())
+            .count(),
         candidate_safe_count: frames
             .iter()
             .filter(|frame| frame.candidate_risk.as_deref() == Some("safe"))
@@ -6515,6 +10429,21 @@ fn summarize_roll_suite_review(
             .iter()
             .filter(|frame| frame.reference_patch_evaluation_present.is_none())
             .count(),
+        render_review_status_counts: roll_suite_value_counts(
+            frames
+                .iter()
+                .map(|frame| frame.render_review_status.as_deref()),
+        ),
+        tone_output_confidence_status_counts: roll_suite_value_counts(
+            frames
+                .iter()
+                .map(|frame| frame.tone_output_confidence_status.as_deref()),
+        ),
+        tone_output_review_reason_counts: roll_suite_value_counts(
+            frames
+                .iter()
+                .map(|frame| frame.tone_output_review_reason.as_deref()),
+        ),
         candidate_risk_counts: roll_suite_value_counts(
             frames.iter().map(|frame| frame.candidate_risk.as_deref()),
         ),
@@ -6572,6 +10501,20 @@ fn summarize_roll_suite_quality(frames: &[RollSuiteEntry]) -> RollSuiteQualitySu
         (Some(min), Some(max)) => Some(max - min),
         _ => None,
     };
+    let evaluated_grain_frames = frames
+        .iter()
+        .filter(|frame| frame.grain_detail_evaluated == Some(true))
+        .collect::<Vec<_>>();
+    let supported_luminance_grain_frames = evaluated_grain_frames
+        .iter()
+        .copied()
+        .filter(|frame| frame.grain_detail_luminance_supported == Some(true))
+        .collect::<Vec<_>>();
+    let supported_chroma_grain_frames = evaluated_grain_frames
+        .iter()
+        .copied()
+        .filter(|frame| frame.grain_detail_chroma_supported == Some(true))
+        .collect::<Vec<_>>();
 
     RollSuiteQualitySummary {
         frame_count: frames.len(),
@@ -6666,6 +10609,16 @@ fn summarize_roll_suite_quality(frames: &[RollSuiteEntry]) -> RollSuiteQualitySu
                 .iter()
                 .map(|frame| frame.noise_reduction_applied_ratio),
         ),
+        noise_reduction_structure_excluded_ratio_mean: mean_optional(
+            frames
+                .iter()
+                .map(|frame| frame.noise_reduction_structure_excluded_ratio),
+        ),
+        noise_reduction_structure_excluded_ratio_min: min_optional(
+            frames
+                .iter()
+                .map(|frame| frame.noise_reduction_structure_excluded_ratio),
+        ),
         noise_reduction_texture_limited_ratio_mean: mean_optional(
             frames
                 .iter()
@@ -6695,6 +10648,67 @@ fn summarize_roll_suite_quality(frames: &[RollSuiteEntry]) -> RollSuiteQualitySu
             frames
                 .iter()
                 .map(|frame| frame.noise_reduction_max_abs_luma_delta),
+        ),
+        grain_detail_evaluated_count: evaluated_grain_frames.len(),
+        grain_detail_decision_supported_count: evaluated_grain_frames
+            .iter()
+            .filter(|frame| frame.grain_detail_decision_supported == Some(true))
+            .count(),
+        grain_detail_review_required_count: evaluated_grain_frames
+            .iter()
+            .filter(|frame| frame.grain_detail_review_required == Some(true))
+            .count(),
+        grain_detail_luminance_supported_count: supported_luminance_grain_frames.len(),
+        grain_detail_chroma_supported_count: supported_chroma_grain_frames.len(),
+        grain_detail_luminance_probe_count_min: min_optional_usize(
+            evaluated_grain_frames
+                .iter()
+                .map(|frame| frame.grain_detail_luminance_probe_count),
+        ),
+        grain_detail_chroma_probe_count_min: min_optional_usize(
+            evaluated_grain_frames
+                .iter()
+                .map(|frame| frame.grain_detail_chroma_probe_count),
+        ),
+        grain_detail_luminance_median_retention_mean: mean_optional(
+            supported_luminance_grain_frames
+                .iter()
+                .map(|frame| frame.grain_detail_luminance_median_retention),
+        ),
+        grain_detail_luminance_median_retention_min: min_optional(
+            supported_luminance_grain_frames
+                .iter()
+                .map(|frame| frame.grain_detail_luminance_median_retention),
+        ),
+        grain_detail_luminance_p10_retention_mean: mean_optional(
+            supported_luminance_grain_frames
+                .iter()
+                .map(|frame| frame.grain_detail_luminance_p10_retention),
+        ),
+        grain_detail_luminance_p10_retention_min: min_optional(
+            supported_luminance_grain_frames
+                .iter()
+                .map(|frame| frame.grain_detail_luminance_p10_retention),
+        ),
+        grain_detail_chroma_median_retention_mean: mean_optional(
+            supported_chroma_grain_frames
+                .iter()
+                .map(|frame| frame.grain_detail_chroma_median_retention),
+        ),
+        grain_detail_chroma_median_retention_min: min_optional(
+            supported_chroma_grain_frames
+                .iter()
+                .map(|frame| frame.grain_detail_chroma_median_retention),
+        ),
+        grain_detail_chroma_p10_retention_mean: mean_optional(
+            supported_chroma_grain_frames
+                .iter()
+                .map(|frame| frame.grain_detail_chroma_p10_retention),
+        ),
+        grain_detail_chroma_p10_retention_min: min_optional(
+            supported_chroma_grain_frames
+                .iter()
+                .map(|frame| frame.grain_detail_chroma_p10_retention),
         ),
         colorspace_post_scale_preserved_ratio_mean: mean_optional(
             frames
@@ -6862,6 +10876,10 @@ fn min_optional(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
         .min_by(|a, b| a.total_cmp(b))
 }
 
+fn min_optional_usize(values: impl Iterator<Item = Option<usize>>) -> Option<usize> {
+    values.flatten().min()
+}
+
 fn compare_roll_suites(
     baseline_path: String,
     baseline: &serde_json::Value,
@@ -6882,6 +10900,10 @@ fn compare_roll_suites(
     const FRAME_FLAT_CHROMA_INCREASE_THRESHOLD: f64 = 0.01;
     const FRAME_BALANCE_INCREASE_THRESHOLD: f64 = 0.04;
     const FRAME_PRESERVED_DROP_THRESHOLD: f64 = -0.01;
+    const GRAIN_DETAIL_RETENTION_DROP_THRESHOLD: f64 = -0.03;
+    const FRAME_GRAIN_DETAIL_RETENTION_DROP_THRESHOLD: f64 = -0.05;
+    const FRAME_TONE_OUTPUT_CONFIDENCE_DROP_THRESHOLD: f64 = -0.001;
+    const FRAME_TONE_OUTPUT_RANGE_RETENTION_DROP_THRESHOLD: f64 = -0.05;
 
     let baseline_frames = roll_suite_frames_by_name(baseline);
     let current_frames = roll_suite_frames_by_name(current);
@@ -6897,6 +10919,56 @@ fn compare_roll_suites(
         .collect::<Vec<_>>();
 
     let quality = RollSuiteQualityComparison {
+        noise_reduction_enabled_count_delta: roll_suite_quality_isize_delta(
+            baseline,
+            current,
+            "noise_reduction_enabled_count",
+        ),
+        grain_detail_evaluated_count_delta: roll_suite_quality_isize_delta(
+            baseline,
+            current,
+            "grain_detail_evaluated_count",
+        ),
+        grain_detail_decision_supported_count_delta: roll_suite_quality_isize_delta(
+            baseline,
+            current,
+            "grain_detail_decision_supported_count",
+        ),
+        grain_detail_review_required_count_delta: roll_suite_quality_isize_delta(
+            baseline,
+            current,
+            "grain_detail_review_required_count",
+        ),
+        grain_detail_luminance_supported_count_delta: roll_suite_quality_isize_delta(
+            baseline,
+            current,
+            "grain_detail_luminance_supported_count",
+        ),
+        grain_detail_chroma_supported_count_delta: roll_suite_quality_isize_delta(
+            baseline,
+            current,
+            "grain_detail_chroma_supported_count",
+        ),
+        grain_detail_luminance_p10_retention_mean_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "grain_detail_luminance_p10_retention_mean",
+        ),
+        grain_detail_luminance_p10_retention_min_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "grain_detail_luminance_p10_retention_min",
+        ),
+        grain_detail_chroma_p10_retention_mean_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "grain_detail_chroma_p10_retention_mean",
+        ),
+        grain_detail_chroma_p10_retention_min_delta: roll_suite_quality_delta(
+            baseline,
+            current,
+            "grain_detail_chroma_p10_retention_min",
+        ),
         render_luminance_range_p05_p95_mean_delta: roll_suite_quality_delta(
             baseline,
             current,
@@ -7059,6 +11131,73 @@ fn compare_roll_suites(
         issues.push("roll_suite_compare:review_required_count_increased".to_string());
     }
     if !frame_set_changed {
+        if quality
+            .noise_reduction_enabled_count_delta
+            .is_some_and(|delta| delta != 0)
+        {
+            issues.push("roll_suite_compare:noise_reduction_enabled_count_changed".to_string());
+        }
+        if quality
+            .grain_detail_evaluated_count_delta
+            .is_some_and(|delta| delta != 0)
+        {
+            issues.push("roll_suite_compare:grain_detail_evaluated_count_changed".to_string());
+        }
+        if quality
+            .grain_detail_review_required_count_delta
+            .is_some_and(|delta| delta > 0)
+        {
+            issues.push(
+                "roll_suite_compare:grain_detail_review_required_count_increased".to_string(),
+            );
+        }
+        if quality
+            .grain_detail_decision_supported_count_delta
+            .is_some_and(|delta| delta < 0)
+        {
+            issues.push(
+                "roll_suite_compare:grain_detail_decision_supported_count_dropped".to_string(),
+            );
+        }
+        if quality
+            .grain_detail_luminance_supported_count_delta
+            .is_some_and(|delta| delta < 0)
+        {
+            issues.push(
+                "roll_suite_compare:grain_detail_luminance_supported_count_dropped".to_string(),
+            );
+        }
+        if quality
+            .grain_detail_chroma_supported_count_delta
+            .is_some_and(|delta| delta < 0)
+        {
+            issues
+                .push("roll_suite_compare:grain_detail_chroma_supported_count_dropped".to_string());
+        }
+        if option_lt(
+            quality.grain_detail_luminance_p10_retention_mean_delta,
+            GRAIN_DETAIL_RETENTION_DROP_THRESHOLD,
+        ) {
+            issues.push("roll_suite_compare:grain_detail_luminance_p10_mean_dropped".to_string());
+        }
+        if option_lt(
+            quality.grain_detail_luminance_p10_retention_min_delta,
+            GRAIN_DETAIL_RETENTION_DROP_THRESHOLD,
+        ) {
+            issues.push("roll_suite_compare:grain_detail_luminance_p10_min_dropped".to_string());
+        }
+        if option_lt(
+            quality.grain_detail_chroma_p10_retention_mean_delta,
+            GRAIN_DETAIL_RETENTION_DROP_THRESHOLD,
+        ) {
+            issues.push("roll_suite_compare:grain_detail_chroma_p10_mean_dropped".to_string());
+        }
+        if option_lt(
+            quality.grain_detail_chroma_p10_retention_min_delta,
+            GRAIN_DETAIL_RETENTION_DROP_THRESHOLD,
+        ) {
+            issues.push("roll_suite_compare:grain_detail_chroma_p10_min_dropped".to_string());
+        }
         if option_lt(
             quality.midtone_luminance_p50_min_delta,
             MIDTONE_MIN_DROP_THRESHOLD,
@@ -7135,18 +11274,128 @@ fn compare_roll_suites(
         let current_frame = current_frames.get(name);
         let baseline_status = baseline_frame.and_then(|frame| roll_suite_string(frame, "status"));
         let current_status = current_frame.and_then(|frame| roll_suite_string(frame, "status"));
+        let baseline_render_review_status =
+            baseline_frame.and_then(|frame| roll_suite_string(frame, "render_review_status"));
+        let current_render_review_status =
+            current_frame.and_then(|frame| roll_suite_string(frame, "render_review_status"));
+        let baseline_render_reviewable =
+            baseline_frame.and_then(|frame| roll_suite_bool(frame, "render_reviewable"));
+        let current_render_reviewable =
+            current_frame.and_then(|frame| roll_suite_bool(frame, "render_reviewable"));
+        let baseline_tone_output_confidence_status = baseline_frame
+            .and_then(|frame| roll_suite_string(frame, "tone_output_confidence_status"));
+        let current_tone_output_confidence_status = current_frame
+            .and_then(|frame| roll_suite_string(frame, "tone_output_confidence_status"));
+        let baseline_tone_output_review_required =
+            baseline_frame.and_then(|frame| roll_suite_bool(frame, "tone_output_review_required"));
+        let current_tone_output_review_required =
+            current_frame.and_then(|frame| roll_suite_bool(frame, "tone_output_review_required"));
         let baseline_candidate_risk =
             baseline_frame.and_then(|frame| roll_suite_string(frame, "candidate_risk"));
         let current_candidate_risk =
             current_frame.and_then(|frame| roll_suite_string(frame, "candidate_risk"));
+        let baseline_grain_detail_review_required =
+            baseline_frame.and_then(|frame| roll_suite_bool(frame, "grain_detail_review_required"));
+        let current_grain_detail_review_required =
+            current_frame.and_then(|frame| roll_suite_bool(frame, "grain_detail_review_required"));
+        let baseline_grain_detail_decision_supported = baseline_frame
+            .and_then(|frame| roll_suite_bool(frame, "grain_detail_decision_supported"));
+        let current_grain_detail_decision_supported = current_frame
+            .and_then(|frame| roll_suite_bool(frame, "grain_detail_decision_supported"));
+        let baseline_grain_detail_luminance_supported = baseline_frame
+            .and_then(|frame| roll_suite_bool(frame, "grain_detail_luminance_supported"));
+        let current_grain_detail_luminance_supported = current_frame
+            .and_then(|frame| roll_suite_bool(frame, "grain_detail_luminance_supported"));
+        let baseline_grain_detail_chroma_supported = baseline_frame
+            .and_then(|frame| roll_suite_bool(frame, "grain_detail_chroma_supported"));
+        let current_grain_detail_chroma_supported =
+            current_frame.and_then(|frame| roll_suite_bool(frame, "grain_detail_chroma_supported"));
         let comparison = RollSuiteFrameComparison {
             name: name.clone(),
             status_changed: baseline_status != current_status,
             baseline_status,
             current_status,
+            render_review_status_changed: asserted_option_string_changed(
+                baseline_render_review_status.as_ref(),
+                current_render_review_status.as_ref(),
+            ),
+            baseline_render_review_status,
+            current_render_review_status,
+            render_reviewable_changed: asserted_option_bool_changed(
+                baseline_render_reviewable,
+                current_render_reviewable,
+            ),
+            baseline_render_reviewable,
+            current_render_reviewable,
+            tone_output_confidence_status_changed: asserted_option_string_changed(
+                baseline_tone_output_confidence_status.as_ref(),
+                current_tone_output_confidence_status.as_ref(),
+            ),
+            baseline_tone_output_confidence_status,
+            current_tone_output_confidence_status,
+            tone_output_review_required_changed: asserted_option_bool_changed(
+                baseline_tone_output_review_required,
+                current_tone_output_review_required,
+            ),
+            baseline_tone_output_review_required,
+            current_tone_output_review_required,
+            tone_output_evidence_confidence_delta: roll_suite_frame_delta(
+                baseline_frame.copied(),
+                current_frame.copied(),
+                "tone_output_evidence_confidence",
+            ),
+            tone_output_render_to_mapped_luminance_range_ratio_delta: roll_suite_frame_delta(
+                baseline_frame.copied(),
+                current_frame.copied(),
+                "render_to_mapped_luminance_range_ratio",
+            ),
+            tone_output_maximum_post_tone_high_clip_ratio_delta: roll_suite_frame_delta(
+                baseline_frame.copied(),
+                current_frame.copied(),
+                "maximum_post_tone_high_clip_ratio",
+            ),
+            tone_output_maximum_post_tone_low_clip_ratio_delta: roll_suite_frame_delta(
+                baseline_frame.copied(),
+                current_frame.copied(),
+                "maximum_post_tone_low_clip_ratio",
+            ),
             candidate_risk_changed: baseline_candidate_risk != current_candidate_risk,
             baseline_candidate_risk,
             current_candidate_risk,
+            grain_detail_review_required_changed: option_bool_changed(
+                baseline_grain_detail_review_required,
+                current_grain_detail_review_required,
+            ),
+            baseline_grain_detail_review_required,
+            current_grain_detail_review_required,
+            grain_detail_decision_supported_changed: option_bool_changed(
+                baseline_grain_detail_decision_supported,
+                current_grain_detail_decision_supported,
+            ),
+            baseline_grain_detail_decision_supported,
+            current_grain_detail_decision_supported,
+            grain_detail_luminance_supported_changed: option_bool_changed(
+                baseline_grain_detail_luminance_supported,
+                current_grain_detail_luminance_supported,
+            ),
+            baseline_grain_detail_luminance_supported,
+            current_grain_detail_luminance_supported,
+            grain_detail_chroma_supported_changed: option_bool_changed(
+                baseline_grain_detail_chroma_supported,
+                current_grain_detail_chroma_supported,
+            ),
+            baseline_grain_detail_chroma_supported,
+            current_grain_detail_chroma_supported,
+            grain_detail_luminance_p10_retention_delta: roll_suite_frame_delta(
+                baseline_frame.copied(),
+                current_frame.copied(),
+                "grain_detail_luminance_p10_retention",
+            ),
+            grain_detail_chroma_p10_retention_delta: roll_suite_frame_delta(
+                baseline_frame.copied(),
+                current_frame.copied(),
+                "grain_detail_chroma_p10_retention",
+            ),
             render_luminance_range_p05_p95_delta: roll_suite_frame_delta(
                 baseline_frame.copied(),
                 current_frame.copied(),
@@ -7217,6 +11466,87 @@ fn compare_roll_suites(
                 roll_frame_issue_token(name)
             ));
         }
+        let both_frames_present = baseline_frame.is_some() && current_frame.is_some();
+        if both_frames_present
+            && comparison.baseline_render_reviewable == Some(true)
+            && comparison.current_render_reviewable != Some(true)
+        {
+            issues.push(format!(
+                "roll_suite_compare:{}:render_reviewability_lost",
+                roll_frame_issue_token(name)
+            ));
+        }
+        if both_frames_present
+            && comparison.baseline_tone_output_confidence_status.as_deref()
+                == Some("supported_render_tonal_distribution")
+            && comparison.current_tone_output_confidence_status.as_deref()
+                != Some("supported_render_tonal_distribution")
+        {
+            issues.push(format!(
+                "roll_suite_compare:{}:tone_output_status_regressed",
+                roll_frame_issue_token(name)
+            ));
+        }
+        if both_frames_present
+            && comparison.baseline_tone_output_review_required == Some(false)
+            && comparison.current_tone_output_review_required == Some(true)
+        {
+            issues.push(format!(
+                "roll_suite_compare:{}:tone_output_review_newly_required",
+                roll_frame_issue_token(name)
+            ));
+        }
+        let baseline_has_tone_output_evidence =
+            comparison.baseline_tone_output_confidence_status.is_some()
+                || comparison.baseline_tone_output_review_required.is_some();
+        let current_has_tone_output_evidence =
+            comparison.current_tone_output_confidence_status.is_some()
+                || comparison.current_tone_output_review_required.is_some();
+        if both_frames_present
+            && baseline_has_tone_output_evidence
+            && !current_has_tone_output_evidence
+        {
+            issues.push(format!(
+                "roll_suite_compare:{}:tone_output_evidence_missing",
+                roll_frame_issue_token(name)
+            ));
+        }
+        if option_lt(
+            comparison.tone_output_evidence_confidence_delta,
+            FRAME_TONE_OUTPUT_CONFIDENCE_DROP_THRESHOLD,
+        ) {
+            issues.push(format!(
+                "roll_suite_compare:{}:tone_output_evidence_confidence_dropped",
+                roll_frame_issue_token(name)
+            ));
+        }
+        if option_lt(
+            comparison.tone_output_render_to_mapped_luminance_range_ratio_delta,
+            FRAME_TONE_OUTPUT_RANGE_RETENTION_DROP_THRESHOLD,
+        ) {
+            issues.push(format!(
+                "roll_suite_compare:{}:tone_output_range_retention_dropped",
+                roll_frame_issue_token(name)
+            ));
+        }
+        if option_gt(
+            comparison.tone_output_maximum_post_tone_high_clip_ratio_delta,
+            CLIP_HIGH_INCREASE_THRESHOLD,
+        ) {
+            issues.push(format!(
+                "roll_suite_compare:{}:tone_output_high_clipping_increased",
+                roll_frame_issue_token(name)
+            ));
+        }
+        if option_gt(
+            comparison.tone_output_maximum_post_tone_low_clip_ratio_delta,
+            CLIP_HIGH_INCREASE_THRESHOLD,
+        ) {
+            issues.push(format!(
+                "roll_suite_compare:{}:tone_output_low_clipping_increased",
+                roll_frame_issue_token(name)
+            ));
+        }
         if baseline_frame.is_some()
             && current_frame.is_some()
             && roll_suite_risk_rank(comparison.current_candidate_risk.as_deref())
@@ -7224,6 +11554,56 @@ fn compare_roll_suites(
         {
             issues.push(format!(
                 "roll_suite_compare:{}:candidate_risk_regressed",
+                roll_frame_issue_token(name)
+            ));
+        }
+        if comparison.baseline_grain_detail_review_required == Some(false)
+            && comparison.current_grain_detail_review_required == Some(true)
+        {
+            issues.push(format!(
+                "roll_suite_compare:{}:grain_detail_review_newly_required",
+                roll_frame_issue_token(name)
+            ));
+        }
+        if comparison.baseline_grain_detail_decision_supported == Some(true)
+            && comparison.current_grain_detail_decision_supported == Some(false)
+        {
+            issues.push(format!(
+                "roll_suite_compare:{}:grain_detail_decision_support_lost",
+                roll_frame_issue_token(name)
+            ));
+        }
+        if comparison.baseline_grain_detail_luminance_supported == Some(true)
+            && comparison.current_grain_detail_luminance_supported == Some(false)
+        {
+            issues.push(format!(
+                "roll_suite_compare:{}:grain_detail_luminance_support_lost",
+                roll_frame_issue_token(name)
+            ));
+        }
+        if comparison.baseline_grain_detail_chroma_supported == Some(true)
+            && comparison.current_grain_detail_chroma_supported == Some(false)
+        {
+            issues.push(format!(
+                "roll_suite_compare:{}:grain_detail_chroma_support_lost",
+                roll_frame_issue_token(name)
+            ));
+        }
+        if option_lt(
+            comparison.grain_detail_luminance_p10_retention_delta,
+            FRAME_GRAIN_DETAIL_RETENTION_DROP_THRESHOLD,
+        ) {
+            issues.push(format!(
+                "roll_suite_compare:{}:grain_detail_luminance_p10_dropped",
+                roll_frame_issue_token(name)
+            ));
+        }
+        if option_lt(
+            comparison.grain_detail_chroma_p10_retention_delta,
+            FRAME_GRAIN_DETAIL_RETENTION_DROP_THRESHOLD,
+        ) {
+            issues.push(format!(
+                "roll_suite_compare:{}:grain_detail_chroma_p10_dropped",
                 roll_frame_issue_token(name)
             ));
         }
@@ -7336,6 +11716,17 @@ fn roll_suite_quality_delta(
     )
 }
 
+fn roll_suite_quality_isize_delta(
+    baseline: &serde_json::Value,
+    current: &serde_json::Value,
+    field: &str,
+) -> Option<isize> {
+    Some(
+        current.get("quality")?.get(field)?.as_i64()? as isize
+            - baseline.get("quality")?.get(field)?.as_i64()? as isize,
+    )
+}
+
 fn roll_suite_quality_value(summary: &serde_json::Value, field: &str) -> Option<f64> {
     if let Some(value) = summary
         .get("quality")
@@ -7401,6 +11792,22 @@ fn roll_suite_isize_delta(
 
 fn roll_suite_string(value: &serde_json::Value, field: &str) -> Option<String> {
     value.get(field)?.as_str().map(ToString::to_string)
+}
+
+fn roll_suite_bool(value: &serde_json::Value, field: &str) -> Option<bool> {
+    value.get(field)?.as_bool()
+}
+
+fn option_bool_changed(baseline: Option<bool>, current: Option<bool>) -> bool {
+    matches!((baseline, current), (Some(baseline), Some(current)) if baseline != current)
+}
+
+fn asserted_option_bool_changed(baseline: Option<bool>, current: Option<bool>) -> bool {
+    baseline.is_some() && baseline != current
+}
+
+fn asserted_option_string_changed(baseline: Option<&String>, current: Option<&String>) -> bool {
+    baseline.is_some() && baseline != current
 }
 
 fn f64_delta(baseline: Option<f64>, current: Option<f64>) -> Option<f64> {
@@ -7599,13 +12006,18 @@ fn run_roll_suite_pipeline_child(
         std::fs::remove_file(&report_path)?;
     }
 
+    let component1 = pipeline_cli
+        .inputs
+        .first()
+        .ok_or("roll suite pipeline requires at least one input")?;
+    let component2 = pipeline_cli.inputs.get(1).unwrap_or(component1);
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("--roll-suite-child")
         .arg("--component1")
-        .arg(&pipeline_cli.component1)
+        .arg(component1)
         .arg("--component2")
-        .arg(&pipeline_cli.component2)
+        .arg(component2)
         .arg("--output-dir")
         .arg(&pipeline_cli.output_dir)
         .arg("--color-mode")
@@ -7618,6 +12030,31 @@ fn run_roll_suite_pipeline_child(
         .arg(pipeline_cli.render_intent.as_str())
         .arg("--quality-mode")
         .arg(pipeline_cli.quality_mode.as_str())
+        .arg("--technical-white-balance")
+        .arg(pipeline_cli.white_balance.technical_white_balance.as_str())
+        .arg("--technical-temperature-kelvin")
+        .arg(
+            pipeline_cli
+                .white_balance
+                .technical_temperature_kelvin
+                .to_string(),
+        )
+        .arg("--technical-tint")
+        .arg(pipeline_cli.white_balance.technical_tint.to_string())
+        .arg("--creative-temperature")
+        .arg(pipeline_cli.white_balance.creative_temperature.to_string())
+        .arg("--creative-tint")
+        .arg(pipeline_cli.white_balance.creative_tint.to_string())
+        .arg("--deskew")
+        .arg(pipeline_cli.geometry.deskew.as_str())
+        .arg("--deskew-angle-degrees")
+        .arg(pipeline_cli.geometry.deskew_angle_degrees.to_string())
+        .arg("--grain-reduction")
+        .arg(pipeline_cli.grain.grain_reduction.as_str())
+        .arg("--grain-strength")
+        .arg(pipeline_cli.grain.grain_strength.to_string())
+        .arg("--grain-scale")
+        .arg(pipeline_cli.grain.grain_scale.to_string())
         .arg("--transform")
         .arg(&pipeline_cli.transform)
         .arg("--ica-max-iter")
@@ -7719,6 +12156,8 @@ fn run_roll_suite_entry(
         output_height: None,
         output_color_space: None,
         output_file_icc_profile_matches_report: None,
+        delivery_artifacts_intact: None,
+        delivery_artifact_issues: Vec::new(),
         stale_render_artifact_count: None,
         report_path: None,
         summary_json_path: None,
@@ -7730,6 +12169,17 @@ fn run_roll_suite_entry(
         input_base_confidence: None,
         render_review_status: None,
         render_reviewable: None,
+        tone_output_evidence_evaluated: None,
+        tone_output_evidence_confidence: None,
+        tone_output_confidence_status: None,
+        tone_output_review_required: None,
+        tone_output_review_reason: None,
+        confidence_limited_by_tone_output_evidence: None,
+        input_luminance_range_p05_p95: None,
+        mapped_luminance_range_p05_p95: None,
+        render_to_mapped_luminance_range_ratio: None,
+        maximum_post_tone_high_clip_ratio: None,
+        maximum_post_tone_low_clip_ratio: None,
         positive_input_likely_negative_like: None,
         positive_input_accepted_high_warm_score: None,
         positive_input_orange_mask_score: None,
@@ -7783,15 +12233,30 @@ fn run_roll_suite_entry(
         high_frequency_flat_chroma_to_luma_p95_ratio: None,
         noise_reduction_enabled: None,
         noise_reduction_applied_ratio: None,
+        noise_reduction_structure_gate_start: None,
+        noise_reduction_structure_gate_end: None,
+        noise_reduction_structure_excluded_ratio: None,
         noise_reduction_texture_limited_ratio: None,
         noise_reduction_saturation_limited_ratio: None,
         noise_reduction_mean_abs_chroma_delta: None,
         noise_reduction_max_abs_chroma_delta: None,
         noise_reduction_mean_abs_luma_delta: None,
         noise_reduction_max_abs_luma_delta: None,
+        grain_detail_evaluated: None,
+        grain_detail_decision_supported: None,
+        grain_detail_review_required: None,
+        grain_detail_luminance_supported: None,
+        grain_detail_chroma_supported: None,
+        grain_detail_luminance_probe_count: None,
+        grain_detail_chroma_probe_count: None,
+        grain_detail_luminance_median_retention: None,
+        grain_detail_luminance_p10_retention: None,
+        grain_detail_chroma_median_retention: None,
+        grain_detail_chroma_p10_retention: None,
         calibration_status: None,
         calibration_source: None,
         calibration_acceptance_status: None,
+        calibration_color_mapping_applied: None,
         calibration_confidence: None,
         reference_patch_evaluation_present: None,
         debug_artifact_count: None,
@@ -7812,8 +12277,7 @@ fn run_roll_suite_entry(
 
     let source_path = PathBuf::from(&frame.path);
     let pipeline_cli = PipelineCli {
-        component1: source_path.clone(),
-        component2: source_path,
+        inputs: vec![source_path],
         output_dir: output_dir.clone(),
         calibration_profile: cli.calibration_profile.clone(),
         calibration_library: cli.calibration_library.clone(),
@@ -7833,6 +12297,9 @@ fn run_roll_suite_entry(
         input_mode: cli.input_mode,
         render_intent: cli.render_intent,
         quality_mode: cli.quality_mode,
+        white_balance: cli.white_balance,
+        geometry: cli.geometry,
+        grain: cli.grain,
         write_master: cli.write_master,
         review_sidecar: cli.review_sidecar.clone(),
         write_review_sidecar: cli.write_review_sidecar.clone(),
@@ -7844,6 +12311,7 @@ fn run_roll_suite_entry(
         ica_tol: cli.ica_tol,
         bit_depth: cli.bit_depth,
         use_opencv: cli.use_opencv,
+        require_reviewable: false,
     };
 
     let report = match run_roll_suite_pipeline_child(&pipeline_cli) {
@@ -7870,12 +12338,23 @@ fn run_roll_suite_entry(
     entry.report_path = Some(report_path.display().to_string());
 
     let summary = summarize_report_with_source(frame.stem.clone(), &report, Some(&report_path));
+    entry.issues.extend(
+        summary
+            .diagnostic_consistency_issues
+            .iter()
+            .map(|issue| format!("roll_suite:{name}:diagnostic_consistency:{issue}")),
+    );
     entry.output_path = summary.render.output_path.clone();
     entry.output_width = summary.render.output_width;
     entry.output_height = summary.render.output_height;
     entry.output_color_space = summary.render.output_color_space.clone();
     entry.output_file_icc_profile_matches_report =
         summary.render.output_file_icc_profile_matches_report;
+    entry.delivery_artifact_issues = delivery_artifact_integrity_issues(&summary.render)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    entry.delivery_artifacts_intact = Some(entry.delivery_artifact_issues.is_empty());
     entry.stale_render_artifact_count = summary.render.stale_render_artifact_count;
     entry.stitch_decision = summary.stitch.decision.clone();
     entry.base_confidence = summary.base_density.base_confidence;
@@ -7884,6 +12363,19 @@ fn run_roll_suite_entry(
     entry.input_base_confidence = summary.render.input_base_confidence;
     entry.render_review_status = summary.render.render_review_status.clone();
     entry.render_reviewable = summary.render.render_reviewable;
+    entry.tone_output_evidence_evaluated = summary.tone.tone_output_evidence_evaluated;
+    entry.tone_output_evidence_confidence = summary.tone.tone_output_evidence_confidence;
+    entry.tone_output_confidence_status = summary.tone.tone_output_confidence_status.clone();
+    entry.tone_output_review_required = summary.tone.tone_output_review_required;
+    entry.tone_output_review_reason = summary.tone.tone_output_review_reason.clone();
+    entry.confidence_limited_by_tone_output_evidence =
+        summary.tone.confidence_limited_by_tone_output_evidence;
+    entry.input_luminance_range_p05_p95 = summary.tone.input_luminance_range_p05_p95;
+    entry.mapped_luminance_range_p05_p95 = summary.tone.mapped_luminance_range_p05_p95;
+    entry.render_to_mapped_luminance_range_ratio =
+        summary.tone.render_to_mapped_luminance_range_ratio;
+    entry.maximum_post_tone_high_clip_ratio = summary.tone.maximum_post_tone_high_clip_ratio;
+    entry.maximum_post_tone_low_clip_ratio = summary.tone.maximum_post_tone_low_clip_ratio;
     entry.positive_input_likely_negative_like = summary.render.positive_input_likely_negative_like;
     entry.positive_input_accepted_high_warm_score =
         summary.render.positive_input_accepted_high_warm_score;
@@ -7971,6 +12463,10 @@ fn run_roll_suite_entry(
     }
     entry.noise_reduction_enabled = summary.tone.noise_reduction_enabled;
     entry.noise_reduction_applied_ratio = summary.tone.noise_reduction_applied_ratio;
+    entry.noise_reduction_structure_gate_start = summary.tone.noise_reduction_structure_gate_start;
+    entry.noise_reduction_structure_gate_end = summary.tone.noise_reduction_structure_gate_end;
+    entry.noise_reduction_structure_excluded_ratio =
+        summary.tone.noise_reduction_structure_excluded_ratio;
     entry.noise_reduction_texture_limited_ratio =
         summary.tone.noise_reduction_texture_limited_ratio;
     entry.noise_reduction_saturation_limited_ratio =
@@ -7980,6 +12476,19 @@ fn run_roll_suite_entry(
     entry.noise_reduction_max_abs_chroma_delta = summary.tone.noise_reduction_max_abs_chroma_delta;
     entry.noise_reduction_mean_abs_luma_delta = summary.tone.noise_reduction_mean_abs_luma_delta;
     entry.noise_reduction_max_abs_luma_delta = summary.tone.noise_reduction_max_abs_luma_delta;
+    if let Some(detail) = &summary.tone.grain_detail_retention {
+        entry.grain_detail_evaluated = detail.evaluated;
+        entry.grain_detail_decision_supported = detail.decision_supported;
+        entry.grain_detail_review_required = detail.review_required;
+        entry.grain_detail_luminance_supported = detail.luminance_decision_supported;
+        entry.grain_detail_chroma_supported = detail.chroma_decision_supported;
+        entry.grain_detail_luminance_probe_count = detail.luminance_probe_count;
+        entry.grain_detail_chroma_probe_count = detail.chroma_probe_count;
+        entry.grain_detail_luminance_median_retention = detail.luminance_median_retention;
+        entry.grain_detail_luminance_p10_retention = detail.luminance_p10_retention;
+        entry.grain_detail_chroma_median_retention = detail.chroma_median_retention;
+        entry.grain_detail_chroma_p10_retention = detail.chroma_p10_retention;
+    }
     entry.calibration_status = summary.colorspace.calibration_status.clone();
     entry.calibration_source = summary.colorspace.calibration_source.clone();
     entry.calibration_acceptance_status = summary
@@ -7987,6 +12496,11 @@ fn run_roll_suite_entry(
         .calibration_acceptance
         .as_ref()
         .and_then(|acceptance| acceptance.status.clone());
+    entry.calibration_color_mapping_applied = summary
+        .colorspace
+        .calibration_color_mapping_application
+        .as_ref()
+        .and_then(|application| application.applied);
     entry.calibration_confidence = summary.colorspace.calibration_confidence;
     entry.reference_patch_evaluation_present =
         Some(summary.colorspace.reference_patch_evaluation.is_some());
@@ -8099,27 +12613,9 @@ fn validate_roll_suite_summary(
     debug_artifact_issues: &[String],
     entry: &mut RollSuiteEntry,
 ) {
-    if summary.render.output_path.is_none() {
+    for issue in delivery_artifact_integrity_issues(&summary.render) {
         entry.status = "failed".to_string();
-        entry
-            .issues
-            .push(format!("roll_suite:{name}:output_path_missing"));
-    }
-    if summary.render.output_file_icc_profile_matches_report == Some(false) {
-        entry.status = "failed".to_string();
-        entry
-            .issues
-            .push(format!("roll_suite:{name}:output_icc_profile_mismatch"));
-    }
-    if summary
-        .render
-        .stale_render_artifact_count
-        .is_some_and(|count| count > 0)
-    {
-        entry.status = "failed".to_string();
-        entry
-            .issues
-            .push(format!("roll_suite:{name}:stale_render_artifacts"));
+        entry.issues.push(format!("roll_suite:{name}:{issue}"));
     }
     if !debug_artifact_issues.is_empty() {
         entry.status = "failed".to_string();
@@ -8129,6 +12625,12 @@ fn validate_roll_suite_summary(
                 .map(|issue| format!("roll_suite:{name}:{issue}")),
         );
     }
+    append_roll_suite_render_review_issues(
+        name,
+        summary.render.render_reviewable,
+        summary.tone.tone_output_review_required,
+        &mut entry.issues,
+    );
 
     if input_mode == InputMode::Positive
         && summary.render.positive_input_likely_negative_like == Some(true)
@@ -8201,6 +12703,24 @@ fn validate_roll_suite_summary(
         entry
             .issues
             .push(format!("roll_suite:{name}:selected_candidate_fallback"));
+    }
+}
+
+fn append_roll_suite_render_review_issues(
+    name: &str,
+    render_reviewable: Option<bool>,
+    tone_output_review_required: Option<bool>,
+    issues: &mut Vec<String>,
+) {
+    match render_reviewable {
+        Some(true) => {}
+        Some(false) => issues.push(format!("roll_suite:{name}:render_review_not_supported")),
+        None => issues.push(format!("roll_suite:{name}:render_review_evidence_missing")),
+    }
+    match tone_output_review_required {
+        Some(false) => {}
+        Some(true) => issues.push(format!("roll_suite:{name}:tone_output_review_required")),
+        None => issues.push(format!("roll_suite:{name}:tone_output_evidence_missing")),
     }
 }
 
@@ -8541,6 +13061,36 @@ fn roll_suite_to_markdown(summary: &RollSuiteSummary) -> String {
     }
     md.push_str("## Roll Review Audit\n\n");
     md.push_str(&format!(
+        "- Final render reviewable/not reviewable/unknown: `{}` / `{}` / `{}`\n",
+        summary.review.render_reviewable_count,
+        summary.review.render_not_reviewable_count,
+        summary.review.render_reviewable_unknown_count
+    ));
+    md.push_str(&format!(
+        "- Final render review status counts: `{}`\n",
+        markdown_cell(&roll_suite_counts_cell(
+            &summary.review.render_review_status_counts
+        ))
+    ));
+    md.push_str(&format!(
+        "- Tone output evaluated/review required/unknown: `{}` / `{}` / `{}`\n",
+        summary.review.tone_output_evaluated_count,
+        summary.review.tone_output_review_required_count,
+        summary.review.tone_output_unknown_count
+    ));
+    md.push_str(&format!(
+        "- Tone output status counts: `{}`\n",
+        markdown_cell(&roll_suite_counts_cell(
+            &summary.review.tone_output_confidence_status_counts
+        ))
+    ));
+    md.push_str(&format!(
+        "- Tone output review reason counts: `{}`\n",
+        markdown_cell(&roll_suite_counts_cell(
+            &summary.review.tone_output_review_reason_counts
+        ))
+    ));
+    md.push_str(&format!(
         "- Candidate risk safe/review/unknown: `{}` / `{}` / `{}`\n",
         summary.review.candidate_safe_count,
         summary.review.candidate_review_required_count,
@@ -8633,11 +13183,48 @@ fn roll_suite_to_markdown(summary: &RollSuiteSummary) -> String {
         optional_f64(summary.quality.noise_reduction_applied_ratio_max)
     ));
     md.push_str(&format!(
+        "- Denoise exact structure-excluded ratio mean/min: `{}` / `{}`\n",
+        optional_f64(
+            summary
+                .quality
+                .noise_reduction_structure_excluded_ratio_mean
+        ),
+        optional_f64(summary.quality.noise_reduction_structure_excluded_ratio_min)
+    ));
+    md.push_str(&format!(
         "- Denoise texture/saturation limited mean: `{}` / `{}`; mean chroma/luma delta: `{}` / `{}`\n",
         optional_f64(summary.quality.noise_reduction_texture_limited_ratio_mean),
         optional_f64(summary.quality.noise_reduction_saturation_limited_ratio_mean),
         optional_f64(summary.quality.noise_reduction_mean_abs_chroma_delta_mean),
         optional_f64(summary.quality.noise_reduction_mean_abs_luma_delta_mean)
+    ));
+    md.push_str(&format!(
+        "- Grain detail evaluated/supported/review frames: `{}` / `{}` / `{}`; luminance/chroma supported: `{}` / `{}`\n",
+        summary.quality.grain_detail_evaluated_count,
+        summary.quality.grain_detail_decision_supported_count,
+        summary.quality.grain_detail_review_required_count,
+        summary.quality.grain_detail_luminance_supported_count,
+        summary.quality.grain_detail_chroma_supported_count
+    ));
+    md.push_str(&format!(
+        "- Grain detail luminance probes min, median retention mean/min, p10 retention mean/min: `{}` / `{}` / `{}` / `{}` / `{}`\n",
+        optional_usize(summary.quality.grain_detail_luminance_probe_count_min),
+        optional_f64(
+            summary
+                .quality
+                .grain_detail_luminance_median_retention_mean
+        ),
+        optional_f64(summary.quality.grain_detail_luminance_median_retention_min),
+        optional_f64(summary.quality.grain_detail_luminance_p10_retention_mean),
+        optional_f64(summary.quality.grain_detail_luminance_p10_retention_min)
+    ));
+    md.push_str(&format!(
+        "- Grain detail chroma probes min, median retention mean/min, p10 retention mean/min: `{}` / `{}` / `{}` / `{}` / `{}`\n",
+        optional_usize(summary.quality.grain_detail_chroma_probe_count_min),
+        optional_f64(summary.quality.grain_detail_chroma_median_retention_mean),
+        optional_f64(summary.quality.grain_detail_chroma_median_retention_min),
+        optional_f64(summary.quality.grain_detail_chroma_p10_retention_mean),
+        optional_f64(summary.quality.grain_detail_chroma_p10_retention_min)
     ));
     md.push_str(&format!(
         "- Post-scale preserved ratio mean/min: `{}` / `{}`\n",
@@ -8702,6 +13289,31 @@ fn roll_suite_to_markdown(summary: &RollSuiteSummary) -> String {
             comparison.review_required_count_delta,
             comparison.failed_count_delta
         ));
+        md.push_str(&format!(
+            "- Denoise enabled/evaluated/detail-supported/detail-review/luminance-supported/chroma-supported count deltas: `{}` / `{}` / `{}` / `{}` / `{}` / `{}`\n\n",
+            optional_delta_isize(comparison.quality.noise_reduction_enabled_count_delta),
+            optional_delta_isize(comparison.quality.grain_detail_evaluated_count_delta),
+            optional_delta_isize(
+                comparison
+                    .quality
+                    .grain_detail_decision_supported_count_delta
+            ),
+            optional_delta_isize(
+                comparison
+                    .quality
+                    .grain_detail_review_required_count_delta
+            ),
+            optional_delta_isize(
+                comparison
+                    .quality
+                    .grain_detail_luminance_supported_count_delta
+            ),
+            optional_delta_isize(
+                comparison
+                    .quality
+                    .grain_detail_chroma_supported_count_delta
+            )
+        ));
         if !comparison.issues.is_empty() {
             md.push_str("### Comparison Issues\n\n");
             for issue in &comparison.issues {
@@ -8723,6 +13335,30 @@ fn roll_suite_to_markdown(summary: &RollSuiteSummary) -> String {
         md.push_str("| Metric | Delta |\n");
         md.push_str("| --- | ---: |\n");
         for (label, delta) in [
+            (
+                "grain luma p10 retention mean",
+                comparison
+                    .quality
+                    .grain_detail_luminance_p10_retention_mean_delta,
+            ),
+            (
+                "grain luma p10 retention min",
+                comparison
+                    .quality
+                    .grain_detail_luminance_p10_retention_min_delta,
+            ),
+            (
+                "grain chroma p10 retention mean",
+                comparison
+                    .quality
+                    .grain_detail_chroma_p10_retention_mean_delta,
+            ),
+            (
+                "grain chroma p10 retention min",
+                comparison
+                    .quality
+                    .grain_detail_chroma_p10_retention_min_delta,
+            ),
             (
                 "render luminance range mean",
                 comparison.quality.render_luminance_range_p05_p95_mean_delta,
@@ -8818,9 +13454,9 @@ fn roll_suite_to_markdown(summary: &RollSuiteSummary) -> String {
         ] {
             md.push_str(&format!("| {} | {} |\n", label, optional_delta_f64(delta)));
         }
-        md.push_str("\n| Frame | Status | Risk | Render Range d | Midtone p50 d | Shadow Sat d | Mid Neutral Sat d | Bright Neutral Sat d | Chroma p95 d | Flat Chroma p95 d | Preserve d | Clip High d |\n");
+        md.push_str("\n| Frame | Status | Risk | Grain Review | Grain Support (all/L/C) | Grain L p10 d | Grain C p10 d | Render Range d | Midtone p50 d | Shadow Sat d | Mid Neutral Sat d | Bright Neutral Sat d | Chroma p95 d | Flat Chroma p95 d | Preserve d | Clip High d |\n");
         md.push_str(
-            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+            "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
         );
         for frame in &comparison.frames {
             let status = if frame.status_changed {
@@ -8841,11 +13477,34 @@ fn roll_suite_to_markdown(summary: &RollSuiteSummary) -> String {
             } else {
                 frame.current_candidate_risk.clone().unwrap_or_default()
             };
+            let grain_review = roll_suite_bool_transition(
+                frame.baseline_grain_detail_review_required,
+                frame.current_grain_detail_review_required,
+            );
+            let grain_support = [
+                roll_suite_bool_transition(
+                    frame.baseline_grain_detail_decision_supported,
+                    frame.current_grain_detail_decision_supported,
+                ),
+                roll_suite_bool_transition(
+                    frame.baseline_grain_detail_luminance_supported,
+                    frame.current_grain_detail_luminance_supported,
+                ),
+                roll_suite_bool_transition(
+                    frame.baseline_grain_detail_chroma_supported,
+                    frame.current_grain_detail_chroma_supported,
+                ),
+            ]
+            .join("/");
             md.push_str(&format!(
-                "| `{}` | `{}` | `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                "| `{}` | `{}` | `{}` | `{}` | `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 markdown_cell(&frame.name),
                 markdown_cell(&status),
                 markdown_cell(&risk),
+                markdown_cell(&grain_review),
+                markdown_cell(&grain_support),
+                optional_delta_f64(frame.grain_detail_luminance_p10_retention_delta),
+                optional_delta_f64(frame.grain_detail_chroma_p10_retention_delta),
                 optional_delta_f64(frame.render_luminance_range_p05_p95_delta),
                 optional_delta_f64(frame.midtone_luminance_p50_delta),
                 optional_delta_f64(frame.shadow_saturation_p95_delta),
@@ -8855,6 +13514,39 @@ fn roll_suite_to_markdown(summary: &RollSuiteSummary) -> String {
                 optional_delta_f64(frame.high_frequency_flat_chroma_residual_p95_delta),
                 optional_delta_f64(frame.colorspace_post_scale_preserved_ratio_delta),
                 optional_delta_f64(frame.post_chroma_compression_clipped_high_max_delta)
+            ));
+        }
+        md.push_str("\n### Frame Tone Output Comparison\n\n");
+        md.push_str("| Frame | Final Review | Reviewable | Tone Status | Tone Review | Confidence d | Render:Mapped d | Clip High d | Clip Low d |\n");
+        md.push_str("| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: |\n");
+        for frame in &comparison.frames {
+            let render_status = roll_suite_string_transition(
+                frame.baseline_render_review_status.as_deref(),
+                frame.current_render_review_status.as_deref(),
+                frame.render_review_status_changed,
+            );
+            let tone_status = roll_suite_string_transition(
+                frame.baseline_tone_output_confidence_status.as_deref(),
+                frame.current_tone_output_confidence_status.as_deref(),
+                frame.tone_output_confidence_status_changed,
+            );
+            md.push_str(&format!(
+                "| `{}` | `{}` | `{}` | `{}` | `{}` | {} | {} | {} | {} |\n",
+                markdown_cell(&frame.name),
+                markdown_cell(&render_status),
+                markdown_cell(&roll_suite_bool_transition(
+                    frame.baseline_render_reviewable,
+                    frame.current_render_reviewable,
+                )),
+                markdown_cell(&tone_status),
+                markdown_cell(&roll_suite_bool_transition(
+                    frame.baseline_tone_output_review_required,
+                    frame.current_tone_output_review_required,
+                )),
+                optional_delta_f64(frame.tone_output_evidence_confidence_delta),
+                optional_delta_f64(frame.tone_output_render_to_mapped_luminance_range_ratio_delta),
+                optional_delta_f64(frame.tone_output_maximum_post_tone_high_clip_ratio_delta),
+                optional_delta_f64(frame.tone_output_maximum_post_tone_low_clip_ratio_delta)
             ));
         }
         md.push('\n');
@@ -8882,6 +13574,39 @@ fn roll_suite_to_markdown(summary: &RollSuiteSummary) -> String {
             markdown_cell(frame.tone_color_trust_state.as_deref().unwrap_or("unknown")),
             markdown_cell(frame.calibration_status.as_deref().unwrap_or("unknown")),
             frame.issues.len()
+        ));
+    }
+    md.push_str("\n## Frame Tone Output Evidence\n\n");
+    md.push_str("| Frame | Final Review | Reviewable | Evaluated | Confidence | Tone Status | Tone Review | Reason | Input Range | Mapped Range | Render Range | Render:Mapped | Clip High | Clip Low | Limited |\n");
+    md.push_str("| --- | --- | --- | --- | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n");
+    for frame in &summary.frames {
+        md.push_str(&format!(
+            "| `{}` | `{}` | `{}` | `{}` | {} | `{}` | `{}` | `{}` | {} | {} | {} | {} | {} | {} | `{}` |\n",
+            markdown_cell(&frame.name),
+            markdown_cell(frame.render_review_status.as_deref().unwrap_or("unknown")),
+            optional_bool(frame.render_reviewable),
+            optional_bool(frame.tone_output_evidence_evaluated),
+            optional_f64(frame.tone_output_evidence_confidence),
+            markdown_cell(
+                frame
+                    .tone_output_confidence_status
+                    .as_deref()
+                    .unwrap_or("unknown")
+            ),
+            optional_bool(frame.tone_output_review_required),
+            markdown_cell(
+                frame
+                    .tone_output_review_reason
+                    .as_deref()
+                    .unwrap_or("unknown")
+            ),
+            optional_f64(frame.input_luminance_range_p05_p95),
+            optional_f64(frame.mapped_luminance_range_p05_p95),
+            optional_f64(frame.render_luminance_range_p05_p95),
+            optional_f64(frame.render_to_mapped_luminance_range_ratio),
+            optional_f64(frame.maximum_post_tone_high_clip_ratio),
+            optional_f64(frame.maximum_post_tone_low_clip_ratio),
+            optional_bool(frame.confidence_limited_by_tone_output_evidence)
         ));
     }
     md.push_str("\n## Frame Quality Diagnostics\n\n");
@@ -8930,6 +13655,29 @@ fn roll_suite_to_markdown(summary: &RollSuiteSummary) -> String {
             optional_f64(frame.post_chroma_compression_clipped_low_max)
         ));
     }
+    md.push_str("\n## Frame Grain Detail Diagnostics\n\n");
+    md.push_str("| Frame | Enabled | Evaluated | Supported | Review | L Probes | L Support | L Median | L p10 | C Probes | C Support | C Median | C p10 |\n");
+    md.push_str(
+        "| --- | --- | --- | --- | --- | ---: | --- | ---: | ---: | ---: | --- | ---: | ---: |\n",
+    );
+    for frame in &summary.frames {
+        md.push_str(&format!(
+            "| `{}` | `{}` | `{}` | `{}` | `{}` | {} | `{}` | {} | {} | {} | `{}` | {} | {} |\n",
+            markdown_cell(&frame.name),
+            optional_bool(frame.noise_reduction_enabled),
+            optional_bool(frame.grain_detail_evaluated),
+            optional_bool(frame.grain_detail_decision_supported),
+            optional_bool(frame.grain_detail_review_required),
+            optional_usize(frame.grain_detail_luminance_probe_count),
+            optional_bool(frame.grain_detail_luminance_supported),
+            optional_f64(frame.grain_detail_luminance_median_retention),
+            optional_f64(frame.grain_detail_luminance_p10_retention),
+            optional_usize(frame.grain_detail_chroma_probe_count),
+            optional_bool(frame.grain_detail_chroma_supported),
+            optional_f64(frame.grain_detail_chroma_median_retention),
+            optional_f64(frame.grain_detail_chroma_p10_retention)
+        ));
+    }
     md
 }
 
@@ -8937,6 +13685,33 @@ fn roll_dimensions_label(width: Option<usize>, height: Option<usize>) -> String 
     match (width, height) {
         (Some(width), Some(height)) => format!("{width}x{height}"),
         _ => "n/a".to_string(),
+    }
+}
+
+fn roll_suite_bool_transition(baseline: Option<bool>, current: Option<bool>) -> String {
+    match (baseline, current) {
+        (Some(baseline), Some(current)) if baseline != current => {
+            format!("{baseline} -> {current}")
+        }
+        (_, Some(current)) => current.to_string(),
+        (Some(baseline), None) => format!("{baseline} -> n/a"),
+        (None, None) => String::new(),
+    }
+}
+
+fn roll_suite_string_transition(
+    baseline: Option<&str>,
+    current: Option<&str>,
+    changed: bool,
+) -> String {
+    if changed {
+        format!(
+            "{} -> {}",
+            baseline.unwrap_or("n/a"),
+            current.unwrap_or("n/a")
+        )
+    } else {
+        current.or(baseline).unwrap_or_default().to_string()
     }
 }
 
@@ -9042,15 +13817,20 @@ fn run_fixture_suite_entry(
     let mut entry = FixtureSuiteEntry {
         name: name.to_string(),
         status: "passed".to_string(),
+        component_count: fixture.component_count(),
         coverage_validation_ready: coverage.validation_ready,
         coverage_issues: coverage.issues,
         coverage_action_items: coverage.action_items,
         output_dir: output_dir.display().to_string(),
         output_path: None,
         output_modified_at: None,
+        output_width: None,
+        output_height: None,
         output_color_space: None,
         expected_output_color_space: None,
         output_file_icc_profile_matches_report: None,
+        delivery_artifacts_intact: None,
+        delivery_artifact_issues: Vec::new(),
         stale_render_artifact_count: None,
         report_path: None,
         summary_json_path: None,
@@ -9062,10 +13842,155 @@ fn run_fixture_suite_entry(
         summary_baseline_status: None,
         summary_baseline_write_status: None,
         summary_baseline_written_path: None,
+        deskew_status: None,
+        expected_deskew_status: None,
+        deskew_applied: None,
+        expected_deskew_applied: None,
+        deskew_review_required: None,
+        expected_deskew_review_required: None,
+        deskew_retained_area_ratio: None,
+        expected_deskew_retained_area_ratio_min: None,
+        geometry_preparation: GeometryPreparationFixtureSuiteEvidence {
+            expected_all_deskew_components_applied: fixture
+                .expectations
+                .deskew_all_components_applied,
+            expected_minimum_deskew_retained_area_ratio: fixture
+                .expectations
+                .deskew_minimum_component_retained_area_ratio_min,
+            expected_all_border_crop_components_cropped: fixture
+                .expectations
+                .border_crop_all_components_cropped,
+            expected_minimum_removed_edge_count_per_component: fixture
+                .expectations
+                .border_crop_minimum_removed_edge_count_per_component_min,
+            expected_minimum_border_crop_retained_area_ratio: fixture
+                .expectations
+                .border_crop_retained_area_ratio_min,
+            expected_maximum_border_crop_retained_area_ratio: fixture
+                .expectations
+                .border_crop_retained_area_ratio_max,
+            expected_border_crop_rejected: fixture.expectations.border_crop_rejected,
+            expected_deskew_correction_degrees: fixture
+                .expectations
+                .deskew_correction_degrees_expected,
+            expected_deskew_correction_tolerance_degrees: fixture
+                .expectations
+                .deskew_correction_tolerance_degrees,
+            expected_border_crop_components: fixture
+                .expectations
+                .border_crop_components_expected
+                .clone(),
+            ..GeometryPreparationFixtureSuiteEvidence::default()
+        },
+        input_orientation: OrientationFixtureSuiteEvidence {
+            expected_components: fixture.expectations.orientation_components_expected.clone(),
+            ..OrientationFixtureSuiteEvidence::default()
+        },
         stitch_decision: None,
         expected_stitch_decision: None,
+        inferred_component_order: Vec::new(),
+        expected_inferred_component_order: Vec::new(),
+        technical_white_balance_status: None,
+        expected_technical_white_balance_status: None,
+        technical_white_balance_applied: None,
+        expected_technical_white_balance_applied: None,
+        technical_white_balance_review_required: None,
+        expected_technical_white_balance_review_required: None,
+        creative_temperature: None,
+        expected_creative_temperature: None,
+        creative_tint: None,
+        expected_creative_tint: None,
+        seam_exposure_model: None,
+        expected_seam_exposure_model: None,
+        seam_exposure_held_out_validation_passed: None,
+        expected_seam_exposure_held_out_validation_passed: None,
+        seam_exposure_held_out_improvement_over_gain: None,
+        expected_seam_exposure_held_out_improvement_over_gain_min: None,
+        seam_exposure_offset_normalized_abs_max: None,
+        expected_seam_exposure_offset_normalized_abs_max: None,
+        seam_exposure_spatial_slope_abs_max: None,
+        expected_seam_exposure_spatial_slope_abs_min: None,
+        expected_seam_exposure_spatial_slope_abs_max: None,
+        seam_exposure_spatial_slope_agreement_ratio: None,
+        expected_seam_exposure_spatial_slope_agreement_ratio_min: None,
+        seam_exposure_held_out_spatial_improvement_over_best_constant: None,
+        expected_seam_exposure_held_out_spatial_improvement_over_best_constant_min: None,
+        seam_exposure_spatial_offset_slope_normalized_abs_max: None,
+        expected_seam_exposure_spatial_offset_slope_normalized_abs_min: None,
+        expected_seam_exposure_spatial_offset_slope_normalized_abs_max: None,
+        seam_exposure_spatial_offset_endpoint_normalized_abs_max: None,
+        expected_seam_exposure_spatial_offset_endpoint_normalized_abs_max: None,
+        seam_exposure_spatial_affine_slope_agreement_ratio: None,
+        expected_seam_exposure_spatial_affine_slope_agreement_ratio_min: None,
+        seam_exposure_spatial_affine_center_offset_delta_normalized: None,
+        expected_seam_exposure_spatial_affine_center_offset_delta_normalized_max: None,
+        seam_exposure_held_out_spatial_gain_offset_improvement_over_best_simpler: None,
+        expected_seam_exposure_held_out_spatial_gain_offset_improvement_over_best_simpler_min: None,
+        seam_blend_mode: None,
+        expected_seam_blend_required: false,
+        expected_seam_blend_mode: None,
+        seam_blend_review_required: None,
+        expected_seam_blend_review_required: None,
+        seam_detail_review_required: None,
+        expected_seam_detail_review_required: None,
+        seam_detail_supported_scale_count: None,
+        expected_seam_detail_supported_scale_count_min: None,
+        seam_detail_max_symmetric_energy_ratio: None,
+        expected_seam_detail_max_symmetric_energy_ratio_max: None,
+        seam_gradient_ratio: None,
+        expected_seam_gradient_ratio_max: None,
+        seam_overlap_p95_abs_difference: None,
+        expected_seam_overlap_p95_abs_difference_max: None,
         base_estimate_source: None,
         expected_base_estimate_source: None,
+        negative_reconstruction: NegativeReconstructionFixtureSuiteEvidence {
+            expected_base_confidence_min: fixture.expectations.base_confidence_min,
+            expected_density_inversion_skipped: fixture.expectations.density_inversion_skipped,
+            expected_response_model: fixture.expectations.negative_response_model.clone(),
+            expected_response_source: fixture.expectations.negative_response_source.clone(),
+            expected_response_accepted: fixture.expectations.negative_response_accepted,
+            expected_response_review_required: fixture
+                .expectations
+                .negative_response_review_required,
+            expected_crosstalk_model: fixture
+                .expectations
+                .negative_response_crosstalk_model
+                .clone(),
+            expected_characteristic_curve_model: fixture
+                .expectations
+                .negative_response_characteristic_curve_model
+                .clone(),
+            expected_measured_model_id: fixture
+                .expectations
+                .negative_response_measured_model_id
+                .clone(),
+            expected_measured_confidence_min: fixture
+                .expectations
+                .negative_response_measured_confidence_min,
+            expected_held_out_delta_e00_rms_max: fixture
+                .expectations
+                .negative_response_held_out_delta_e00_rms_max,
+            expected_held_out_delta_e00_max: fixture
+                .expectations
+                .negative_response_held_out_max_delta_e00_max,
+            expected_held_out_improvement_over_unit_slope_min: fixture
+                .expectations
+                .negative_response_held_out_improvement_over_unit_slope_min,
+            expected_maximum_density_noise_gain: fixture
+                .expectations
+                .negative_response_density_noise_gain_max,
+            expected_curve_extrapolated_any_ratio_max: fixture
+                .expectations
+                .negative_response_curve_extrapolated_ratio_max,
+            expected_signed_headroom_preserved: fixture
+                .expectations
+                .negative_response_signed_headroom_preserved,
+            expected_curve_interpolation: fixture
+                .expectations
+                .negative_response_curve_interpolation
+                .clone(),
+            ..NegativeReconstructionFixtureSuiteEvidence::default()
+        },
         reference_evidence: fixture.reference_evidence.clone(),
         render_input_source: None,
         expected_render_input_source: None,
@@ -9085,6 +14010,8 @@ fn run_fixture_suite_entry(
         calibration_roll_profile_id: None,
         calibration_requested_film_stock: None,
         calibration_acceptance_status: None,
+        calibration_color_mapping_applied: None,
+        expected_calibration_color_mapping_applied: None,
         calibration_confidence: None,
         expected_calibration_confidence_min: None,
         calibration_matrix_condition_number: None,
@@ -9123,6 +14050,14 @@ fn run_fixture_suite_entry(
         expected_candidate_risk: None,
         tone_color_trust_state: None,
         expected_tone_color_trust_state: None,
+        neutral_safety_rescue_applied: None,
+        expected_neutral_safety_rescue_applied: None,
+        neutral_safety_rescue_preserved_ratio_gain: None,
+        expected_neutral_safety_rescue_preserved_ratio_gain_min: None,
+        neutral_safety_rescue_midtone_saturation_p95_reduction: None,
+        expected_neutral_safety_rescue_midtone_saturation_p95_reduction_min: None,
+        neutral_safety_rescue_reason: None,
+        expected_neutral_safety_rescue_reason_contains: None,
         highlight_chroma_compressed_ratio: None,
         expected_highlight_chroma_compressed_ratio_min: None,
         expected_highlight_chroma_compressed_ratio_max: None,
@@ -9130,10 +14065,53 @@ fn run_fixture_suite_entry(
         expected_highlight_neutral_chroma_compressed_ratio_max: None,
         shadow_chroma_compressed_ratio: None,
         expected_shadow_chroma_compressed_ratio_max: None,
+        effective_grain_reduction: None,
+        effective_grain_strength: None,
+        effective_grain_scale: None,
+        grain_reduction_enabled: None,
+        expected_grain_reduction_enabled: None,
+        grain_reduction_applied_ratio: None,
+        expected_grain_reduction_applied_ratio_min: None,
+        grain_reduction_structure_excluded_ratio: None,
+        expected_grain_reduction_structure_excluded_ratio_min: None,
+        grain_reduction_flat_luma_p95_reduction_ratio: None,
+        expected_grain_reduction_flat_luma_p95_reduction_ratio_min: None,
+        grain_reduction_flat_chroma_p95_reduction_ratio: None,
+        expected_grain_reduction_flat_chroma_p95_reduction_ratio_min: None,
+        grain_detail_review_required: None,
+        expected_grain_detail_review_required: None,
+        grain_detail_decision_supported: None,
+        expected_grain_detail_decision_supported: None,
+        grain_detail_luminance_probe_count: None,
+        expected_grain_detail_luminance_probe_count_min: None,
+        grain_detail_chroma_probe_count: None,
+        expected_grain_detail_chroma_probe_count_min: None,
+        grain_detail_luminance_p10_retention: None,
+        expected_grain_detail_luminance_p10_retention_min: None,
+        grain_detail_chroma_p10_retention: None,
+        expected_grain_detail_chroma_p10_retention_min: None,
         mapping_strategy: None,
         expected_mapping_strategy: None,
         post_scale_preserved_ratio: None,
         expected_post_scale_preserved_ratio_min: None,
+        render_luminance_range_p05_p95: None,
+        expected_render_luminance_range_p05_p95_min: None,
+        render_review_status: None,
+        expected_render_review_status: None,
+        render_reviewable: None,
+        expected_render_reviewable: None,
+        tone_output_confidence_status: None,
+        expected_tone_output_confidence_status: None,
+        tone_output_review_required: None,
+        expected_tone_output_review_required: None,
+        tone_output_evidence_confidence: None,
+        expected_tone_output_evidence_confidence_min: None,
+        render_to_mapped_luminance_range_ratio: None,
+        expected_render_to_mapped_luminance_range_ratio_min: None,
+        post_chroma_compression_clipped_high_ratio_max: None,
+        expected_post_chroma_compression_clipped_high_ratio_max: None,
+        post_chroma_compression_clipped_low_ratio_max: None,
+        expected_post_chroma_compression_clipped_low_ratio_max: None,
         reference_patch_evaluation_present: None,
         reference_patch_patch_count: None,
         reference_patch_selected_rms_delta_e: None,
@@ -9163,21 +14141,28 @@ fn run_fixture_suite_entry(
         error: None,
     };
 
-    let component1_missing = !fixture.component1.exists();
-    let component2_missing = !fixture.component2.exists();
-    if component1_missing {
-        entry
-            .issues
-            .push(format!("fixture_suite:{name}:component1_missing"));
+    let inputs = fixture.pipeline_inputs();
+    let missing_components = inputs
+        .iter()
+        .enumerate()
+        .filter(|(_, path)| !path.exists())
+        .map(|(index, _)| index + 1)
+        .collect::<Vec<_>>();
+    for component_number in &missing_components {
+        entry.issues.push(format!(
+            "fixture_suite:{name}:component{component_number}_missing"
+        ));
     }
-    if component2_missing {
-        entry
-            .issues
-            .push(format!("fixture_suite:{name}:component2_missing"));
-    }
-    if component1_missing || component2_missing {
+    if !missing_components.is_empty() {
         entry.status = "failed".to_string();
-        entry.error = Some("component file missing".to_string());
+        entry.error = Some(format!(
+            "component file(s) missing: {}",
+            missing_components
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
         return entry;
     }
     if !entry.coverage_validation_ready {
@@ -9223,6 +14208,31 @@ fn run_fixture_suite_entry(
         entry.error = Some(format!("invalid fixture bit_depth `{bit_depth}`"));
         return entry;
     }
+    let geometry = match geometry_for_fixture(cli.geometry, Some(fixture)) {
+        Ok(geometry) => geometry,
+        Err(error) => {
+            entry.status = "failed".to_string();
+            entry
+                .issues
+                .push(format!("fixture_suite:{name}:invalid_geometry_settings"));
+            entry.error = Some(error.to_string());
+            return entry;
+        }
+    };
+    let grain = match grain_for_fixture(cli.grain, Some(fixture)) {
+        Ok(grain) => grain,
+        Err(error) => {
+            entry.status = "failed".to_string();
+            entry
+                .issues
+                .push(format!("fixture_suite:{name}:invalid_grain_settings"));
+            entry.error = Some(error.to_string());
+            return entry;
+        }
+    };
+    entry.effective_grain_reduction = Some(grain.grain_reduction.as_str().to_string());
+    entry.effective_grain_strength = Some(grain.grain_strength);
+    entry.effective_grain_scale = Some(grain.grain_scale);
     let force_stitch = cli.force_stitch || fixture.force_stitch;
     let force_no_stitch = cli.force_no_stitch || fixture.force_no_stitch;
     if force_stitch && force_no_stitch {
@@ -9245,8 +14255,7 @@ fn run_fixture_suite_entry(
     }
 
     let pipeline_cli = PipelineCli {
-        component1: fixture.component1.clone(),
-        component2: fixture.component2.clone(),
+        inputs,
         output_dir: output_dir.clone(),
         calibration_profile,
         calibration_library,
@@ -9268,6 +14277,9 @@ fn run_fixture_suite_entry(
         input_mode,
         render_intent: cli.render_intent,
         quality_mode: cli.quality_mode,
+        white_balance: cli.white_balance,
+        geometry,
+        grain,
         write_master: cli.write_master,
         review_sidecar: cli.review_sidecar.clone(),
         write_review_sidecar: cli.write_review_sidecar.clone(),
@@ -9279,13 +14291,78 @@ fn run_fixture_suite_entry(
         ica_tol: cli.ica_tol,
         bit_depth,
         use_opencv: cli.use_opencv,
+        require_reviewable: false,
     };
     entry.expected_calibration_source =
         expected_calibration_source(&pipeline_cli).map(str::to_string);
     entry.expected_calibration_scanner_profile = pipeline_cli.scanner_profile.clone();
     entry.expected_calibration_roll_profile = pipeline_cli.roll_profile.clone();
     entry.expected_calibration_film_stock = pipeline_cli.film_stock.clone();
+    entry.expected_deskew_status = fixture.expectations.deskew_status.clone();
+    entry.expected_deskew_applied = fixture.expectations.deskew_applied;
+    entry.expected_deskew_review_required = fixture.expectations.deskew_review_required;
+    entry.expected_deskew_retained_area_ratio_min =
+        fixture.expectations.deskew_retained_area_ratio_min;
     entry.expected_stitch_decision = fixture.expectations.stitch_decision.clone();
+    entry.expected_inferred_component_order = fixture.expectations.inferred_component_order.clone();
+    entry.expected_technical_white_balance_status =
+        fixture.expectations.technical_white_balance_status.clone();
+    entry.expected_technical_white_balance_applied =
+        fixture.expectations.technical_white_balance_applied;
+    entry.expected_technical_white_balance_review_required =
+        fixture.expectations.technical_white_balance_review_required;
+    entry.expected_creative_temperature = fixture.expectations.creative_temperature;
+    entry.expected_creative_tint = fixture.expectations.creative_tint;
+    entry.expected_seam_exposure_model = fixture.expectations.seam_exposure_model.clone();
+    entry.expected_seam_exposure_held_out_validation_passed = fixture
+        .expectations
+        .seam_exposure_held_out_validation_passed;
+    entry.expected_seam_exposure_held_out_improvement_over_gain_min = fixture
+        .expectations
+        .seam_exposure_held_out_improvement_over_gain_min;
+    entry.expected_seam_exposure_offset_normalized_abs_max =
+        fixture.expectations.seam_exposure_offset_normalized_abs_max;
+    entry.expected_seam_exposure_spatial_slope_abs_min =
+        fixture.expectations.seam_exposure_spatial_slope_abs_min;
+    entry.expected_seam_exposure_spatial_slope_abs_max =
+        fixture.expectations.seam_exposure_spatial_slope_abs_max;
+    entry.expected_seam_exposure_spatial_slope_agreement_ratio_min = fixture
+        .expectations
+        .seam_exposure_spatial_slope_agreement_ratio_min;
+    entry.expected_seam_exposure_held_out_spatial_improvement_over_best_constant_min = fixture
+        .expectations
+        .seam_exposure_held_out_spatial_improvement_over_best_constant_min;
+    entry.expected_seam_exposure_spatial_offset_slope_normalized_abs_min = fixture
+        .expectations
+        .seam_exposure_spatial_offset_slope_normalized_abs_min;
+    entry.expected_seam_exposure_spatial_offset_slope_normalized_abs_max = fixture
+        .expectations
+        .seam_exposure_spatial_offset_slope_normalized_abs_max;
+    entry.expected_seam_exposure_spatial_offset_endpoint_normalized_abs_max = fixture
+        .expectations
+        .seam_exposure_spatial_offset_endpoint_normalized_abs_max;
+    entry.expected_seam_exposure_spatial_affine_slope_agreement_ratio_min = fixture
+        .expectations
+        .seam_exposure_spatial_affine_slope_agreement_ratio_min;
+    entry.expected_seam_exposure_spatial_affine_center_offset_delta_normalized_max = fixture
+        .expectations
+        .seam_exposure_spatial_affine_center_offset_delta_normalized_max;
+    entry.expected_seam_exposure_held_out_spatial_gain_offset_improvement_over_best_simpler_min =
+        fixture
+            .expectations
+            .seam_exposure_held_out_spatial_gain_offset_improvement_over_best_simpler_min;
+    entry.expected_seam_blend_required = fixture.expectations.seam_blend_required;
+    entry.expected_seam_blend_mode = fixture.expectations.seam_blend_mode.clone();
+    entry.expected_seam_blend_review_required = fixture.expectations.seam_blend_review_required;
+    entry.expected_seam_detail_review_required = fixture.expectations.seam_detail_review_required;
+    entry.expected_seam_detail_supported_scale_count_min =
+        fixture.expectations.seam_detail_supported_scale_count_min;
+    entry.expected_seam_detail_max_symmetric_energy_ratio_max = fixture
+        .expectations
+        .seam_detail_max_symmetric_energy_ratio_max;
+    entry.expected_seam_gradient_ratio_max = fixture.expectations.seam_gradient_ratio_max;
+    entry.expected_seam_overlap_p95_abs_difference_max =
+        fixture.expectations.seam_overlap_p95_abs_difference_max;
     entry.expected_base_estimate_source = fixture.expectations.base_estimate_source.clone();
     entry.expected_output_color_space = fixture.expectations.output_color_space.clone();
     entry.expected_render_input_source = fixture.expectations.render_input_source.clone();
@@ -9297,6 +14374,8 @@ fn run_fixture_suite_entry(
         .clone();
     entry.expected_selected_candidate = fixture.expectations.selected_candidate.clone();
     entry.expected_selected_candidate_rank = fixture.expectations.selected_candidate_rank;
+    entry.expected_calibration_color_mapping_applied =
+        fixture.expectations.calibration_color_mapping_applied;
     entry.expected_candidate_acceptance_signatures_required = fixture
         .expectations
         .candidate_acceptance_signatures_required
@@ -9328,6 +14407,18 @@ fn run_fixture_suite_entry(
         fixture.expectations.spatial_neutral_delta_p95_max;
     entry.expected_candidate_risk = fixture.expectations.candidate_risk.clone();
     entry.expected_tone_color_trust_state = fixture.expectations.tone_color_trust_state.clone();
+    entry.expected_neutral_safety_rescue_applied =
+        fixture.expectations.neutral_safety_rescue_applied;
+    entry.expected_neutral_safety_rescue_preserved_ratio_gain_min = fixture
+        .expectations
+        .neutral_safety_rescue_preserved_ratio_gain_min;
+    entry.expected_neutral_safety_rescue_midtone_saturation_p95_reduction_min = fixture
+        .expectations
+        .neutral_safety_rescue_midtone_saturation_p95_reduction_min;
+    entry.expected_neutral_safety_rescue_reason_contains = fixture
+        .expectations
+        .neutral_safety_rescue_reason_contains
+        .clone();
     entry.expected_highlight_chroma_compressed_ratio_min =
         fixture.expectations.highlight_chroma_compressed_ratio_min;
     entry.expected_highlight_chroma_compressed_ratio_max =
@@ -9337,9 +14428,51 @@ fn run_fixture_suite_entry(
         .highlight_neutral_chroma_compressed_ratio_max;
     entry.expected_shadow_chroma_compressed_ratio_max =
         fixture.expectations.shadow_chroma_compressed_ratio_max;
+    entry.expected_grain_reduction_enabled = fixture.expectations.grain_reduction_enabled;
+    entry.expected_grain_reduction_applied_ratio_min =
+        fixture.expectations.grain_reduction_applied_ratio_min;
+    entry.expected_grain_reduction_structure_excluded_ratio_min = fixture
+        .expectations
+        .grain_reduction_structure_excluded_ratio_min;
+    entry.expected_grain_reduction_flat_luma_p95_reduction_ratio_min = fixture
+        .expectations
+        .grain_reduction_flat_luma_p95_reduction_ratio_min;
+    entry.expected_grain_reduction_flat_chroma_p95_reduction_ratio_min = fixture
+        .expectations
+        .grain_reduction_flat_chroma_p95_reduction_ratio_min;
+    entry.expected_grain_detail_review_required = fixture.expectations.grain_detail_review_required;
+    entry.expected_grain_detail_decision_supported =
+        fixture.expectations.grain_detail_decision_supported;
+    entry.expected_grain_detail_luminance_probe_count_min =
+        fixture.expectations.grain_detail_luminance_probe_count_min;
+    entry.expected_grain_detail_chroma_probe_count_min =
+        fixture.expectations.grain_detail_chroma_probe_count_min;
+    entry.expected_grain_detail_luminance_p10_retention_min = fixture
+        .expectations
+        .grain_detail_luminance_p10_retention_min;
+    entry.expected_grain_detail_chroma_p10_retention_min =
+        fixture.expectations.grain_detail_chroma_p10_retention_min;
     entry.expected_mapping_strategy = fixture.expectations.mapping_strategy.clone();
     entry.expected_post_scale_preserved_ratio_min =
         fixture.expectations.post_scale_preserved_ratio_min;
+    entry.expected_render_luminance_range_p05_p95_min =
+        fixture.expectations.render_luminance_range_p05_p95_min;
+    entry.expected_render_review_status = fixture.expectations.render_review_status.clone();
+    entry.expected_render_reviewable = fixture.expectations.render_reviewable;
+    entry.expected_tone_output_confidence_status =
+        fixture.expectations.tone_output_confidence_status.clone();
+    entry.expected_tone_output_review_required = fixture.expectations.tone_output_review_required;
+    entry.expected_tone_output_evidence_confidence_min =
+        fixture.expectations.tone_output_evidence_confidence_min;
+    entry.expected_render_to_mapped_luminance_range_ratio_min = fixture
+        .expectations
+        .render_to_mapped_luminance_range_ratio_min;
+    entry.expected_post_chroma_compression_clipped_high_ratio_max = fixture
+        .expectations
+        .post_chroma_compression_clipped_high_ratio_max;
+    entry.expected_post_chroma_compression_clipped_low_ratio_max = fixture
+        .expectations
+        .post_chroma_compression_clipped_low_ratio_max;
     entry.expected_reference_patch_evaluation_required =
         fixture.expectations.reference_patch_evaluation_required;
     entry.expected_reference_patch_count_min = fixture.expectations.reference_patch_count_min;
@@ -9393,6 +14526,12 @@ fn run_fixture_suite_entry(
     entry.report_path = Some(report_path.display().to_string());
 
     let mut summary = summarize_report_with_source(name.to_string(), &report, Some(&report_path));
+    entry.issues.extend(
+        summary
+            .diagnostic_consistency_issues
+            .iter()
+            .map(|issue| format!("fixture_suite:{name}:diagnostic_consistency:{issue}")),
+    );
     write_fixture_suite_summary_baseline(cli, name, fixture, &summary, &mut entry);
     if entry.status != "failed" {
         apply_fixture_suite_summary_baseline(name, fixture, &mut summary, &mut entry);
@@ -9400,12 +14539,205 @@ fn run_fixture_suite_entry(
 
     entry.output_path = summary.render.output_path.clone();
     entry.output_modified_at = summary.render.output_modified_at.clone();
+    entry.output_width = summary.render.output_width;
+    entry.output_height = summary.render.output_height;
     entry.output_color_space = summary.render.output_color_space.clone();
     entry.output_file_icc_profile_matches_report =
         summary.render.output_file_icc_profile_matches_report;
+    entry.delivery_artifact_issues = delivery_artifact_integrity_issues(&summary.render)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    entry.delivery_artifacts_intact = Some(entry.delivery_artifact_issues.is_empty());
     entry.stale_render_artifact_count = summary.render.stale_render_artifact_count;
+    entry.deskew_status = summary.deskew.status.clone();
+    entry.deskew_applied = summary.deskew.applied;
+    entry.deskew_review_required = summary.deskew.review_required;
+    entry.deskew_retained_area_ratio = summary.deskew.retained_area_ratio;
+    entry.geometry_preparation.all_deskew_components_applied =
+        summary.deskew.all_components_applied;
+    entry
+        .geometry_preparation
+        .minimum_deskew_retained_area_ratio = summary.deskew.minimum_component_retained_area_ratio;
+    entry
+        .geometry_preparation
+        .all_border_crop_components_cropped = summary.border_crop.all_components_cropped;
+    entry
+        .geometry_preparation
+        .minimum_removed_edge_count_per_component =
+        summary.border_crop.minimum_removed_edge_count_per_component;
+    entry
+        .geometry_preparation
+        .minimum_border_crop_retained_area_ratio = summary.border_crop.minimum_retained_area_ratio;
+    entry
+        .geometry_preparation
+        .maximum_border_crop_retained_area_ratio = summary.border_crop.maximum_retained_area_ratio;
+    entry.geometry_preparation.border_crop_rejected =
+        Some(summary.border_crop.rejected_crop_warning_count > 0);
+    entry.geometry_preparation.deskew_correction_degrees = summary.deskew.correction_degrees;
+    entry.geometry_preparation.border_crop_components = summary.border_crop.components.clone();
+    entry.input_orientation.components = summary.input_orientation.components.clone();
     entry.stitch_decision = summary.stitch.decision.clone();
+    entry.inferred_component_order = summary.stitch.inferred_order.clone();
+    entry.technical_white_balance_status = summary.white_balance.technical_status.clone();
+    entry.technical_white_balance_applied = summary.white_balance.technical_applied;
+    entry.technical_white_balance_review_required = summary.white_balance.technical_review_required;
+    entry.creative_temperature = summary.white_balance.creative_temperature;
+    entry.creative_tint = summary.white_balance.creative_tint;
+    entry.seam_exposure_model = summary
+        .stitch
+        .seam_exposure_correction
+        .as_ref()
+        .and_then(|correction| correction.model.clone());
+    entry.seam_exposure_held_out_validation_passed = summary
+        .stitch
+        .seam_exposure_correction
+        .as_ref()
+        .and_then(|correction| correction.held_out_validation_passed);
+    entry.seam_exposure_held_out_improvement_over_gain = summary
+        .stitch
+        .seam_exposure_correction
+        .as_ref()
+        .and_then(|correction| correction.held_out_improvement_over_gain);
+    entry.seam_exposure_offset_normalized_abs_max = summary
+        .stitch
+        .seam_exposure_correction
+        .as_ref()
+        .and_then(|correction| correction.offset_rgb_normalized.as_ref())
+        .map(|offsets| offsets.iter().map(|value| value.abs()).fold(0.0, f64::max));
+    entry.seam_exposure_spatial_slope_abs_max = summary
+        .stitch
+        .seam_exposure_correction
+        .as_ref()
+        .and_then(|correction| correction.spatial_gain_log_slope_y_rgb.as_ref())
+        .map(|slopes| slopes.iter().map(|value| value.abs()).fold(0.0, f64::max));
+    entry.seam_exposure_spatial_slope_agreement_ratio = summary
+        .stitch
+        .seam_exposure_correction
+        .as_ref()
+        .and_then(|correction| correction.spatial_slope_agreement_ratio);
+    entry.seam_exposure_held_out_spatial_improvement_over_best_constant = summary
+        .stitch
+        .seam_exposure_correction
+        .as_ref()
+        .and_then(|correction| correction.held_out_spatial_improvement_over_best_constant);
+    entry.seam_exposure_spatial_offset_slope_normalized_abs_max = summary
+        .stitch
+        .seam_exposure_correction
+        .as_ref()
+        .and_then(|correction| correction.spatial_offset_slope_y_rgb_normalized.as_ref())
+        .map(|slopes| slopes.iter().map(|value| value.abs()).fold(0.0, f64::max));
+    entry.seam_exposure_spatial_offset_endpoint_normalized_abs_max = summary
+        .stitch
+        .seam_exposure_correction
+        .as_ref()
+        .and_then(|correction| {
+            correction
+                .spatial_offset_top_rgb_normalized
+                .as_ref()
+                .zip(correction.spatial_offset_bottom_rgb_normalized.as_ref())
+        })
+        .map(|(top, bottom)| {
+            top.iter()
+                .chain(bottom.iter())
+                .map(|value| value.abs())
+                .fold(0.0, f64::max)
+        });
+    entry.seam_exposure_spatial_affine_slope_agreement_ratio = summary
+        .stitch
+        .seam_exposure_correction
+        .as_ref()
+        .and_then(|correction| correction.spatial_affine_slope_agreement_ratio);
+    entry.seam_exposure_spatial_affine_center_offset_delta_normalized = summary
+        .stitch
+        .seam_exposure_correction
+        .as_ref()
+        .and_then(|correction| correction.spatial_affine_center_offset_delta_normalized);
+    entry.seam_exposure_held_out_spatial_gain_offset_improvement_over_best_simpler = summary
+        .stitch
+        .seam_exposure_correction
+        .as_ref()
+        .and_then(|correction| {
+            correction.held_out_spatial_gain_offset_improvement_over_best_simpler
+        });
+    entry.seam_blend_mode = summary
+        .stitch
+        .seam_blend
+        .as_ref()
+        .and_then(|blend| blend.mode.clone());
+    entry.seam_blend_review_required = summary
+        .stitch
+        .seam_blend
+        .as_ref()
+        .and_then(|blend| blend.review_required);
+    entry.seam_detail_review_required = summary
+        .stitch
+        .seam_blend
+        .as_ref()
+        .and_then(|blend| blend.detail_consistency.as_ref())
+        .and_then(|detail| detail.review_required);
+    entry.seam_detail_supported_scale_count = summary
+        .stitch
+        .seam_blend
+        .as_ref()
+        .and_then(|blend| blend.detail_consistency.as_ref())
+        .and_then(|detail| detail.minimum_supported_scale_count);
+    entry.seam_detail_max_symmetric_energy_ratio = summary
+        .stitch
+        .seam_blend
+        .as_ref()
+        .and_then(|blend| blend.detail_consistency.as_ref())
+        .and_then(|detail| detail.maximum_symmetric_energy_ratio);
+    entry.seam_gradient_ratio = summary
+        .stitch
+        .seam_blend
+        .as_ref()
+        .and_then(|blend| blend.output_to_source_seam_gradient_ratio);
+    entry.seam_overlap_p95_abs_difference = summary
+        .stitch
+        .seam_blend
+        .as_ref()
+        .and_then(|blend| blend.overlap_p95_abs_difference);
     entry.base_estimate_source = summary.base_density.base_estimate_source.clone();
+    entry.negative_reconstruction.base_confidence = summary.base_density.base_confidence;
+    entry.negative_reconstruction.density_inversion_skipped =
+        summary.negative_reconstruction.density_inversion_skipped;
+    entry.negative_reconstruction.response_model =
+        summary.negative_reconstruction.response_model.clone();
+    entry.negative_reconstruction.response_source =
+        summary.negative_reconstruction.response_source.clone();
+    entry.negative_reconstruction.response_accepted =
+        summary.negative_reconstruction.response_accepted;
+    entry.negative_reconstruction.response_review_required = summary
+        .negative_reconstruction
+        .reconstruction_review_required;
+    entry.negative_reconstruction.crosstalk_model =
+        summary.negative_reconstruction.crosstalk_model.clone();
+    entry.negative_reconstruction.characteristic_curve_model = summary
+        .negative_reconstruction
+        .characteristic_curve_model
+        .clone();
+    entry.negative_reconstruction.measured_model_id =
+        summary.negative_reconstruction.measured_model_id.clone();
+    entry.negative_reconstruction.measured_confidence =
+        summary.negative_reconstruction.measured_confidence;
+    entry.negative_reconstruction.held_out_delta_e00_rms =
+        summary.negative_reconstruction.held_out_delta_e00_rms;
+    entry.negative_reconstruction.held_out_delta_e00_max =
+        summary.negative_reconstruction.held_out_delta_e00_max;
+    entry
+        .negative_reconstruction
+        .held_out_improvement_over_unit_slope = summary
+        .negative_reconstruction
+        .held_out_improvement_over_unit_slope;
+    entry.negative_reconstruction.maximum_density_noise_gain =
+        summary.negative_reconstruction.maximum_density_noise_gain;
+    entry.negative_reconstruction.curve_extrapolated_any_ratio =
+        summary.negative_reconstruction.curve_extrapolated_any_ratio;
+    entry.negative_reconstruction.signed_headroom_preserved =
+        summary.negative_reconstruction.signed_headroom_preserved;
+    entry.negative_reconstruction.curve_interpolation =
+        summary.negative_reconstruction.curve_interpolation.clone();
     entry.render_input_source = summary.colorspace.render_input_source.clone();
     entry.render_input_reason = summary.colorspace.render_input_reason.clone();
     entry.selected_mapping_reason = summary.colorspace.selected_mapping_reason.clone();
@@ -9427,6 +14759,11 @@ fn run_fixture_suite_entry(
         .calibration_acceptance
         .as_ref()
         .and_then(|acceptance| acceptance.status.clone());
+    entry.calibration_color_mapping_applied = summary
+        .colorspace
+        .calibration_color_mapping_application
+        .as_ref()
+        .and_then(|application| application.applied);
     entry.calibration_confidence = summary.colorspace.calibration_confidence;
     entry.calibration_matrix_condition_number =
         summary.colorspace.calibration_matrix_condition_number;
@@ -9450,12 +14787,60 @@ fn run_fixture_suite_entry(
     entry.spatial_neutral_delta_p95 = summary.render.colorspace_spatial_neutral_delta_p95;
     entry.candidate_risk = summary.colorspace.candidate_risk.clone();
     entry.tone_color_trust_state = summary.colorspace.tone_color_trust_state.clone();
+    let neutral_safety_rescue = summary.colorspace.neutral_safety_rescue.as_ref();
+    entry.neutral_safety_rescue_applied = neutral_safety_rescue.and_then(|rescue| rescue.applied);
+    entry.neutral_safety_rescue_preserved_ratio_gain =
+        neutral_safety_rescue.and_then(|rescue| rescue.preserved_ratio_gain);
+    entry.neutral_safety_rescue_midtone_saturation_p95_reduction =
+        neutral_safety_rescue.and_then(|rescue| rescue.midtone_saturation_p95_reduction);
+    entry.neutral_safety_rescue_reason =
+        neutral_safety_rescue.and_then(|rescue| rescue.reason.clone());
     entry.highlight_chroma_compressed_ratio = summary.tone.highlight_chroma_compressed_ratio;
     entry.highlight_neutral_chroma_compressed_ratio =
         summary.tone.highlight_neutral_chroma_compressed_ratio;
     entry.shadow_chroma_compressed_ratio = summary.tone.shadow_chroma_compressed_ratio;
+    entry.grain_reduction_enabled = summary.tone.noise_reduction_enabled;
+    entry.grain_reduction_applied_ratio = summary.tone.noise_reduction_applied_ratio;
+    entry.grain_reduction_structure_excluded_ratio =
+        summary.tone.noise_reduction_structure_excluded_ratio;
+    entry.grain_reduction_flat_luma_p95_reduction_ratio =
+        summary.tone.noise_reduction_flat_luma_p95_reduction_ratio;
+    entry.grain_reduction_flat_chroma_p95_reduction_ratio =
+        summary.tone.noise_reduction_flat_chroma_p95_reduction_ratio;
+    let grain_detail = summary.tone.grain_detail_retention.as_ref();
+    entry.grain_detail_review_required = grain_detail.and_then(|detail| detail.review_required);
+    entry.grain_detail_decision_supported =
+        grain_detail.and_then(|detail| detail.decision_supported);
+    entry.grain_detail_luminance_probe_count =
+        grain_detail.and_then(|detail| detail.luminance_probe_count);
+    entry.grain_detail_chroma_probe_count =
+        grain_detail.and_then(|detail| detail.chroma_probe_count);
+    entry.grain_detail_luminance_p10_retention =
+        grain_detail.and_then(|detail| detail.luminance_p10_retention);
+    entry.grain_detail_chroma_p10_retention =
+        grain_detail.and_then(|detail| detail.chroma_p10_retention);
     entry.mapping_strategy = summary.colorspace.mapping_strategy.clone();
     entry.post_scale_preserved_ratio = summary.colorspace.post_scale_preserved_ratio;
+    entry.render_luminance_range_p05_p95 = summary.tone.render_luminance_range_p05_p95;
+    entry.render_review_status = summary.render.render_review_status.clone();
+    entry.render_reviewable = summary.render.render_reviewable;
+    entry.tone_output_confidence_status = summary.tone.tone_output_confidence_status.clone();
+    entry.tone_output_review_required = summary.tone.tone_output_review_required;
+    entry.tone_output_evidence_confidence = summary.tone.tone_output_evidence_confidence;
+    entry.render_to_mapped_luminance_range_ratio =
+        summary.tone.render_to_mapped_luminance_range_ratio;
+    entry.post_chroma_compression_clipped_high_ratio_max = max_f64_slice(
+        summary
+            .tone
+            .post_chroma_compression_clipped_high_ratio
+            .as_deref(),
+    );
+    entry.post_chroma_compression_clipped_low_ratio_max = max_f64_slice(
+        summary
+            .tone
+            .post_chroma_compression_clipped_low_ratio
+            .as_deref(),
+    );
     entry.reference_patch_evaluation_present =
         Some(summary.colorspace.reference_patch_evaluation.is_some());
     entry.reference_patch_patch_count = summary
@@ -9513,7 +14898,13 @@ fn run_fixture_suite_entry(
         .iter()
         .map(|artifact| artifact.kind.clone())
         .collect();
-    validate_fixture_suite_output_guardrails(name, &summary, &mut entry);
+    validate_fixture_suite_output_guardrails(
+        name,
+        &fixture.expectations,
+        cli.require_reviewable,
+        &summary,
+        &mut entry,
+    );
     validate_fixture_suite_calibration_expectations(name, &pipeline_cli, &summary, &mut entry);
     validate_fixture_suite_color_expectations(
         name,
@@ -9570,9 +14961,454 @@ fn validate_fixture_suite_color_expectations(
 ) {
     push_fixture_suite_expected_string_issue(
         name,
+        "deskew_status",
+        expectations.deskew_status.as_deref(),
+        summary.deskew.status.as_deref(),
+        entry,
+    );
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "deskew_applied",
+        expectations.deskew_applied,
+        summary.deskew.applied,
+        entry,
+    );
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "deskew_review_required",
+        expectations.deskew_review_required,
+        summary.deskew.review_required,
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "deskew_retained_area_ratio",
+        expectations.deskew_retained_area_ratio_min,
+        summary.deskew.retained_area_ratio,
+        entry,
+    );
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "deskew_all_components_applied",
+        expectations.deskew_all_components_applied,
+        summary.deskew.all_components_applied,
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "deskew_minimum_component_retained_area_ratio",
+        expectations.deskew_minimum_component_retained_area_ratio_min,
+        summary.deskew.minimum_component_retained_area_ratio,
+        entry,
+    );
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "border_crop_all_components_cropped",
+        expectations.border_crop_all_components_cropped,
+        summary.border_crop.all_components_cropped,
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "border_crop_minimum_removed_edge_count_per_component",
+        expectations
+            .border_crop_minimum_removed_edge_count_per_component_min
+            .map(|value| value as f64),
+        summary
+            .border_crop
+            .minimum_removed_edge_count_per_component
+            .map(|value| value as f64),
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "border_crop_retained_area_ratio",
+        expectations.border_crop_retained_area_ratio_min,
+        summary.border_crop.minimum_retained_area_ratio,
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "border_crop_retained_area_ratio",
+        expectations.border_crop_retained_area_ratio_max,
+        summary.border_crop.maximum_retained_area_ratio,
+        entry,
+    );
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "border_crop_rejected",
+        expectations.border_crop_rejected,
+        Some(summary.border_crop.rejected_crop_warning_count > 0),
+        entry,
+    );
+    validate_fixture_suite_geometry_accuracy_expectations(name, expectations, summary, entry);
+    validate_fixture_suite_orientation_accuracy_expectations(name, expectations, summary, entry);
+    push_fixture_suite_expected_string_issue(
+        name,
         "stitch_decision",
         expectations.stitch_decision.as_deref(),
         summary.stitch.decision.as_deref(),
+        entry,
+    );
+    if !expectations.inferred_component_order.is_empty()
+        && expectations.inferred_component_order != summary.stitch.inferred_order
+    {
+        entry.issues.push(format!(
+            "fixture_suite:{name}:inferred_component_order_mismatch:expected={:?}:actual={:?}",
+            expectations.inferred_component_order, summary.stitch.inferred_order
+        ));
+    }
+    push_fixture_suite_expected_string_issue(
+        name,
+        "technical_white_balance_status",
+        expectations.technical_white_balance_status.as_deref(),
+        summary.white_balance.technical_status.as_deref(),
+        entry,
+    );
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "technical_white_balance_applied",
+        expectations.technical_white_balance_applied,
+        summary.white_balance.technical_applied,
+        entry,
+    );
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "technical_white_balance_review_required",
+        expectations.technical_white_balance_review_required,
+        summary.white_balance.technical_review_required,
+        entry,
+    );
+    push_fixture_suite_expected_f64_issue(
+        name,
+        "creative_temperature",
+        expectations.creative_temperature,
+        summary.white_balance.creative_temperature,
+        entry,
+    );
+    push_fixture_suite_expected_f64_issue(
+        name,
+        "creative_tint",
+        expectations.creative_tint,
+        summary.white_balance.creative_tint,
+        entry,
+    );
+    let seam_exposure = summary.stitch.seam_exposure_correction.as_ref();
+    push_fixture_suite_expected_string_issue(
+        name,
+        "seam_exposure_model",
+        expectations.seam_exposure_model.as_deref(),
+        seam_exposure.and_then(|correction| correction.model.as_deref()),
+        entry,
+    );
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "seam_exposure_held_out_validation_passed",
+        expectations.seam_exposure_held_out_validation_passed,
+        seam_exposure.and_then(|correction| correction.held_out_validation_passed),
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "seam_exposure_held_out_improvement_over_gain",
+        expectations.seam_exposure_held_out_improvement_over_gain_min,
+        seam_exposure.and_then(|correction| correction.held_out_improvement_over_gain),
+        entry,
+    );
+    let offset_normalized_abs_max = seam_exposure
+        .and_then(|correction| correction.offset_rgb_normalized.as_ref())
+        .map(|offsets| offsets.iter().map(|value| value.abs()).fold(0.0, f64::max));
+    push_fixture_suite_expected_max_issue(
+        name,
+        "seam_exposure_offset_normalized_abs_max",
+        expectations.seam_exposure_offset_normalized_abs_max,
+        offset_normalized_abs_max,
+        entry,
+    );
+    let spatial_slope_abs_max = seam_exposure.and_then(|correction| {
+        let x = correction
+            .spatial_gain_log_slope_x_rgb
+            .as_ref()
+            .map(|slopes| slopes.iter().map(|value| value.abs()).fold(0.0, f64::max));
+        let y = correction
+            .spatial_gain_log_slope_y_rgb
+            .as_ref()
+            .map(|slopes| slopes.iter().map(|value| value.abs()).fold(0.0, f64::max));
+        x.zip(y).map(|(x, y)| x.max(y)).or(x).or(y)
+    });
+    push_fixture_suite_expected_min_issue(
+        name,
+        "seam_exposure_spatial_slope_abs_max",
+        expectations.seam_exposure_spatial_slope_abs_min,
+        spatial_slope_abs_max,
+        entry,
+    );
+    let seam_blend = summary.stitch.seam_blend.as_ref();
+    let seam_detail = seam_blend.and_then(|blend| blend.detail_consistency.as_ref());
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "seam_blend_review_required",
+        expectations.seam_blend_review_required,
+        seam_blend.and_then(|blend| blend.review_required),
+        entry,
+    );
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "seam_detail_review_required",
+        expectations.seam_detail_review_required,
+        seam_detail.and_then(|detail| detail.review_required),
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "seam_detail_supported_scale_count",
+        expectations
+            .seam_detail_supported_scale_count_min
+            .map(|value| value as f64),
+        seam_detail
+            .and_then(|detail| detail.minimum_supported_scale_count)
+            .map(|value| value as f64),
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "seam_detail_max_symmetric_energy_ratio",
+        expectations.seam_detail_max_symmetric_energy_ratio_max,
+        seam_detail.and_then(|detail| detail.maximum_symmetric_energy_ratio),
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "seam_exposure_spatial_slope_abs_max",
+        expectations.seam_exposure_spatial_slope_abs_max,
+        spatial_slope_abs_max,
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "seam_exposure_spatial_slope_agreement_ratio",
+        expectations.seam_exposure_spatial_slope_agreement_ratio_min,
+        seam_exposure.and_then(|correction| correction.spatial_slope_agreement_ratio),
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "seam_exposure_held_out_spatial_improvement_over_best_constant",
+        expectations.seam_exposure_held_out_spatial_improvement_over_best_constant_min,
+        seam_exposure
+            .and_then(|correction| correction.held_out_spatial_improvement_over_best_constant),
+        entry,
+    );
+    let spatial_offset_slope_abs_max = seam_exposure.and_then(|correction| {
+        let x = correction
+            .spatial_offset_slope_x_rgb_normalized
+            .as_ref()
+            .map(|slopes| slopes.iter().map(|value| value.abs()).fold(0.0, f64::max));
+        let y = correction
+            .spatial_offset_slope_y_rgb_normalized
+            .as_ref()
+            .map(|slopes| slopes.iter().map(|value| value.abs()).fold(0.0, f64::max));
+        x.zip(y).map(|(x, y)| x.max(y)).or(x).or(y)
+    });
+    push_fixture_suite_expected_min_issue(
+        name,
+        "seam_exposure_spatial_offset_slope_normalized_abs_max",
+        expectations.seam_exposure_spatial_offset_slope_normalized_abs_min,
+        spatial_offset_slope_abs_max,
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "seam_exposure_spatial_offset_slope_normalized_abs_max",
+        expectations.seam_exposure_spatial_offset_slope_normalized_abs_max,
+        spatial_offset_slope_abs_max,
+        entry,
+    );
+    let spatial_offset_endpoint_abs_max = seam_exposure
+        .and_then(|correction| {
+            correction
+                .spatial_offset_top_rgb_normalized
+                .as_ref()
+                .zip(correction.spatial_offset_bottom_rgb_normalized.as_ref())
+        })
+        .map(|(top, bottom)| {
+            top.iter()
+                .chain(bottom.iter())
+                .map(|value| value.abs())
+                .fold(0.0, f64::max)
+        });
+    push_fixture_suite_expected_max_issue(
+        name,
+        "seam_exposure_spatial_offset_endpoint_normalized_abs_max",
+        expectations.seam_exposure_spatial_offset_endpoint_normalized_abs_max,
+        spatial_offset_endpoint_abs_max,
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "seam_exposure_spatial_affine_slope_agreement_ratio",
+        expectations.seam_exposure_spatial_affine_slope_agreement_ratio_min,
+        seam_exposure.and_then(|correction| correction.spatial_affine_slope_agreement_ratio),
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "seam_exposure_spatial_affine_center_offset_delta_normalized",
+        expectations.seam_exposure_spatial_affine_center_offset_delta_normalized_max,
+        seam_exposure
+            .and_then(|correction| correction.spatial_affine_center_offset_delta_normalized),
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "seam_exposure_held_out_spatial_gain_offset_improvement_over_best_simpler",
+        expectations.seam_exposure_held_out_spatial_gain_offset_improvement_over_best_simpler_min,
+        seam_exposure.and_then(|correction| {
+            correction.held_out_spatial_gain_offset_improvement_over_best_simpler
+        }),
+        entry,
+    );
+    let spatial_2d = seam_exposure.and_then(|correction| correction.spatial_2d_validation.as_ref());
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "seam_exposure_spatial_2d_gain_accepted",
+        expectations.seam_exposure_spatial_2d_gain_accepted,
+        spatial_2d.and_then(|validation| validation.gain_accepted),
+        entry,
+    );
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "seam_exposure_spatial_2d_gain_offset_accepted",
+        expectations.seam_exposure_spatial_2d_gain_offset_accepted,
+        spatial_2d.and_then(|validation| validation.gain_offset_accepted),
+        entry,
+    );
+    let spatial_quadratic = spatial_2d.and_then(|validation| validation.quadratic.as_ref());
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "seam_exposure_spatial_quadratic_gain_accepted",
+        expectations.seam_exposure_spatial_quadratic_gain_accepted,
+        spatial_quadratic.and_then(|validation| validation.gain_accepted),
+        entry,
+    );
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "seam_exposure_spatial_quadratic_gain_offset_accepted",
+        expectations.seam_exposure_spatial_quadratic_gain_offset_accepted,
+        spatial_quadratic.and_then(|validation| validation.gain_offset_accepted),
+        entry,
+    );
+    if let Some(expected) = expectations.seam_exposure_spatial_2d_distinct_columns_min {
+        match spatial_2d.and_then(|validation| {
+            validation
+                .distinct_training_columns
+                .zip(validation.distinct_held_out_columns)
+                .map(|(training, held_out)| training.min(held_out))
+        }) {
+            Some(actual) if actual >= expected => {}
+            Some(actual) => entry.issues.push(format!(
+                "fixture_suite:{name}:seam_exposure_spatial_2d_distinct_columns_below_minimum:expected_min={expected}:actual={actual}"
+            )),
+            None => entry.issues.push(format!(
+                "fixture_suite:{name}:seam_exposure_spatial_2d_distinct_columns_missing"
+            )),
+        }
+    }
+    let selected_model = seam_exposure.and_then(|correction| correction.model.as_deref());
+    let selected_2d_gain_offset = matches!(
+        selected_model,
+        Some("gain_offset_spatial_xy_rgb" | "gain_offset_spatial_quadratic_xy_rgb")
+    );
+    let selected_quadratic = matches!(
+        selected_model,
+        Some("gain_spatial_quadratic_xy_rgb" | "gain_offset_spatial_quadratic_xy_rgb")
+    );
+    let selected_2d_horizontal_agreement = spatial_2d.and_then(|validation| {
+        if selected_quadratic {
+            validation.quadratic.as_ref().and_then(|quadratic| {
+                if selected_2d_gain_offset {
+                    quadratic.gain_offset_curvature_coefficient_agreement_ratio
+                } else {
+                    quadratic.gain_curvature_coefficient_agreement_ratio
+                }
+            })
+        } else if selected_2d_gain_offset {
+            validation.gain_offset_horizontal_slope_agreement_ratio
+        } else {
+            validation.gain_horizontal_slope_agreement_ratio
+        }
+    });
+    push_fixture_suite_expected_min_issue(
+        name,
+        "seam_exposure_spatial_2d_horizontal_slope_agreement_ratio",
+        expectations.seam_exposure_spatial_2d_horizontal_slope_agreement_ratio_min,
+        selected_2d_horizontal_agreement,
+        entry,
+    );
+    let selected_2d_improvement = spatial_2d.and_then(|validation| {
+        if selected_quadratic {
+            validation.quadratic.as_ref().and_then(|quadratic| {
+                if selected_2d_gain_offset {
+                    quadratic.gain_offset_improvement_over_best_simpler
+                } else {
+                    quadratic.gain_improvement_over_best_simpler
+                }
+            })
+        } else if selected_2d_gain_offset {
+            validation.gain_offset_improvement_over_best_simpler
+        } else {
+            validation.gain_improvement_over_best_simpler
+        }
+    });
+    push_fixture_suite_expected_min_issue(
+        name,
+        "seam_exposure_held_out_spatial_2d_improvement_over_best_simpler",
+        expectations.seam_exposure_held_out_spatial_2d_improvement_over_best_simpler_min,
+        selected_2d_improvement,
+        entry,
+    );
+    if expectations.seam_blend_required
+        && !summary
+            .stitch
+            .seam_blend
+            .as_ref()
+            .is_some_and(|blend| blend.applied == Some(true) && blend.applied_merge_count > 0)
+    {
+        entry.issues.push(format!(
+            "fixture_suite:{name}:seam_blend_missing_or_not_applied"
+        ));
+    }
+    push_fixture_suite_expected_string_issue(
+        name,
+        "seam_blend_mode",
+        expectations.seam_blend_mode.as_deref(),
+        summary
+            .stitch
+            .seam_blend
+            .as_ref()
+            .and_then(|blend| blend.mode.as_deref()),
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "seam_gradient_ratio",
+        expectations.seam_gradient_ratio_max,
+        summary
+            .stitch
+            .seam_blend
+            .as_ref()
+            .and_then(|blend| blend.output_to_source_seam_gradient_ratio),
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "seam_overlap_p95_abs_difference",
+        expectations.seam_overlap_p95_abs_difference_max,
+        summary
+            .stitch
+            .seam_blend
+            .as_ref()
+            .and_then(|blend| blend.overlap_p95_abs_difference),
         entry,
     );
     push_fixture_suite_expected_string_issue(
@@ -9580,6 +15416,130 @@ fn validate_fixture_suite_color_expectations(
         "base_estimate_source",
         expectations.base_estimate_source.as_deref(),
         summary.base_density.base_estimate_source.as_deref(),
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "base_confidence",
+        expectations.base_confidence_min,
+        summary.base_density.base_confidence,
+        entry,
+    );
+    let negative = &summary.negative_reconstruction;
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "density_inversion_skipped",
+        expectations.density_inversion_skipped,
+        negative.density_inversion_skipped,
+        entry,
+    );
+    push_fixture_suite_expected_string_issue(
+        name,
+        "negative_response_model",
+        expectations.negative_response_model.as_deref(),
+        negative.response_model.as_deref(),
+        entry,
+    );
+    push_fixture_suite_expected_string_issue(
+        name,
+        "negative_response_source",
+        expectations.negative_response_source.as_deref(),
+        negative.response_source.as_deref(),
+        entry,
+    );
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "negative_response_accepted",
+        expectations.negative_response_accepted,
+        negative.response_accepted,
+        entry,
+    );
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "negative_response_review_required",
+        expectations.negative_response_review_required,
+        negative.reconstruction_review_required,
+        entry,
+    );
+    push_fixture_suite_expected_string_issue(
+        name,
+        "negative_response_crosstalk_model",
+        expectations.negative_response_crosstalk_model.as_deref(),
+        negative.crosstalk_model.as_deref(),
+        entry,
+    );
+    push_fixture_suite_expected_string_issue(
+        name,
+        "negative_response_characteristic_curve_model",
+        expectations
+            .negative_response_characteristic_curve_model
+            .as_deref(),
+        negative.characteristic_curve_model.as_deref(),
+        entry,
+    );
+    push_fixture_suite_expected_string_issue(
+        name,
+        "negative_response_measured_model_id",
+        expectations.negative_response_measured_model_id.as_deref(),
+        negative.measured_model_id.as_deref(),
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "negative_response_measured_confidence",
+        expectations.negative_response_measured_confidence_min,
+        negative.measured_confidence,
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "negative_response_held_out_delta_e00_rms",
+        expectations.negative_response_held_out_delta_e00_rms_max,
+        negative.held_out_delta_e00_rms,
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "negative_response_held_out_max_delta_e00",
+        expectations.negative_response_held_out_max_delta_e00_max,
+        negative.held_out_delta_e00_max,
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "negative_response_held_out_improvement_over_unit_slope",
+        expectations.negative_response_held_out_improvement_over_unit_slope_min,
+        negative.held_out_improvement_over_unit_slope,
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "negative_response_density_noise_gain",
+        expectations.negative_response_density_noise_gain_max,
+        negative.maximum_density_noise_gain,
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "negative_response_curve_extrapolated_ratio",
+        expectations.negative_response_curve_extrapolated_ratio_max,
+        negative.curve_extrapolated_any_ratio,
+        entry,
+    );
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "negative_response_signed_headroom_preserved",
+        expectations.negative_response_signed_headroom_preserved,
+        negative.signed_headroom_preserved,
+        entry,
+    );
+    push_fixture_suite_expected_string_issue(
+        name,
+        "negative_response_curve_interpolation",
+        expectations
+            .negative_response_curve_interpolation
+            .as_deref(),
+        negative.curve_interpolation.as_deref(),
         entry,
     );
     push_fixture_suite_expected_string_issue(
@@ -9649,6 +15609,17 @@ fn validate_fixture_suite_color_expectations(
             .calibration_acceptance
             .as_ref()
             .and_then(|acceptance| acceptance.status.as_deref()),
+        entry,
+    );
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "calibration_color_mapping_applied",
+        expectations.calibration_color_mapping_applied,
+        summary
+            .colorspace
+            .calibration_color_mapping_application
+            .as_ref()
+            .and_then(|application| application.applied),
         entry,
     );
     for required_detail in &expectations.calibration_rejection_details_required {
@@ -9773,6 +15744,37 @@ fn validate_fixture_suite_color_expectations(
         summary.colorspace.tone_color_trust_state.as_deref(),
         entry,
     );
+    let neutral_safety_rescue = summary.colorspace.neutral_safety_rescue.as_ref();
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "neutral_safety_rescue_applied",
+        expectations.neutral_safety_rescue_applied,
+        neutral_safety_rescue.and_then(|rescue| rescue.applied),
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "neutral_safety_rescue_preserved_ratio_gain",
+        expectations.neutral_safety_rescue_preserved_ratio_gain_min,
+        neutral_safety_rescue.and_then(|rescue| rescue.preserved_ratio_gain),
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "neutral_safety_rescue_midtone_saturation_p95_reduction",
+        expectations.neutral_safety_rescue_midtone_saturation_p95_reduction_min,
+        neutral_safety_rescue.and_then(|rescue| rescue.midtone_saturation_p95_reduction),
+        entry,
+    );
+    push_fixture_suite_expected_contains_issue(
+        name,
+        "neutral_safety_rescue_reason",
+        expectations
+            .neutral_safety_rescue_reason_contains
+            .as_deref(),
+        neutral_safety_rescue.and_then(|rescue| rescue.reason.as_deref()),
+        entry,
+    );
     push_fixture_suite_expected_min_issue(
         name,
         "highlight_chroma_compressed_ratio",
@@ -9801,6 +15803,92 @@ fn validate_fixture_suite_color_expectations(
         summary.tone.shadow_chroma_compressed_ratio,
         entry,
     );
+    let grain_detail = summary.tone.grain_detail_retention.as_ref();
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "grain_reduction_enabled",
+        expectations.grain_reduction_enabled,
+        summary.tone.noise_reduction_enabled,
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "grain_reduction_applied_ratio",
+        expectations.grain_reduction_applied_ratio_min,
+        summary.tone.noise_reduction_applied_ratio,
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "grain_reduction_structure_excluded_ratio",
+        expectations.grain_reduction_structure_excluded_ratio_min,
+        summary.tone.noise_reduction_structure_excluded_ratio,
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "grain_reduction_flat_luma_p95_reduction_ratio",
+        expectations.grain_reduction_flat_luma_p95_reduction_ratio_min,
+        summary.tone.noise_reduction_flat_luma_p95_reduction_ratio,
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "grain_reduction_flat_chroma_p95_reduction_ratio",
+        expectations.grain_reduction_flat_chroma_p95_reduction_ratio_min,
+        summary.tone.noise_reduction_flat_chroma_p95_reduction_ratio,
+        entry,
+    );
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "grain_detail_review_required",
+        expectations.grain_detail_review_required,
+        grain_detail.and_then(|detail| detail.review_required),
+        entry,
+    );
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "grain_detail_decision_supported",
+        expectations.grain_detail_decision_supported,
+        grain_detail.and_then(|detail| detail.decision_supported),
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "grain_detail_luminance_probe_count",
+        expectations
+            .grain_detail_luminance_probe_count_min
+            .map(|value| value as f64),
+        grain_detail
+            .and_then(|detail| detail.luminance_probe_count)
+            .map(|value| value as f64),
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "grain_detail_chroma_probe_count",
+        expectations
+            .grain_detail_chroma_probe_count_min
+            .map(|value| value as f64),
+        grain_detail
+            .and_then(|detail| detail.chroma_probe_count)
+            .map(|value| value as f64),
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "grain_detail_luminance_p10_retention",
+        expectations.grain_detail_luminance_p10_retention_min,
+        grain_detail.and_then(|detail| detail.luminance_p10_retention),
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "grain_detail_chroma_p10_retention",
+        expectations.grain_detail_chroma_p10_retention_min,
+        grain_detail.and_then(|detail| detail.chroma_p10_retention),
+        entry,
+    );
     if let Some(minimum) = expectations.post_scale_preserved_ratio_min {
         if !summary
             .colorspace
@@ -9812,6 +15900,79 @@ fn validate_fixture_suite_color_expectations(
             ));
         }
     }
+    push_fixture_suite_expected_min_issue(
+        name,
+        "render_luminance_range_p05_p95",
+        expectations.render_luminance_range_p05_p95_min,
+        summary.tone.render_luminance_range_p05_p95,
+        entry,
+    );
+    push_fixture_suite_expected_string_issue(
+        name,
+        "render_review_status",
+        expectations.render_review_status.as_deref(),
+        summary.render.render_review_status.as_deref(),
+        entry,
+    );
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "render_reviewable",
+        expectations.render_reviewable,
+        summary.render.render_reviewable,
+        entry,
+    );
+    push_fixture_suite_expected_string_issue(
+        name,
+        "tone_output_confidence_status",
+        expectations.tone_output_confidence_status.as_deref(),
+        summary.tone.tone_output_confidence_status.as_deref(),
+        entry,
+    );
+    push_fixture_suite_expected_bool_issue(
+        name,
+        "tone_output_review_required",
+        expectations.tone_output_review_required,
+        summary.tone.tone_output_review_required,
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "tone_output_evidence_confidence",
+        expectations.tone_output_evidence_confidence_min,
+        summary.tone.tone_output_evidence_confidence,
+        entry,
+    );
+    push_fixture_suite_expected_min_issue(
+        name,
+        "render_to_mapped_luminance_range_ratio",
+        expectations.render_to_mapped_luminance_range_ratio_min,
+        summary.tone.render_to_mapped_luminance_range_ratio,
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "post_chroma_compression_clipped_high_ratio_max",
+        expectations.post_chroma_compression_clipped_high_ratio_max,
+        max_f64_slice(
+            summary
+                .tone
+                .post_chroma_compression_clipped_high_ratio
+                .as_deref(),
+        ),
+        entry,
+    );
+    push_fixture_suite_expected_max_issue(
+        name,
+        "post_chroma_compression_clipped_low_ratio_max",
+        expectations.post_chroma_compression_clipped_low_ratio_max,
+        max_f64_slice(
+            summary
+                .tone
+                .post_chroma_compression_clipped_low_ratio
+                .as_deref(),
+        ),
+        entry,
+    );
     if expectations.reference_patch_evaluation_required
         && summary.colorspace.reference_patch_evaluation.is_none()
     {
@@ -10013,6 +16174,157 @@ fn fixture_suite_candidate_acceptance_signatures(
         .collect()
 }
 
+fn validate_fixture_suite_geometry_accuracy_expectations(
+    name: &str,
+    expectations: &FixtureExpectations,
+    summary: &ValidationSummary,
+    entry: &mut FixtureSuiteEntry,
+) {
+    if let Some(expected) = expectations.deskew_correction_degrees_expected {
+        match (
+            expectations.deskew_correction_tolerance_degrees,
+            summary.deskew.correction_degrees,
+        ) {
+            (Some(tolerance), Some(actual)) if (actual - expected).abs() > tolerance => {
+                entry.issues.push(format!(
+                    "fixture_suite:{name}:deskew_correction_degrees_outside_tolerance:expected={expected:.6}:tolerance={tolerance:.6}:actual={actual:.6}"
+                ));
+            }
+            (Some(_), None) => entry.issues.push(format!(
+                "fixture_suite:{name}:deskew_correction_degrees_missing"
+            )),
+            (None, _) => entry.issues.push(format!(
+                "fixture_suite:{name}:deskew_correction_tolerance_degrees_missing"
+            )),
+            _ => {}
+        }
+    }
+
+    for expected in &expectations.border_crop_components_expected {
+        let Some(actual) = summary
+            .border_crop
+            .components
+            .iter()
+            .find(|component| component.index == Some(expected.component_index))
+        else {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:border_crop_component{}_missing",
+                expected.component_index
+            ));
+            continue;
+        };
+        for (edge, expected_value, actual_value) in [
+            ("top", expected.top_removed, actual.top_removed),
+            ("bottom", expected.bottom_removed, actual.bottom_removed),
+            ("left", expected.left_removed, actual.left_removed),
+            ("right", expected.right_removed, actual.right_removed),
+        ] {
+            match actual_value {
+                Some(actual_value)
+                    if actual_value.abs_diff(expected_value) > expected.tolerance_px =>
+                {
+                    entry.issues.push(format!(
+                        "fixture_suite:{name}:border_crop_component{}_{edge}_outside_tolerance:expected={expected_value}:tolerance={}:actual={actual_value}",
+                        expected.component_index, expected.tolerance_px
+                    ));
+                }
+                None => entry.issues.push(format!(
+                    "fixture_suite:{name}:border_crop_component{}_{edge}_missing",
+                    expected.component_index
+                )),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn validate_fixture_suite_orientation_accuracy_expectations(
+    name: &str,
+    expectations: &FixtureExpectations,
+    summary: &ValidationSummary,
+    entry: &mut FixtureSuiteEntry,
+) {
+    for expected in &expectations.orientation_components_expected {
+        let Some(actual) = summary
+            .input_orientation
+            .components
+            .iter()
+            .find(|component| component.index == Some(expected.component_index))
+        else {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:orientation_component{}_missing",
+                expected.component_index
+            ));
+            continue;
+        };
+        if actual.tag_value.is_some() != expected.tag_present {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:orientation_component{}_tag_present_mismatch:expected={}:actual={}",
+                expected.component_index,
+                expected.tag_present,
+                actual.tag_value.is_some()
+            ));
+        }
+        if actual.tag_value != expected.tag_value {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:orientation_component{}_tag_value_mismatch:expected={:?}:actual={:?}",
+                expected.component_index, expected.tag_value, actual.tag_value
+            ));
+        }
+        if actual.transform.as_deref() != Some(expected.transform.as_str()) {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:orientation_component{}_transform_mismatch:expected={}:actual={}",
+                expected.component_index,
+                expected.transform,
+                actual.transform.as_deref().unwrap_or("missing")
+            ));
+        }
+        if actual.decoded_pixel_sha256.as_deref() != Some(expected.decoded_pixel_sha256.as_str()) {
+            entry.issues.push(format!(
+                "fixture_suite:{name}:orientation_component{}_decoded_pixel_sha256_mismatch:expected={}:actual={}",
+                expected.component_index,
+                expected.decoded_pixel_sha256,
+                actual.decoded_pixel_sha256.as_deref().unwrap_or("missing")
+            ));
+        }
+        for (field, expected_value, actual_value) in [
+            (
+                "applied",
+                expected.applied.to_string(),
+                actual.applied.map(|value| value.to_string()),
+            ),
+            (
+                "source_width",
+                expected.source_width.to_string(),
+                actual.source_width.map(|value| value.to_string()),
+            ),
+            (
+                "source_height",
+                expected.source_height.to_string(),
+                actual.source_height.map(|value| value.to_string()),
+            ),
+            (
+                "output_width",
+                expected.output_width.to_string(),
+                actual.output_width.map(|value| value.to_string()),
+            ),
+            (
+                "output_height",
+                expected.output_height.to_string(),
+                actual.output_height.map(|value| value.to_string()),
+            ),
+        ] {
+            if actual_value.as_deref() != Some(expected_value.as_str()) {
+                entry.issues.push(format!(
+                    "fixture_suite:{name}:orientation_component{}_{field}_mismatch:expected={expected_value}:actual={}",
+                    expected.component_index,
+                    actual_value.as_deref().unwrap_or("missing")
+                ));
+            }
+        }
+    }
+}
+
 fn push_fixture_suite_expected_string_issue(
     name: &str,
     field: &str,
@@ -10024,6 +16336,36 @@ fn push_fixture_suite_expected_string_issue(
         entry
             .issues
             .push(format!("fixture_suite:{name}:{field}_mismatch"));
+    }
+}
+
+fn push_fixture_suite_expected_bool_issue(
+    name: &str,
+    field: &str,
+    expected: Option<bool>,
+    actual: Option<bool>,
+    entry: &mut FixtureSuiteEntry,
+) {
+    if expected.is_some() && expected != actual {
+        entry
+            .issues
+            .push(format!("fixture_suite:{name}:{field}_mismatch"));
+    }
+}
+
+fn push_fixture_suite_expected_f64_issue(
+    name: &str,
+    field: &str,
+    expected: Option<f64>,
+    actual: Option<f64>,
+    entry: &mut FixtureSuiteEntry,
+) {
+    if let Some(expected) = expected {
+        if !actual.is_some_and(|actual| (actual - expected).abs() <= 1e-9) {
+            entry
+                .issues
+                .push(format!("fixture_suite:{name}:{field}_mismatch"));
+        }
     }
 }
 
@@ -10077,18 +16419,67 @@ fn push_fixture_suite_expected_min_issue(
 
 fn validate_fixture_suite_output_guardrails(
     name: &str,
+    expectations: &FixtureExpectations,
+    require_reviewable: bool,
     summary: &ValidationSummary,
     entry: &mut FixtureSuiteEntry,
 ) {
-    if summary.render.output_file_icc_profile_matches_report == Some(false) {
-        entry
-            .issues
-            .push(format!("fixture_suite:{name}:output_icc_profile_mismatch"));
+    for issue in delivery_artifact_integrity_issues(&summary.render) {
+        entry.issues.push(format!("fixture_suite:{name}:{issue}"));
     }
-    if summary.render.stale_render_artifact_count.unwrap_or(0) > 0 {
-        entry
-            .issues
-            .push(format!("fixture_suite:{name}:stale_render_artifacts"));
+    append_fixture_suite_render_review_issues(
+        name,
+        expectations.render_reviewable,
+        require_reviewable,
+        summary.render.render_review_status.as_deref(),
+        summary.render.render_reviewable,
+        &mut entry.issues,
+    );
+}
+
+fn final_render_is_reviewable(
+    render_review_status: Option<&str>,
+    render_reviewable: Option<bool>,
+) -> bool {
+    render_review_status == Some("reviewable") && render_reviewable == Some(true)
+}
+
+fn final_render_review_evidence_is_consistent(
+    render_review_status: Option<&str>,
+    render_reviewable: Option<bool>,
+) -> bool {
+    match (render_review_status, render_reviewable) {
+        (Some("reviewable"), Some(true)) => true,
+        (Some(status), Some(false)) if status != "reviewable" => true,
+        _ => false,
+    }
+}
+
+fn append_fixture_suite_render_review_issues(
+    name: &str,
+    expected_render_reviewable: Option<bool>,
+    require_reviewable: bool,
+    render_review_status: Option<&str>,
+    render_reviewable: Option<bool>,
+    issues: &mut Vec<String>,
+) {
+    if !final_render_review_evidence_is_consistent(render_review_status, render_reviewable) {
+        issues.push(format!(
+            "fixture_suite:{name}:render_reviewability_evidence_missing_or_inconsistent"
+        ));
+        return;
+    }
+    if final_render_is_reviewable(render_review_status, render_reviewable) {
+        return;
+    }
+    if require_reviewable {
+        issues.push(format!(
+            "fixture_suite:{name}:require_reviewable_not_satisfied"
+        ));
+    } else if expected_render_reviewable != Some(false) {
+        issues.push(format!(
+            "fixture_suite:{name}:non_reviewable_render_not_explicitly_expected"
+        ));
     }
 }
 
@@ -10298,6 +16689,13 @@ fn summary_baseline_contract_issues(baseline: &TrackedValidationBaseline) -> Vec
     if baseline.colorspace.calibration_acceptance_status.is_none() {
         issues.push("colorspace.calibration_acceptance_status");
     }
+    if baseline
+        .colorspace
+        .calibration_color_mapping_applied
+        .is_none()
+    {
+        issues.push("colorspace.calibration_color_mapping_applied");
+    }
     if baseline.colorspace.candidate_risk.is_none() {
         issues.push("colorspace.candidate_risk");
     }
@@ -10390,8 +16788,8 @@ fn fixture_suite_to_markdown(summary: &FixtureSuiteSummary) -> String {
         }
         out.push('\n');
     }
-    out.push_str("| Fixture | Status | Coverage | Coverage actions | Baseline | Stitch | Base | Output space | Reference evidence | Render input | Calibration | Candidate | Quality scores | Risk | Tone trust | Tone protection | Gamut preserved | Reference patch fit | Debug artifacts | ICC | Stale artifacts | Issues |\n");
-    out.push_str("|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|\n");
+    out.push_str("| Fixture | Status | Coverage | Coverage actions | Baseline | Stitch | Base | Geometry preparation / orientation | Negative reconstruction | Output space | Reference evidence | Render input | Calibration | Candidate | Quality scores | Risk | Tone trust | Tone protection | Dynamic range | Reference patch fit | Debug artifacts | ICC | Stale artifacts | Issues |\n");
+    out.push_str("|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|-|\n");
     for fixture in &summary.fixtures {
         let coverage = if fixture.coverage_validation_ready {
             "ready".to_string()
@@ -10418,6 +16816,8 @@ fn fixture_suite_to_markdown(summary: &FixtureSuiteSummary) -> String {
             fixture.expected_base_estimate_source.as_deref(),
             fixture.base_estimate_source.as_deref(),
         );
+        let geometry_preparation = fixture_suite_geometry_preparation_label(fixture);
+        let negative_reconstruction = fixture_suite_negative_reconstruction_label(fixture);
         let output_space = expected_actual_label(
             fixture.expected_output_color_space.as_deref(),
             fixture.output_color_space.as_deref(),
@@ -10493,15 +16893,7 @@ fn fixture_suite_to_markdown(summary: &FixtureSuiteSummary) -> String {
             fixture.tone_color_trust_state.as_deref(),
         );
         let tone_protection = fixture_suite_tone_protection_label(fixture);
-        let preserved = fixture
-            .post_scale_preserved_ratio
-            .map(|value| format!("{value:.6}"))
-            .unwrap_or_default();
-        let preserved = if let Some(minimum) = fixture.expected_post_scale_preserved_ratio_min {
-            format!("min {minimum:.6}; actual {preserved}")
-        } else {
-            preserved
-        };
+        let dynamic_range = fixture_suite_dynamic_range_label(fixture);
         let reference_patch_fit = fixture_suite_reference_patch_label(fixture);
         let debug_artifacts = fixture_suite_debug_artifact_label(fixture);
         let icc = fixture
@@ -10518,7 +16910,7 @@ fn fixture_suite_to_markdown(summary: &FixtureSuiteSummary) -> String {
             fixture.issues.join(", ")
         };
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             fixture.name,
             fixture.status,
             coverage,
@@ -10526,6 +16918,8 @@ fn fixture_suite_to_markdown(summary: &FixtureSuiteSummary) -> String {
             baseline,
             stitch,
             base,
+            geometry_preparation,
+            negative_reconstruction,
             output_space,
             reference_evidence,
             render_input,
@@ -10535,7 +16929,7 @@ fn fixture_suite_to_markdown(summary: &FixtureSuiteSummary) -> String {
             risk,
             tone_trust,
             tone_protection,
-            preserved,
+            dynamic_range,
             reference_patch_fit,
             debug_artifacts,
             icc,
@@ -10550,6 +16944,262 @@ fn fixture_suite_to_markdown(summary: &FixtureSuiteSummary) -> String {
         }
     }
     out
+}
+
+fn fixture_suite_geometry_preparation_label(fixture: &FixtureSuiteEntry) -> String {
+    let evidence = &fixture.geometry_preparation;
+    let mut parts = Vec::new();
+    push_fixture_suite_expected_value_label(
+        &mut parts,
+        "deskew all components",
+        evidence.expected_all_deskew_components_applied,
+        evidence.all_deskew_components_applied,
+    );
+    push_fixture_suite_min_label(
+        &mut parts,
+        "deskew retained area",
+        evidence.expected_minimum_deskew_retained_area_ratio,
+        evidence.minimum_deskew_retained_area_ratio,
+    );
+    match (
+        evidence.expected_deskew_correction_degrees,
+        evidence.expected_deskew_correction_tolerance_degrees,
+        evidence.deskew_correction_degrees,
+    ) {
+        (Some(expected), Some(tolerance), Some(actual)) => parts.push(format!(
+            "deskew correction expected {expected:.6} +/- {tolerance:.6}; actual {actual:.6}"
+        )),
+        (Some(expected), Some(tolerance), None) => parts.push(format!(
+            "deskew correction expected {expected:.6} +/- {tolerance:.6}; actual missing"
+        )),
+        (Some(expected), None, actual) => parts.push(format!(
+            "deskew correction expected {expected:.6}; tolerance missing; actual {}",
+            actual
+                .map(|value| format!("{value:.6}"))
+                .unwrap_or_else(|| "missing".to_string())
+        )),
+        (None, _, Some(actual)) => parts.push(format!("deskew correction {actual:.6}")),
+        _ => {}
+    }
+    push_fixture_suite_expected_value_label(
+        &mut parts,
+        "crop all components",
+        evidence.expected_all_border_crop_components_cropped,
+        evidence.all_border_crop_components_cropped,
+    );
+    push_fixture_suite_expected_value_label(
+        &mut parts,
+        "removed edges minimum",
+        evidence.expected_minimum_removed_edge_count_per_component,
+        evidence.minimum_removed_edge_count_per_component,
+    );
+    push_fixture_suite_min_label(
+        &mut parts,
+        "crop retained area",
+        evidence.expected_minimum_border_crop_retained_area_ratio,
+        evidence.minimum_border_crop_retained_area_ratio,
+    );
+    push_fixture_suite_max_label(
+        &mut parts,
+        "crop retained area",
+        evidence.expected_maximum_border_crop_retained_area_ratio,
+        evidence.maximum_border_crop_retained_area_ratio,
+    );
+    push_fixture_suite_expected_value_label(
+        &mut parts,
+        "crop rejected",
+        evidence.expected_border_crop_rejected,
+        evidence.border_crop_rejected,
+    );
+    for expected in &evidence.expected_border_crop_components {
+        let actual = evidence
+            .border_crop_components
+            .iter()
+            .find(|component| component.index == Some(expected.component_index));
+        let actual_label = actual
+            .map(|component| {
+                format!(
+                    "{}/{}/{}/{}",
+                    optional_usize(component.top_removed),
+                    optional_usize(component.bottom_removed),
+                    optional_usize(component.left_removed),
+                    optional_usize(component.right_removed)
+                )
+            })
+            .unwrap_or_else(|| "missing".to_string());
+        parts.push(format!(
+            "crop component {} top/bottom/left/right expected {}/{}/{}/{} +/- {}; actual {actual_label}",
+            expected.component_index,
+            expected.top_removed,
+            expected.bottom_removed,
+            expected.left_removed,
+            expected.right_removed,
+            expected.tolerance_px
+        ));
+    }
+    for expected in &fixture.input_orientation.expected_components {
+        let actual = fixture
+            .input_orientation
+            .components
+            .iter()
+            .find(|component| component.index == Some(expected.component_index));
+        let expected_tag = expected
+            .tag_value
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "absent".to_string());
+        let actual_tag = actual
+            .and_then(|component| component.tag_value)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "absent/missing".to_string());
+        let actual_transform = actual
+            .and_then(|component| component.transform.as_deref())
+            .unwrap_or("missing");
+        let actual_applied = actual
+            .and_then(|component| component.applied)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "missing".to_string());
+        let actual_source = actual
+            .and_then(|component| {
+                component
+                    .source_width
+                    .zip(component.source_height)
+                    .map(|(width, height)| format!("{width}x{height}"))
+            })
+            .unwrap_or_else(|| "missing".to_string());
+        let actual_output = actual
+            .and_then(|component| {
+                component
+                    .output_width
+                    .zip(component.output_height)
+                    .map(|(width, height)| format!("{width}x{height}"))
+            })
+            .unwrap_or_else(|| "missing".to_string());
+        let actual_decoded_pixel_sha256 = actual
+            .and_then(|component| component.decoded_pixel_sha256.as_deref())
+            .unwrap_or("missing");
+        parts.push(format!(
+            "orientation component {} upright approved {}; decoded pixel SHA-256 expected {}; actual {actual_decoded_pixel_sha256}; tag expected {expected_tag}; actual {actual_tag}; transform expected {}; actual {actual_transform}; applied expected {}; actual {actual_applied}; source expected {}x{}; actual {actual_source}; output expected {}x{}; actual {actual_output}",
+            expected.component_index,
+            expected.upright_approved,
+            expected.decoded_pixel_sha256,
+            expected.transform,
+            expected.applied,
+            expected.source_width,
+            expected.source_height,
+            expected.output_width,
+            expected.output_height
+        ));
+    }
+    parts.join("; ")
+}
+
+fn fixture_suite_negative_reconstruction_label(fixture: &FixtureSuiteEntry) -> String {
+    let evidence = &fixture.negative_reconstruction;
+    let mut parts = Vec::new();
+    push_fixture_suite_min_label(
+        &mut parts,
+        "base confidence",
+        evidence.expected_base_confidence_min,
+        evidence.base_confidence,
+    );
+    push_fixture_suite_expected_value_label(
+        &mut parts,
+        "inversion skipped",
+        evidence.expected_density_inversion_skipped,
+        evidence.density_inversion_skipped,
+    );
+    for (label, expected, actual) in [
+        (
+            "response model",
+            evidence.expected_response_model.as_deref(),
+            evidence.response_model.as_deref(),
+        ),
+        (
+            "response source",
+            evidence.expected_response_source.as_deref(),
+            evidence.response_source.as_deref(),
+        ),
+        (
+            "crosstalk",
+            evidence.expected_crosstalk_model.as_deref(),
+            evidence.crosstalk_model.as_deref(),
+        ),
+        (
+            "characteristic curve",
+            evidence.expected_characteristic_curve_model.as_deref(),
+            evidence.characteristic_curve_model.as_deref(),
+        ),
+        (
+            "measured model",
+            evidence.expected_measured_model_id.as_deref(),
+            evidence.measured_model_id.as_deref(),
+        ),
+        (
+            "curve interpolation",
+            evidence.expected_curve_interpolation.as_deref(),
+            evidence.curve_interpolation.as_deref(),
+        ),
+    ] {
+        let value = expected_actual_label(expected, actual);
+        if !value.is_empty() {
+            parts.push(format!("{label} {value}"));
+        }
+    }
+    push_fixture_suite_expected_value_label(
+        &mut parts,
+        "response accepted",
+        evidence.expected_response_accepted,
+        evidence.response_accepted,
+    );
+    push_fixture_suite_expected_value_label(
+        &mut parts,
+        "response review",
+        evidence.expected_response_review_required,
+        evidence.response_review_required,
+    );
+    push_fixture_suite_min_label(
+        &mut parts,
+        "measured confidence",
+        evidence.expected_measured_confidence_min,
+        evidence.measured_confidence,
+    );
+    push_fixture_suite_max_label(
+        &mut parts,
+        "held-out dE00 RMS",
+        evidence.expected_held_out_delta_e00_rms_max,
+        evidence.held_out_delta_e00_rms,
+    );
+    push_fixture_suite_max_label(
+        &mut parts,
+        "held-out dE00 maximum",
+        evidence.expected_held_out_delta_e00_max,
+        evidence.held_out_delta_e00_max,
+    );
+    push_fixture_suite_min_label(
+        &mut parts,
+        "unit-slope improvement",
+        evidence.expected_held_out_improvement_over_unit_slope_min,
+        evidence.held_out_improvement_over_unit_slope,
+    );
+    push_fixture_suite_max_label(
+        &mut parts,
+        "density noise gain",
+        evidence.expected_maximum_density_noise_gain,
+        evidence.maximum_density_noise_gain,
+    );
+    push_fixture_suite_max_label(
+        &mut parts,
+        "curve extrapolation",
+        evidence.expected_curve_extrapolated_any_ratio_max,
+        evidence.curve_extrapolated_any_ratio,
+    );
+    push_fixture_suite_expected_value_label(
+        &mut parts,
+        "signed headroom",
+        evidence.expected_signed_headroom_preserved,
+        evidence.signed_headroom_preserved,
+    );
+    parts.join("; ")
 }
 
 fn fixture_suite_quality_score_label(fixture: &FixtureSuiteEntry) -> String {
@@ -10619,6 +17269,19 @@ fn fixture_suite_quality_score_label(fixture: &FixtureSuiteEntry) -> String {
 
 fn fixture_suite_tone_protection_label(fixture: &FixtureSuiteEntry) -> String {
     let mut parts = Vec::new();
+    if let Some(mode) = fixture.effective_grain_reduction.as_deref() {
+        parts.push(format!(
+            "grain config {mode}, strength {}, scale {}",
+            fixture
+                .effective_grain_strength
+                .map(|value| format!("{value:.3}"))
+                .unwrap_or_else(|| "n/a".to_string()),
+            fixture
+                .effective_grain_scale
+                .map(|value| format!("{value:.3}"))
+                .unwrap_or_else(|| "n/a".to_string())
+        ));
+    }
     push_fixture_suite_min_label(
         &mut parts,
         "highlight chroma",
@@ -10642,6 +17305,163 @@ fn fixture_suite_tone_protection_label(fixture: &FixtureSuiteEntry) -> String {
         "shadow chroma",
         fixture.expected_shadow_chroma_compressed_ratio_max,
         fixture.shadow_chroma_compressed_ratio,
+    );
+    if let Some(expected) = fixture.expected_grain_reduction_enabled {
+        parts.push(format!(
+            "grain enabled expected {expected}; actual {}",
+            fixture
+                .grain_reduction_enabled
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        ));
+    }
+    push_fixture_suite_min_label(
+        &mut parts,
+        "grain applied ratio",
+        fixture.expected_grain_reduction_applied_ratio_min,
+        fixture.grain_reduction_applied_ratio,
+    );
+    push_fixture_suite_min_label(
+        &mut parts,
+        "grain exact structure-excluded ratio",
+        fixture.expected_grain_reduction_structure_excluded_ratio_min,
+        fixture.grain_reduction_structure_excluded_ratio,
+    );
+    push_fixture_suite_min_label(
+        &mut parts,
+        "grain flat-luma reduction",
+        fixture.expected_grain_reduction_flat_luma_p95_reduction_ratio_min,
+        fixture.grain_reduction_flat_luma_p95_reduction_ratio,
+    );
+    push_fixture_suite_min_label(
+        &mut parts,
+        "grain flat-chroma reduction",
+        fixture.expected_grain_reduction_flat_chroma_p95_reduction_ratio_min,
+        fixture.grain_reduction_flat_chroma_p95_reduction_ratio,
+    );
+    if let Some(expected) = fixture.expected_grain_detail_review_required {
+        parts.push(format!(
+            "grain review expected {expected}; actual {}",
+            fixture
+                .grain_detail_review_required
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        ));
+    }
+    if let Some(expected) = fixture.expected_grain_detail_decision_supported {
+        parts.push(format!(
+            "grain detail supported expected {expected}; actual {}",
+            fixture
+                .grain_detail_decision_supported
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        ));
+    }
+    push_fixture_suite_min_label(
+        &mut parts,
+        "grain luma probes",
+        fixture
+            .expected_grain_detail_luminance_probe_count_min
+            .map(|value| value as f64),
+        fixture
+            .grain_detail_luminance_probe_count
+            .map(|value| value as f64),
+    );
+    push_fixture_suite_min_label(
+        &mut parts,
+        "grain chroma probes",
+        fixture
+            .expected_grain_detail_chroma_probe_count_min
+            .map(|value| value as f64),
+        fixture
+            .grain_detail_chroma_probe_count
+            .map(|value| value as f64),
+    );
+    push_fixture_suite_min_label(
+        &mut parts,
+        "grain luma p10",
+        fixture.expected_grain_detail_luminance_p10_retention_min,
+        fixture.grain_detail_luminance_p10_retention,
+    );
+    push_fixture_suite_min_label(
+        &mut parts,
+        "grain chroma p10",
+        fixture.expected_grain_detail_chroma_p10_retention_min,
+        fixture.grain_detail_chroma_p10_retention,
+    );
+    parts.join("; ")
+}
+
+fn fixture_suite_dynamic_range_label(fixture: &FixtureSuiteEntry) -> String {
+    let mut parts = Vec::new();
+    push_fixture_suite_min_label(
+        &mut parts,
+        "preserved",
+        fixture.expected_post_scale_preserved_ratio_min,
+        fixture.post_scale_preserved_ratio,
+    );
+    push_fixture_suite_min_label(
+        &mut parts,
+        "luma p05-p95",
+        fixture.expected_render_luminance_range_p05_p95_min,
+        fixture.render_luminance_range_p05_p95,
+    );
+    if let Some(expected) = fixture.expected_render_review_status.as_deref() {
+        parts.push(format!(
+            "render status expected {expected}; actual {}",
+            fixture.render_review_status.as_deref().unwrap_or("n/a")
+        ));
+    }
+    if let Some(expected) = fixture.expected_render_reviewable {
+        parts.push(format!(
+            "reviewable expected {expected}; actual {}",
+            fixture
+                .render_reviewable
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        ));
+    }
+    if let Some(expected) = fixture.expected_tone_output_confidence_status.as_deref() {
+        parts.push(format!(
+            "tone status expected {expected}; actual {}",
+            fixture
+                .tone_output_confidence_status
+                .as_deref()
+                .unwrap_or("n/a")
+        ));
+    }
+    if let Some(expected) = fixture.expected_tone_output_review_required {
+        parts.push(format!(
+            "tone review expected {expected}; actual {}",
+            fixture
+                .tone_output_review_required
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        ));
+    }
+    push_fixture_suite_min_label(
+        &mut parts,
+        "tone evidence",
+        fixture.expected_tone_output_evidence_confidence_min,
+        fixture.tone_output_evidence_confidence,
+    );
+    push_fixture_suite_min_label(
+        &mut parts,
+        "render:mapped",
+        fixture.expected_render_to_mapped_luminance_range_ratio_min,
+        fixture.render_to_mapped_luminance_range_ratio,
+    );
+    push_fixture_suite_max_label(
+        &mut parts,
+        "high clip",
+        fixture.expected_post_chroma_compression_clipped_high_ratio_max,
+        fixture.post_chroma_compression_clipped_high_ratio_max,
+    );
+    push_fixture_suite_max_label(
+        &mut parts,
+        "low clip",
+        fixture.expected_post_chroma_compression_clipped_low_ratio_max,
+        fixture.post_chroma_compression_clipped_low_ratio_max,
     );
     parts.join("; ")
 }
@@ -10709,6 +17529,41 @@ fn fixture_suite_candidate_label(fixture: &FixtureSuiteEntry) -> String {
     if !selection_rejections.is_empty() {
         parts.push(selection_rejections);
     }
+    match (
+        fixture.expected_neutral_safety_rescue_applied,
+        fixture.neutral_safety_rescue_applied,
+    ) {
+        (Some(expected), Some(actual)) => parts.push(format!(
+            "neutral rescue expected {expected}; actual {actual}"
+        )),
+        (Some(expected), None) => parts.push(format!(
+            "neutral rescue expected {expected}; actual missing"
+        )),
+        (None, Some(actual)) => parts.push(format!("neutral rescue {actual}")),
+        (None, None) => {}
+    }
+    push_fixture_suite_min_label(
+        &mut parts,
+        "neutral rescue preserved gain",
+        fixture.expected_neutral_safety_rescue_preserved_ratio_gain_min,
+        fixture.neutral_safety_rescue_preserved_ratio_gain,
+    );
+    push_fixture_suite_min_label(
+        &mut parts,
+        "neutral rescue saturation reduction",
+        fixture.expected_neutral_safety_rescue_midtone_saturation_p95_reduction_min,
+        fixture.neutral_safety_rescue_midtone_saturation_p95_reduction,
+    );
+    let neutral_rescue_reason = fixture_suite_contains_label(
+        "neutral rescue reason",
+        fixture
+            .expected_neutral_safety_rescue_reason_contains
+            .as_deref(),
+        fixture.neutral_safety_rescue_reason.as_deref(),
+    );
+    if !neutral_rescue_reason.is_empty() {
+        parts.push(neutral_rescue_reason);
+    }
     parts.join("; ")
 }
 
@@ -10762,6 +17617,24 @@ fn fixture_suite_required_count_label(
         return format!("{label} {}", actual.len());
     }
     String::new()
+}
+
+fn push_fixture_suite_expected_value_label<T: std::fmt::Display + Copy>(
+    parts: &mut Vec<String>,
+    label: &str,
+    expected: Option<T>,
+    actual: Option<T>,
+) {
+    match (expected, actual) {
+        (Some(expected), Some(actual)) => {
+            parts.push(format!("{label} expected {expected}; actual {actual}"));
+        }
+        (Some(expected), None) => {
+            parts.push(format!("{label} expected {expected}; actual missing"));
+        }
+        (None, Some(actual)) => parts.push(format!("{label} {actual}")),
+        (None, None) => {}
+    }
 }
 
 fn push_fixture_suite_max_label(
@@ -10925,41 +17798,50 @@ fn expected_actual_label(expected: Option<&str>, actual: Option<&str>) -> String
     }
 }
 
-fn resolve_components(
+fn resolve_inputs(
     cli: &ValidationCli,
     fixtures: &BTreeMap<String, FixtureEntry>,
-) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
-    if let (Some(component1), Some(component2)) = (&cli.component1, &cli.component2) {
-        return Ok((component1.clone(), component2.clone()));
-    }
-
-    if cli.component1.is_some() || cli.component2.is_some() {
-        return Err(
-            "both --component1 and --component2 are required when overriding fixture paths".into(),
-        );
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    match (&cli.component1, &cli.component2) {
+        (Some(component1), Some(component2)) => {
+            return Ok(vec![component1.clone(), component2.clone()]);
+        }
+        (Some(component1), None) => return Ok(vec![component1.clone()]),
+        (None, Some(_)) => return Err("--component2 requires --component1".into()),
+        (None, None) => {}
     }
 
     let Some(fixture) = fixtures.get(&cli.fixture) else {
         return Err(format!(
-            "unknown fixture `{}`; pass --component1 and --component2, use --report, or inspect --list-fixtures",
+            "unknown fixture `{}`; pass --component1 with an optional --component2, use --report, or inspect --list-fixtures",
             cli.fixture
         )
         .into());
     };
-    let component1 = fixture.component1.clone();
-    let component2 = fixture.component2.clone();
-
-    if !component1.exists() || !component2.exists() {
+    let inputs = fixture.pipeline_inputs();
+    let missing = inputs
+        .iter()
+        .enumerate()
+        .filter(|(_, path)| !path.exists())
+        .map(|(index, path)| format!("component{}={}", index + 1, path.display()))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
         return Err(format!(
-            "fixture `{}` expects {} and {}; pass --component1/--component2 or summarize an existing --report",
+            "fixture `{}` is missing {}; use a direct --component1 with an optional --component2 override, or summarize an existing --report",
             cli.fixture,
-            component1.display(),
-            component2.display()
+            missing.join(", ")
         )
         .into());
     }
 
-    Ok((component1, component2))
+    Ok(inputs)
+}
+
+fn resolve_orientation_review_inputs(
+    cli: &ValidationCli,
+    fixtures: &BTreeMap<String, FixtureEntry>,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    resolve_inputs(cli, fixtures)
 }
 
 fn print_summary_table(summary: &scanstitch::validation::ValidationSummary) {
@@ -11005,12 +17887,54 @@ fn print_summary_table(summary: &scanstitch::validation::ValidationSummary) {
     );
     print_row(
         "colorspace",
-        "calibration_status",
+        "calibration_record_status",
         summary
             .colorspace
             .calibration_status
             .as_deref()
             .unwrap_or(""),
+    );
+    let calibration_color_mapping = summary
+        .colorspace
+        .calibration_color_mapping_application
+        .as_ref();
+    print_row(
+        "colorspace",
+        "calibration_color_mapping_status",
+        calibration_color_mapping
+            .and_then(|application| application.selection_status.as_deref())
+            .unwrap_or(""),
+    );
+    print_row(
+        "colorspace",
+        "calibration_color_mapping_applied",
+        &calibration_color_mapping
+            .and_then(|application| application.applied)
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    );
+    print_row(
+        "colorspace",
+        "calibration_color_mapping_selected_candidate",
+        calibration_color_mapping
+            .and_then(|application| application.selected_candidate.as_deref())
+            .unwrap_or(""),
+    );
+    print_row(
+        "colorspace",
+        "calibration_color_mapping_preferred_candidate",
+        calibration_color_mapping
+            .and_then(|application| application.preferred_candidate.as_deref())
+            .unwrap_or(""),
+    );
+    print_row(
+        "colorspace",
+        "calibration_color_mapping_consistency_issues",
+        &if summary.diagnostic_consistency_issues.is_empty() {
+            "none".to_string()
+        } else {
+            summary.diagnostic_consistency_issues.join(",")
+        },
     );
     print_row(
         "colorspace",
@@ -11090,6 +18014,42 @@ fn print_summary_table(summary: &scanstitch::validation::ValidationSummary) {
     );
     print_row(
         "tone",
+        "tone_output_confidence_status",
+        summary
+            .tone
+            .tone_output_confidence_status
+            .as_deref()
+            .unwrap_or(""),
+    );
+    print_row(
+        "tone",
+        "tone_output_review_required",
+        &summary
+            .tone
+            .tone_output_review_required
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    );
+    print_row(
+        "tone",
+        "tone_output_evidence_confidence",
+        &summary
+            .tone
+            .tone_output_evidence_confidence
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_default(),
+    );
+    print_row(
+        "tone",
+        "render_to_mapped_range_ratio",
+        &summary
+            .tone
+            .render_to_mapped_luminance_range_ratio
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_default(),
+    );
+    print_row(
+        "tone",
         "luma_residual_p95",
         &summary
             .tone
@@ -11133,8 +18093,12 @@ fn issue_matches(issue: &str, selector: &str) -> bool {
         "colorspace-quality" | "quality" => issue.contains("colorspace_quality"),
         "calibration" => issue.contains("calibration_"),
         "gamut" => issue.contains("gamut") || issue.contains("preservation"),
-        "grain" => issue.contains("residual_p95"),
-        "tone" => issue.contains("chroma_compression"),
+        "grain" => {
+            issue.contains("residual_p95")
+                || issue.contains("grain_detail_")
+                || issue.contains("noise_reduction_")
+        }
+        "tone" => issue.contains("chroma_compression") || issue.contains("tone_output_"),
         "debug-artifact" | "debug-artifacts" => issue.contains("debug_artifact"),
         "summary-baseline" => issue.contains("summary_baseline_"),
         "fixture-coverage" => {
@@ -11148,18 +18112,306 @@ fn issue_matches(issue: &str, selector: &str) -> bool {
     }
 }
 
-fn write_text(path: &PathBuf, contents: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn write_text(path: &Path, contents: &str) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, contents)?;
+    atomic_file::write_bytes(path, contents.as_bytes())?;
     Ok(())
 }
 
-fn write_rgb_image(path: &PathBuf, image: &RgbImage) -> Result<(), Box<dyn std::error::Error>> {
+fn write_rgb_image(path: &Path, image: &RgbImage) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    image.save(path)?;
+    let format = image::ImageFormat::from_path(path)?;
+    let mut staged = atomic_file::AtomicFile::new(path)?;
+    image.write_to(staged.file_mut(), format)?;
+    staged.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        append_fixture_suite_render_review_issues, append_roll_suite_render_review_issues,
+        compare_roll_suites, final_render_is_reviewable, issue_matches,
+    };
+
+    #[test]
+    fn fixture_suite_render_review_guard_requires_explicit_diagnostic_intent() {
+        assert!(final_render_is_reviewable(Some("reviewable"), Some(true)));
+        assert!(!final_render_is_reviewable(
+            Some("review_required_color"),
+            Some(false)
+        ));
+
+        let mut issues = Vec::new();
+        append_fixture_suite_render_review_issues(
+            "healthy",
+            None,
+            false,
+            Some("reviewable"),
+            Some(true),
+            &mut issues,
+        );
+        assert!(issues.is_empty());
+
+        append_fixture_suite_render_review_issues(
+            "undeclared-diagnostic",
+            None,
+            false,
+            Some("review_required_color"),
+            Some(false),
+            &mut issues,
+        );
+        assert_eq!(
+            issues,
+            ["fixture_suite:undeclared-diagnostic:non_reviewable_render_not_explicitly_expected"]
+        );
+
+        issues.clear();
+        append_fixture_suite_render_review_issues(
+            "declared-diagnostic",
+            Some(false),
+            false,
+            Some("review_required_color"),
+            Some(false),
+            &mut issues,
+        );
+        assert!(issues.is_empty());
+
+        append_fixture_suite_render_review_issues(
+            "production-gate",
+            Some(false),
+            true,
+            Some("review_required_color"),
+            Some(false),
+            &mut issues,
+        );
+        assert_eq!(
+            issues,
+            ["fixture_suite:production-gate:require_reviewable_not_satisfied"]
+        );
+
+        issues.clear();
+        append_fixture_suite_render_review_issues(
+            "inconsistent",
+            None,
+            false,
+            Some("reviewable"),
+            Some(false),
+            &mut issues,
+        );
+        assert_eq!(
+            issues,
+            ["fixture_suite:inconsistent:render_reviewability_evidence_missing_or_inconsistent"]
+        );
+    }
+
+    #[test]
+    fn grain_and_tone_failure_selectors_include_evidence_regressions() {
+        assert!(issue_matches(
+            "grain_detail_chroma_retention_regressed",
+            "grain"
+        ));
+        assert!(issue_matches("luma_residual_p95_ratio_changed", "grain"));
+        assert!(issue_matches(
+            "roll_suite_compare:noise_reduction_enabled_count_changed",
+            "grain"
+        ));
+        assert!(!issue_matches("post_scale_preservation_regressed", "grain"));
+        assert!(issue_matches(
+            "tone_output_evidence_confidence_regressed",
+            "tone"
+        ));
+        assert!(issue_matches("tone_output_high_clipping_regressed", "tone"));
+        assert!(issue_matches(
+            "roll_suite:frame-a:tone_output_review_required",
+            "tone"
+        ));
+        assert!(issue_matches(
+            "roll_suite_compare:frame-a:tone_output_status_regressed",
+            "tone"
+        ));
+
+        let mut issues = Vec::new();
+        append_roll_suite_render_review_issues("healthy", Some(true), Some(false), &mut issues);
+        assert!(issues.is_empty());
+        append_roll_suite_render_review_issues("blocked", Some(false), Some(true), &mut issues);
+        assert_eq!(
+            issues,
+            [
+                "roll_suite:blocked:render_review_not_supported",
+                "roll_suite:blocked:tone_output_review_required",
+            ]
+        );
+        issues.clear();
+        append_roll_suite_render_review_issues("missing", None, None, &mut issues);
+        assert_eq!(
+            issues,
+            [
+                "roll_suite:missing:render_review_evidence_missing",
+                "roll_suite:missing:tone_output_evidence_missing",
+            ]
+        );
+    }
+
+    #[test]
+    fn roll_suite_comparison_flags_grain_and_tone_regressions_without_penalizing_legacy_absence() {
+        let baseline = serde_json::json!({
+            "frame_count": 2,
+            "review_required_count": 0,
+            "failed_count": 0,
+            "quality": {
+                "noise_reduction_enabled_count": 2,
+                "grain_detail_evaluated_count": 2,
+                "grain_detail_decision_supported_count": 2,
+                "grain_detail_review_required_count": 0,
+                "grain_detail_luminance_supported_count": 2,
+                "grain_detail_chroma_supported_count": 2,
+                "grain_detail_luminance_p10_retention_mean": 0.96,
+                "grain_detail_luminance_p10_retention_min": 0.94,
+                "grain_detail_chroma_p10_retention_mean": 0.95,
+                "grain_detail_chroma_p10_retention_min": 0.93
+            },
+            "frames": [
+                {
+                    "name": "frame-a.tif",
+                    "status": "passed",
+                    "render_review_status": "reviewable",
+                    "render_reviewable": true,
+                    "tone_output_confidence_status": "supported_render_tonal_distribution",
+                    "tone_output_review_required": false,
+                    "tone_output_evidence_confidence": 1.0,
+                    "render_to_mapped_luminance_range_ratio": 1.0,
+                    "maximum_post_tone_high_clip_ratio": 0.001,
+                    "maximum_post_tone_low_clip_ratio": 0.001,
+                    "candidate_risk": "safe",
+                    "grain_detail_review_required": false,
+                    "grain_detail_decision_supported": true,
+                    "grain_detail_luminance_supported": true,
+                    "grain_detail_chroma_supported": true,
+                    "grain_detail_luminance_p10_retention": 0.96,
+                    "grain_detail_chroma_p10_retention": 0.95
+                },
+                {
+                    "name": "frame-b.tif",
+                    "status": "passed",
+                    "candidate_risk": "safe",
+                    "grain_detail_review_required": false,
+                    "grain_detail_decision_supported": true,
+                    "grain_detail_luminance_supported": true,
+                    "grain_detail_chroma_supported": true,
+                    "grain_detail_luminance_p10_retention": 0.94,
+                    "grain_detail_chroma_p10_retention": 0.93
+                }
+            ]
+        });
+        let current = serde_json::json!({
+            "frame_count": 2,
+            "review_required_count": 1,
+            "failed_count": 0,
+            "quality": {
+                "noise_reduction_enabled_count": 2,
+                "grain_detail_evaluated_count": 2,
+                "grain_detail_decision_supported_count": 1,
+                "grain_detail_review_required_count": 1,
+                "grain_detail_luminance_supported_count": 1,
+                "grain_detail_chroma_supported_count": 1,
+                "grain_detail_luminance_p10_retention_mean": 0.70,
+                "grain_detail_luminance_p10_retention_min": 0.68,
+                "grain_detail_chroma_p10_retention_mean": 0.72,
+                "grain_detail_chroma_p10_retention_min": 0.69
+            },
+            "frames": [
+                {
+                    "name": "frame-a.tif",
+                    "status": "review_required",
+                    "render_review_status": "review_required_tone_output",
+                    "render_reviewable": false,
+                    "tone_output_confidence_status": "review_required_collapsed_render_luminance_range",
+                    "tone_output_review_required": true,
+                    "tone_output_evidence_confidence": 0.0,
+                    "render_to_mapped_luminance_range_ratio": 0.02,
+                    "maximum_post_tone_high_clip_ratio": 0.70,
+                    "maximum_post_tone_low_clip_ratio": 0.60,
+                    "candidate_risk": "safe",
+                    "grain_detail_review_required": true,
+                    "grain_detail_decision_supported": true,
+                    "grain_detail_luminance_supported": true,
+                    "grain_detail_chroma_supported": true,
+                    "grain_detail_luminance_p10_retention": 0.70,
+                    "grain_detail_chroma_p10_retention": 0.72
+                },
+                {
+                    "name": "frame-b.tif",
+                    "status": "passed",
+                    "candidate_risk": "safe",
+                    "grain_detail_review_required": false,
+                    "grain_detail_decision_supported": false,
+                    "grain_detail_luminance_supported": false,
+                    "grain_detail_chroma_supported": false
+                }
+            ]
+        });
+
+        let comparison = compare_roll_suites("baseline.json".to_string(), &baseline, &current);
+        assert_eq!(comparison.status, "review_required");
+        for expected in [
+            "roll_suite_compare:grain_detail_review_required_count_increased",
+            "roll_suite_compare:grain_detail_decision_supported_count_dropped",
+            "roll_suite_compare:grain_detail_luminance_supported_count_dropped",
+            "roll_suite_compare:grain_detail_chroma_supported_count_dropped",
+            "roll_suite_compare:grain_detail_luminance_p10_mean_dropped",
+            "roll_suite_compare:grain_detail_chroma_p10_min_dropped",
+            "roll_suite_compare:frame-a:render_reviewability_lost",
+            "roll_suite_compare:frame-a:tone_output_status_regressed",
+            "roll_suite_compare:frame-a:tone_output_review_newly_required",
+            "roll_suite_compare:frame-a:tone_output_evidence_confidence_dropped",
+            "roll_suite_compare:frame-a:tone_output_range_retention_dropped",
+            "roll_suite_compare:frame-a:tone_output_high_clipping_increased",
+            "roll_suite_compare:frame-a:tone_output_low_clipping_increased",
+            "roll_suite_compare:frame-a:grain_detail_review_newly_required",
+            "roll_suite_compare:frame-a:grain_detail_luminance_p10_dropped",
+            "roll_suite_compare:frame-a:grain_detail_chroma_p10_dropped",
+            "roll_suite_compare:frame-b:grain_detail_decision_support_lost",
+            "roll_suite_compare:frame-b:grain_detail_luminance_support_lost",
+            "roll_suite_compare:frame-b:grain_detail_chroma_support_lost",
+        ] {
+            assert!(
+                comparison.issues.iter().any(|issue| issue == expected),
+                "missing {expected}: {:?}",
+                comparison.issues
+            );
+        }
+        let frame_a = comparison
+            .frames
+            .iter()
+            .find(|frame| frame.name == "frame-a.tif")
+            .expect("frame-a comparison");
+        assert!(frame_a.render_review_status_changed);
+        assert!(frame_a.render_reviewable_changed);
+        assert!(frame_a.tone_output_confidence_status_changed);
+        assert!(frame_a.tone_output_review_required_changed);
+        assert_eq!(frame_a.tone_output_evidence_confidence_delta, Some(-1.0));
+        assert_eq!(
+            frame_a.tone_output_render_to_mapped_luminance_range_ratio_delta,
+            Some(-0.98)
+        );
+
+        let legacy = serde_json::json!({
+            "frame_count": 2,
+            "review_required_count": 1,
+            "failed_count": 0,
+            "quality": {},
+            "frames": [
+                {"name": "frame-a.tif", "status": "review_required", "candidate_risk": "safe"},
+                {"name": "frame-b.tif", "status": "passed", "candidate_risk": "safe"}
+            ]
+        });
+        let legacy_comparison = compare_roll_suites("legacy.json".to_string(), &legacy, &current);
+        assert_eq!(legacy_comparison.status, "comparable");
+        assert!(legacy_comparison.issues.is_empty());
+    }
 }

@@ -48,6 +48,8 @@
         "scene_tags": { "$ref": "#/$defs/tagList" },
         "exposure_tags": { "$ref": "#/$defs/tagList" },
         "reference_evidence": { "$ref": "#/$defs/tagList" },
+        "render_review": { "$ref": "#/$defs/pathString" },
+        "render_review_sha256": { "$ref": "#/$defs/sha256Hex" },
         "calibration_case": { "$ref": "#/$defs/nonEmptyString" },
         "expectations": {
           "$ref": "https://example.invalid/scanstitch/validation-fixtures.schema.json#/$defs/fixtureExpectations"
@@ -63,6 +65,10 @@
         {
           "if": { "required": ["summary_baseline_sha256"] },
           "then": { "required": ["summary_baseline"] }
+        },
+        {
+          "if": { "required": ["render_review_sha256"] },
+          "then": { "required": ["render_review"] }
         },
         {
           "if": { "required": ["calibration_profile_sha256"] },

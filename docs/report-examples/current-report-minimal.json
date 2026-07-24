@@ -1,12 +1,16 @@
 {
   "metadata": {
-    "report_schema_version": 2,
+    "report_schema_version": 4,
     "pipeline_schema_version": 1,
     "generated_at": "2026-05-02T00:14:20Z",
     "generated_at_unix_ms": 1777680860621,
     "package_name": "scanstitch",
     "package_version": "0.1.0",
     "binary_name": "scanstitch",
+    "binary_path": "V:\\PERSONAL\\PHOTOGRAPHY\\SCANSTITCH\\scanstitch.exe",
+    "binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "binary_file_size_bytes": 1,
+    "binary_identity_status": "verified_sha256",
     "working_directory": "V:\\PERSONAL\\PHOTOGRAPHY\\SCANSTITCH",
     "cli_args": ["scanstitch", "LOGAN043.tif", "LOGAN044.tif", "-o", "output/fresh"],
     "output_dir": "V:\\PERSONAL\\PHOTOGRAPHY\\SCANSTITCH\\output\\fresh",
@@ -42,6 +46,39 @@
         "output_width": 5959,
         "output_height": 3670,
         "output_modified_at": "2026-05-02T00:14:57Z",
+        "output_file_size_bytes": 100,
+        "output_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "artifact_sha256_policy": {
+          "algorithm": "sha256",
+          "source": "reopened_saved_file_bytes",
+          "buffer_bytes": 1048576,
+          "overlaps_artifact_conversion_buffers": false,
+          "peak_sequential_delivery_buffer_bytes": 1048576,
+          "required_for_reviewable_delivery": true
+        },
+        "artifact_commit_policy": {
+          "strategy": "same_directory_temporary_file_atomic_replace",
+          "same_directory_staging": true,
+          "per_file_atomic_replace": true,
+          "cross_artifact_transaction": false,
+          "destination_visible_only_after_successful_encode": true,
+          "failed_encode_preserves_existing_destination": true,
+          "file_contents_fsync_before_commit": false,
+          "directory_fsync_after_commit": false,
+          "temporary_disk_overhead": "up_to_new_artifact_size_per_sequential_write",
+          "applies_to": [
+            "primary_tiff",
+            "requested_scene_master",
+            "requested_srgb_proof",
+            "report_json"
+          ]
+        },
+        "master_scene_referred_requested": false,
+        "master_scene_referred_path": null,
+        "master_scene_referred_sha256": null,
+        "review_srgb_requested": false,
+        "review_srgb_path": null,
+        "review_srgb_sha256": null,
         "overwrote_existing_output": false,
         "stale_render_artifact_count": 0,
         "stale_render_artifacts": []

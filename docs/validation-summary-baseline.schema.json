@@ -43,6 +43,21 @@
     "nullableBoolean": {
       "type": ["boolean", "null"]
     },
+    "toneOutputStatus": {
+      "anyOf": [
+        {
+          "enum": [
+            "supported_render_tonal_distribution",
+            "review_required_invalid_render_tone_diagnostics",
+            "review_required_catastrophic_post_tone_clipping",
+            "review_required_insufficient_scene_tonal_range",
+            "review_required_collapsed_fitted_tone_range",
+            "review_required_collapsed_render_luminance_range"
+          ]
+        },
+        { "type": "null" }
+      ]
+    },
     "stringList": {
       "type": "array",
       "uniqueItems": true,
@@ -72,7 +87,19 @@
         "decision": { "$ref": "#/$defs/nonEmptyString" },
         "confidence": { "$ref": "#/$defs/nullableNumber" },
         "chosen_hypothesis": { "$ref": "#/$defs/nullableString" },
-        "seam_exposure_correction_applied": { "$ref": "#/$defs/nullableBoolean" }
+        "seam_exposure_correction_applied": { "$ref": "#/$defs/nullableBoolean" },
+        "seam_exposure_model": { "$ref": "#/$defs/nullableString" },
+        "seam_exposure_spatial_2d_gain_accepted": { "$ref": "#/$defs/nullableBoolean" },
+        "seam_exposure_spatial_2d_gain_offset_accepted": { "$ref": "#/$defs/nullableBoolean" },
+        "seam_exposure_spatial_quadratic_gain_accepted": { "$ref": "#/$defs/nullableBoolean" },
+        "seam_exposure_spatial_quadratic_gain_offset_accepted": { "$ref": "#/$defs/nullableBoolean" },
+        "seam_blend_mode": { "$ref": "#/$defs/nullableString" },
+        "seam_blend_applied": { "$ref": "#/$defs/nullableBoolean" },
+        "seam_blend_review_required": { "$ref": "#/$defs/nullableBoolean" },
+        "seam_detail_review_required": { "$ref": "#/$defs/nullableBoolean" },
+        "seam_detail_max_symmetric_energy_ratio": { "$ref": "#/$defs/nullableNonNegativeNumber" },
+        "seam_gradient_ratio": { "$ref": "#/$defs/nullableNonNegativeNumber" },
+        "seam_overlap_p95_abs_difference": { "$ref": "#/$defs/nullableNonNegativeNumber" }
       }
     },
     "renderBaseline": {
@@ -96,7 +123,9 @@
         "raw_base_proxy_confidence": { "$ref": "#/$defs/nullableNonNegativeNumber" },
         "raw_base_support_fraction": { "$ref": "#/$defs/nullableNonNegativeNumber" },
         "render_input_source": { "$ref": "#/$defs/nonEmptyString" },
-        "colorspace_mapping_strategy": { "$ref": "#/$defs/nonEmptyString" }
+        "colorspace_mapping_strategy": { "$ref": "#/$defs/nonEmptyString" },
+        "render_review_status": { "$ref": "#/$defs/nullableString" },
+        "render_reviewable": { "$ref": "#/$defs/nullableBoolean" }
       }
     },
     "colorspaceBaseline": {
@@ -106,6 +135,7 @@
         "calibration_status",
         "selected_candidate",
         "calibration_acceptance_status",
+        "calibration_color_mapping_applied",
         "candidate_risk",
         "tone_color_trust_state",
         "selected_quality_score",
@@ -136,6 +166,7 @@
         "selected_candidate": { "$ref": "#/$defs/nonEmptyString" },
         "selected_candidate_rank": { "$ref": "#/$defs/nullableNonNegativeInteger" },
         "calibration_acceptance_status": { "$ref": "#/$defs/nonEmptyString" },
+        "calibration_color_mapping_applied": { "type": "boolean" },
         "calibration_acceptance_preferred_candidate": { "$ref": "#/$defs/nullableString" },
         "calibration_acceptance_beats_image_derived": { "$ref": "#/$defs/nullableBoolean" },
         "candidate_risk": { "$ref": "#/$defs/nonEmptyString" },
@@ -214,7 +245,69 @@
       "properties": {
         "highlight_chroma_compressed_ratio": { "type": "number", "minimum": 0 },
         "highlight_neutral_chroma_compressed_ratio": { "$ref": "#/$defs/nullableNonNegativeNumber" },
-        "shadow_chroma_compressed_ratio": { "$ref": "#/$defs/nullableNonNegativeNumber" }
+        "shadow_chroma_compressed_ratio": { "$ref": "#/$defs/nullableNonNegativeNumber" },
+        "tone_output_confidence_status": { "$ref": "#/$defs/toneOutputStatus" },
+        "tone_output_review_required": { "$ref": "#/$defs/nullableBoolean" },
+        "tone_output_evidence_confidence": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "render_luminance_range_p05_p95": { "$ref": "#/$defs/nullableNonNegativeNumber" },
+        "render_to_mapped_luminance_range_ratio": { "$ref": "#/$defs/nullableNonNegativeNumber" },
+        "maximum_post_tone_high_clip_ratio": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "maximum_post_tone_low_clip_ratio": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "adaptive_vibrance_skin_memory_protection_enabled": { "$ref": "#/$defs/nullableBoolean" },
+        "adaptive_vibrance_skin_memory_protection_space": { "$ref": "#/$defs/nullableString" },
+        "adaptive_vibrance_skin_memory_protected_ratio": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "adaptive_vibrance_skin_memory_mean_protection": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "adaptive_vibrance_preferred_memory_color_guard_enabled": { "$ref": "#/$defs/nullableBoolean" },
+        "adaptive_vibrance_preferred_memory_color_guard_space": { "$ref": "#/$defs/nullableString" },
+        "adaptive_vibrance_preferred_memory_color_guard_reference": { "$ref": "#/$defs/nullableString" },
+        "adaptive_vibrance_preferred_memory_color_matched_ratio": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "adaptive_vibrance_preferred_memory_color_limited_ratio": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "adaptive_vibrance_preferred_memory_color_mean_scale_reduction": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "preferred_skin_rendering_enabled": { "$ref": "#/$defs/nullableBoolean" },
+        "preferred_skin_rendering_space": { "$ref": "#/$defs/nullableString" },
+        "preferred_skin_rendering_preference_reference": { "$ref": "#/$defs/nullableString" },
+        "preferred_skin_rendering_adjusted_ratio": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "preferred_skin_rendering_mean_delta_e_ab": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 3
+        }
       }
     },
     "grainBaseline": {
@@ -223,7 +316,11 @@
       "properties": {
         "luma_residual_p95": { "$ref": "#/$defs/nullableNonNegativeNumber" },
         "chroma_residual_p95": { "$ref": "#/$defs/nullableNonNegativeNumber" },
-        "chroma_to_luma_p95_ratio": { "$ref": "#/$defs/nullableNonNegativeNumber" }
+        "chroma_to_luma_p95_ratio": { "$ref": "#/$defs/nullableNonNegativeNumber" },
+        "detail_review_required": { "$ref": "#/$defs/nullableBoolean" },
+        "detail_decision_supported": { "$ref": "#/$defs/nullableBoolean" },
+        "luminance_p10_retention": { "$ref": "#/$defs/nullableNonNegativeNumber" },
+        "chroma_p10_retention": { "$ref": "#/$defs/nullableNonNegativeNumber" }
       }
     }
   }

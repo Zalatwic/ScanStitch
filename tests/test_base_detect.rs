@@ -112,6 +112,69 @@ fn test_dark_horizontal_scanner_gap_is_not_treated_as_film_base() {
 }
 
 #[test]
+fn test_measures_orange_rebate_inside_removed_scanner_band() {
+    let mut img = synthetic::constant_image(120, 240, [5200, 4100, 3400]);
+    for y in 0..10 {
+        for x in 0..240 {
+            for c in 0..3 {
+                img[[y, x, c]] = 120;
+            }
+        }
+    }
+    for y in 10..14 {
+        for x in 0..240 {
+            img[[y, x, 0]] = 12_000;
+            img[[y, x, 1]] = 7000;
+            img[[y, x, 2]] = 3000;
+        }
+    }
+
+    let detection = scanstitch::base_detect::detect_film_base_in_removed_bands(&img, 14, 0, 0, 0)
+        .expect("orange rebate in removed top band");
+
+    assert_eq!(detection.base_color_source, "removed_border_rebate_band");
+    assert!(detection.top_confidence >= 0.70);
+    assert!((detection.base_color[0] - 12_000.0).abs() < 1.0);
+    assert!((detection.base_color[1] - 7000.0).abs() < 1.0);
+    assert!((detection.base_color[2] - 3000.0).abs() < 1.0);
+}
+
+#[test]
+fn test_removed_neutral_scanner_board_does_not_masquerade_as_orange_base() {
+    let mut img = synthetic::constant_image(120, 240, [5200, 4100, 3400]);
+    for y in 0..14 {
+        for x in 0..240 {
+            for c in 0..3 {
+                img[[y, x, c]] = 60_000;
+            }
+        }
+    }
+
+    assert!(
+        scanstitch::base_detect::detect_film_base_in_removed_bands(&img, 14, 0, 0, 0).is_none(),
+        "neutral scanner board must not be accepted as orange film base"
+    );
+}
+
+#[test]
+fn test_removed_dark_reddish_scanner_band_is_rejected_against_frame_envelope() {
+    let mut img = synthetic::constant_image(120, 240, [12_000, 7000, 4000]);
+    for y in 0..14 {
+        for x in 0..240 {
+            img[[y, x, 0]] = 1100;
+            img[[y, x, 1]] = 700;
+            img[[y, x, 2]] = 380;
+        }
+    }
+
+    assert!(
+        scanstitch::base_detect::detect_film_base_in_removed_bands(&img, 14, 0, 0, 0)
+            .is_none(),
+        "a dark reddish scanner strip must be rejected when the frame contains a much higher-transmittance envelope"
+    );
+}
+
+#[test]
 fn test_dark_horizontal_gap_below_high_transmittance_envelope_is_not_base() {
     let mut img = synthetic::constant_image(500, 1000, [1200, 1000, 800]);
     for y in 0..30 {
@@ -413,4 +476,101 @@ fn test_reconcile_stitched_base_keeps_working_edges_when_consistent_with_compone
         "expected a no-override diagnostic reason, got: {}",
         reconciled.reason
     );
+}
+
+fn sampled_band_median_mad(
+    image: &ndarray::Array3<u16>,
+    x_start: usize,
+    x_end: usize,
+) -> ([f64; 3], [f64; 3]) {
+    let (height, width, _) = image.dim();
+    let x_start = x_start.min(width);
+    let x_end = x_end.min(width).max(x_start + 1);
+    let mut channels: [Vec<u16>; 3] = std::array::from_fn(|_| Vec::new());
+    for y in (0..height).step_by(8) {
+        for x in x_start..x_end {
+            for channel in 0..3 {
+                channels[channel].push(image[[y, x, channel]]);
+            }
+        }
+    }
+    let median = std::array::from_fn(|channel| {
+        channels[channel].sort_unstable();
+        channels[channel][channels[channel].len() / 2] as f64
+    });
+    let mad = std::array::from_fn(|channel| {
+        let mut deviations = channels[channel]
+            .iter()
+            .map(|value| (*value as f64 - median[channel]).abs() as u16)
+            .collect::<Vec<_>>();
+        deviations.sort_unstable();
+        deviations[deviations.len() / 2] as f64
+    });
+    (median, mad)
+}
+
+#[test]
+#[ignore = "requires the local OLD_TESTROLL DNG corpus"]
+fn test_real_testroll_curved_rebate_diagnostics() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("OLD_TESTROLL")
+        .join("RAW_0000.dng");
+    if !path.exists() {
+        eprintln!("local OLD_TESTROLL fixture is absent; diagnostic skipped");
+        return;
+    }
+    let loaded = scanstitch::tiff_io::load_tiff_u16(&path, 16).unwrap();
+    let deskew = scanstitch::deskew::auto_deskew(
+        loaded.image,
+        u16::MAX as f64,
+        &scanstitch::deskew::DeskewConfig::default(),
+    );
+    assert_eq!(deskew.diagnostics.status, "already_aligned");
+    assert!(!deskew.diagnostics.applied);
+    assert!(!deskew.diagnostics.review_required);
+    assert_eq!(deskew.diagnostics.horizontal_side_count, 2);
+    assert_eq!(deskew.diagnostics.retained_area_ratio, 1.0);
+    assert!(deskew
+        .diagnostics
+        .detected_source_skew_degrees
+        .is_some_and(|angle| angle.abs() < 0.08));
+    let border = scanstitch::border::remove_borders_with_diagnostics(&deskew.image, 2);
+    let image = border.cropped;
+    let (_, width, _) = image.dim();
+    let detection = scanstitch::base_detect::detect_film_base(&image);
+    assert_eq!(border.diagnostics.top_removed, 111);
+    assert_eq!(border.diagnostics.bottom_removed, 129);
+    assert_eq!(border.diagnostics.left_removed, 34);
+    assert_eq!(border.diagnostics.right_removed, 0);
+    assert_eq!(detection.base_color_source, "high_transmittance_fallback");
+    assert_eq!(
+        scanstitch::base_detect::base_detection_confidence(&detection),
+        0.0,
+        "the scene-derived fallback must not be promoted to measured film-base evidence"
+    );
+    assert!(detection
+        .base_color_proxy_confidence
+        .is_some_and(|confidence| confidence <= 0.01));
+    assert!(detection
+        .base_color_support_fraction
+        .is_some_and(|support| support < 0.001));
+    assert!(detection.base_color_reason.contains("low proxy confidence"));
+    eprintln!(
+        "border={:?} detection confidence L/R/T/B={:.3}/{:.3}/{:.3}/{:.3}, base={:?}, reason={}",
+        border.diagnostics,
+        detection.left_confidence,
+        detection.right_confidence,
+        detection.top_confidence,
+        detection.bottom_confidence,
+        detection.base_color,
+        detection.base_color_reason,
+    );
+    for band_width in [8usize, 16, 32, 64, 96, 128, 192, 256, 298, 384] {
+        let left = sampled_band_median_mad(&image, 0, band_width);
+        let right = sampled_band_median_mad(&image, width - band_width, width);
+        eprintln!(
+            "band={band_width:>3}: left median={:?} mad={:?}; right median={:?} mad={:?}",
+            left.0, left.1, right.0, right.1
+        );
+    }
 }

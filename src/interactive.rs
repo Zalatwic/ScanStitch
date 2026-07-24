@@ -1,9 +1,11 @@
+use crate::atomic_file;
 use crate::cli::{Cli, RenderIntent};
 use crate::report::PipelineReport;
 use crate::tonemap::{
-    self, RenderStyle, ToneColorProtection, ToneCurveDiagnostics, ToneCurveParams,
-    TonemapApplyResult,
+    self, GrainReductionSettings, RenderStyle, ToneColorProtection, ToneCurveDiagnostics,
+    ToneCurveParams, TonemapApplyResult,
 };
+use crate::white_balance;
 use ndarray::Array3;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -12,23 +14,46 @@ use std::time::SystemTime;
 
 pub const REVIEW_SIDECAR_SCHEMA_VERSION: u32 = 1;
 
+fn default_grain_reduction_strength() -> f64 {
+    0.5
+}
+
+fn default_grain_reduction_scale() -> f64 {
+    1.0
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct InteractiveRenderControls {
     pub exposure_ev: f64,
+    #[serde(default)]
+    pub creative_temperature: f64,
+    #[serde(default)]
+    pub creative_tint: f64,
     pub midpoint: f64,
     pub slope: f64,
     pub toe_lift: f64,
     pub shoulder_max: f64,
+    #[serde(default)]
+    pub grain_reduction_enabled: bool,
+    #[serde(default = "default_grain_reduction_strength")]
+    pub grain_reduction_strength: f64,
+    #[serde(default = "default_grain_reduction_scale")]
+    pub grain_reduction_scale: f64,
 }
 
 impl InteractiveRenderControls {
     pub fn from_tone_params(params: &ToneCurveParams) -> Self {
         Self {
             exposure_ev: 0.0,
+            creative_temperature: 0.0,
+            creative_tint: 0.0,
             midpoint: params.midpoint,
             slope: params.slope,
             toe_lift: params.toe_lift,
             shoulder_max: params.shoulder_max,
+            grain_reduction_enabled: false,
+            grain_reduction_strength: default_grain_reduction_strength(),
+            grain_reduction_scale: default_grain_reduction_scale(),
         }
     }
 
@@ -40,6 +65,15 @@ impl InteractiveRenderControls {
             toe_lift: self.toe_lift.clamp(0.0, 0.25),
             shoulder_max: self.shoulder_max.clamp(0.5, 1.0),
         }
+    }
+
+    pub fn grain_reduction_settings(self) -> GrainReductionSettings {
+        GrainReductionSettings {
+            enabled: self.grain_reduction_enabled,
+            strength: self.grain_reduction_strength,
+            scale: self.grain_reduction_scale,
+        }
+        .normalized()
     }
 }
 
@@ -91,12 +125,25 @@ pub struct InteractiveRenderCache {
     pub output_path: PathBuf,
     pub run_started_at: SystemTime,
     pub base_confidence: f64,
+    pub geometry_review_required: bool,
+    pub geometry_review_reason: String,
+    pub input_mode_review_required: bool,
+    pub input_mode_review_reason: String,
+    pub negative_response_review_required: bool,
+    pub negative_response_review_reason: String,
+    pub technical_white_balance_review_required: bool,
+    pub technical_white_balance_review_reason: String,
 }
 
 impl InteractiveRenderCache {
     pub fn default_controls(&self) -> InteractiveRenderControls {
         let mut controls = InteractiveRenderControls::from_tone_params(&self.auto_tone_params);
         controls.exposure_ev = self.auto_exposure_ev;
+        controls.creative_temperature = self.cli.white_balance.creative_temperature;
+        controls.creative_tint = self.cli.white_balance.creative_tint;
+        controls.grain_reduction_enabled = self.cli.grain.grain_reduction.enabled();
+        controls.grain_reduction_strength = self.cli.grain.grain_strength;
+        controls.grain_reduction_scale = self.cli.grain.grain_scale;
         controls
     }
 }
@@ -170,11 +217,16 @@ pub fn controls_with_review_sidecar(
         return default_controls;
     };
     controls.exposure_ev = controls.exposure_ev.clamp(-4.0, 4.0);
+    controls.creative_temperature = controls.creative_temperature.clamp(-1.0, 1.0);
+    controls.creative_tint = controls.creative_tint.clamp(-1.0, 1.0);
     let tone = controls.to_tone_params(auto_params);
     controls.midpoint = tone.midpoint;
     controls.slope = tone.slope;
     controls.toe_lift = tone.toe_lift;
     controls.shoulder_max = tone.shoulder_max;
+    let grain = controls.grain_reduction_settings();
+    controls.grain_reduction_strength = grain.strength;
+    controls.grain_reduction_scale = grain.scale;
     controls
 }
 
@@ -197,11 +249,13 @@ pub fn write_review_sidecar(
         decisions: Some(serde_json::json!({
             "tone_domain": cache.auto_tone_params.domain.as_str(),
             "source": "interactive_controls",
-            "non_destructive": true
+            "non_destructive": true,
+            "grain_reduction_independent_of_render_intent": true
+            ,"creative_white_balance_separate_from_technical_master": true
         })),
     };
     let json = serde_json::to_string_pretty(&sidecar)?;
-    std::fs::write(path, json)?;
+    atomic_file::write_bytes(path, json.as_bytes())?;
     Ok(sidecar)
 }
 
@@ -221,22 +275,67 @@ pub fn render_interactive_image(
 ) -> TonemapApplyResult {
     let tone_params = controls.to_tone_params(&cache.auto_tone_params);
     let render_style = render_style_from_intent(cache.cli.render_intent);
+    let creative = (controls.creative_temperature.abs() > f64::EPSILON
+        || controls.creative_tint.abs() > f64::EPSILON)
+        .then(|| {
+            white_balance::apply_creative_white_balance(
+                &cache.prophoto,
+                controls.creative_temperature,
+                controls.creative_tint,
+            )
+        });
+    let creative_source = creative
+        .as_ref()
+        .map(|result| &result.image)
+        .unwrap_or(&cache.prophoto);
     if controls.exposure_ev.abs() <= f64::EPSILON {
-        return tonemap::apply_tonemap_with_params_color_protection_and_style_diagnostics(
-            &cache.prophoto,
+        return tonemap::apply_tonemap_with_params_color_protection_style_and_grain_diagnostics(
+            creative_source,
             &tone_params,
             &cache.tone_color_protection,
             render_style,
+            controls.grain_reduction_settings(),
         );
     }
 
     let exposure_scale = 2.0f64.powf(controls.exposure_ev);
-    let exposed = cache.prophoto.mapv(|v| (v * exposure_scale).max(0.0));
-    tonemap::apply_tonemap_with_params_color_protection_and_style_diagnostics(
+    let exposed = creative_source.mapv(|v| (v * exposure_scale).max(0.0));
+    tonemap::apply_tonemap_with_params_color_protection_style_and_grain_diagnostics(
         &exposed,
         &tone_params,
         &cache.tone_color_protection,
         render_style,
+        controls.grain_reduction_settings(),
+    )
+}
+
+pub fn render_owned_batch_image(
+    cache: &InteractiveRenderCache,
+    mut image: Array3<f64>,
+    controls: &InteractiveRenderControls,
+) -> TonemapApplyResult {
+    let tone_params = controls.to_tone_params(&cache.auto_tone_params);
+    let render_style = render_style_from_intent(cache.cli.render_intent);
+    if controls.creative_temperature.abs() > f64::EPSILON
+        || controls.creative_tint.abs() > f64::EPSILON
+    {
+        image = white_balance::apply_creative_white_balance_owned(
+            image,
+            controls.creative_temperature,
+            controls.creative_tint,
+        )
+        .image;
+    }
+    if controls.exposure_ev.abs() > f64::EPSILON {
+        let exposure_scale = 2.0f64.powf(controls.exposure_ev);
+        image.mapv_inplace(|value| (value * exposure_scale).max(0.0));
+    }
+    tonemap::apply_tonemap_owned_with_params_color_protection_style_and_grain_diagnostics(
+        image,
+        &tone_params,
+        &cache.tone_color_protection,
+        render_style,
+        controls.grain_reduction_settings(),
     )
 }
 
@@ -254,16 +353,30 @@ pub fn render_preview_frame(
     };
     let tone_params = controls.to_tone_params(&cache.auto_tone_params);
     let exposure_scale = 2.0f64.powf(controls.exposure_ev);
+    let creative = (controls.creative_temperature.abs() > f64::EPSILON
+        || controls.creative_tint.abs() > f64::EPSILON)
+        .then(|| {
+            white_balance::apply_creative_white_balance(
+                &source,
+                controls.creative_temperature,
+                controls.creative_tint,
+            )
+        });
+    let creative_source = creative
+        .as_ref()
+        .map(|result| &result.image)
+        .unwrap_or(&source);
     let exposed = if controls.exposure_ev.abs() <= f64::EPSILON {
-        source
+        creative_source.clone()
     } else {
-        source.mapv(|v| (v * exposure_scale).max(0.0))
+        creative_source.mapv(|v| (v * exposure_scale).max(0.0))
     };
-    let rendered = tonemap::apply_tonemap_with_params_color_protection_and_style_diagnostics(
+    let rendered = tonemap::apply_tonemap_with_params_color_protection_style_and_grain_diagnostics(
         &exposed,
         &tone_params,
         &cache.tone_color_protection,
         render_style_from_intent(cache.cli.render_intent),
+        controls.grain_reduction_settings(),
     )
     .image;
     let (height, width, _) = rendered.dim();

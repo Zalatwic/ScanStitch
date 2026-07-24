@@ -49,6 +49,8 @@
         "min_fixtures": { "type": "integer", "minimum": 0 },
         "min_component_pairs": { "type": "integer", "minimum": 0 },
         "min_component_sha256_pairs": { "type": "integer", "minimum": 0 },
+        "min_n_component_fixtures": { "type": "integer", "minimum": 0 },
+        "min_component_sha256_sets": { "type": "integer", "minimum": 0 },
         "min_readable_tiff_pairs": { "type": "integer", "minimum": 0 },
         "min_tiff_layout_consistent_pairs": { "type": "integer", "minimum": 0 },
         "min_tiff_dimension_matched_pairs": { "type": "integer", "minimum": 0 },
@@ -70,7 +72,17 @@
         "min_reference_evidence_types": { "type": "integer", "minimum": 0 },
         "min_reference_patch_fixtures": { "type": "integer", "minimum": 0 },
         "min_reference_patch_count": { "type": "integer", "minimum": 0 },
+        "min_approved_render_review_fixtures": { "type": "integer", "minimum": 0 },
         "min_debug_artifact_expectation_fixtures": { "type": "integer", "minimum": 0 },
+        "min_render_dynamic_range_contract_fixtures": { "type": "integer", "minimum": 0 },
+        "min_stitch_normalization_contract_fixtures": { "type": "integer", "minimum": 0 },
+        "min_geometry_preparation_contract_fixtures": { "type": "integer", "minimum": 0 },
+        "min_geometry_accuracy_contract_fixtures": { "type": "integer", "minimum": 0 },
+        "min_orientation_accuracy_contract_fixtures": { "type": "integer", "minimum": 0 },
+        "min_negative_reconstruction_contract_fixtures": { "type": "integer", "minimum": 0 },
+        "min_grain_reduction_enabled_fixtures": { "type": "integer", "minimum": 0 },
+        "min_grain_detail_contract_fixtures": { "type": "integer", "minimum": 0 },
+        "min_grain_reduction_effect_contract_fixtures": { "type": "integer", "minimum": 0 },
         "required_film_stocks": { "$ref": "#/$defs/tagList" },
         "required_scene_tags": { "$ref": "#/$defs/tagList" },
         "required_exposure_tags": { "$ref": "#/$defs/tagList" },
@@ -101,15 +113,37 @@
     "fixtureEntry": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["component1", "component2"],
+      "required": ["component1"],
       "properties": {
         "component1": { "$ref": "#/$defs/pathString" },
         "component2": { "$ref": "#/$defs/pathString" },
         "component1_sha256": { "$ref": "#/$defs/sha256Hex" },
         "component2_sha256": { "$ref": "#/$defs/sha256Hex" },
+        "additional_components": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/additionalFixtureComponent" }
+        },
         "output_dir": { "$ref": "#/$defs/pathString" },
         "input_mode": { "enum": ["negative", "positive"] },
         "bit_depth": { "enum": [14, 16] },
+        "grain_reduction": { "enum": ["off", "on"] },
+        "grain_strength": { "type": "number", "minimum": 0, "maximum": 1 },
+        "grain_scale": { "type": "number", "minimum": 0.5, "maximum": 4 },
+        "deskew": { "enum": ["auto", "manual", "off"] },
+        "orientation_correction": {
+          "enum": [
+            "none",
+            "flip-horizontal",
+            "rotate-180",
+            "flip-vertical",
+            "rotate-90-clockwise-then-flip-horizontal",
+            "rotate-90-clockwise",
+            "rotate-270-clockwise-then-flip-horizontal",
+            "rotate-270-clockwise"
+          ]
+        },
+        "deskew_angle_degrees": { "type": "number", "minimum": -3, "maximum": 3 },
         "force_stitch": { "type": "boolean" },
         "force_no_stitch": { "type": "boolean" },
         "summary_baseline": { "$ref": "#/$defs/pathString" },
@@ -124,11 +158,20 @@
         "scene_tags": { "$ref": "#/$defs/tagList" },
         "exposure_tags": { "$ref": "#/$defs/tagList" },
         "reference_evidence": { "$ref": "#/$defs/tagList" },
+        "render_review": { "$ref": "#/$defs/pathString" },
+        "render_review_sha256": { "$ref": "#/$defs/sha256Hex" },
         "calibration_case": { "$ref": "#/$defs/nonEmptyString" },
         "expectations": { "$ref": "#/$defs/fixtureExpectations" },
         "description": { "$ref": "#/$defs/nonEmptyString" }
       },
       "allOf": [
+        {
+          "if": { "required": ["deskew_angle_degrees"] },
+          "then": {
+            "required": ["deskew"],
+            "properties": { "deskew": { "const": "manual" } }
+          }
+        },
         {
           "not": {
             "required": ["calibration_profile", "calibration_library"]
@@ -148,6 +191,10 @@
           "then": { "required": ["summary_baseline"] }
         },
         {
+          "if": { "required": ["render_review_sha256"] },
+          "then": { "required": ["render_review"] }
+        },
+        {
           "if": { "required": ["calibration_profile_sha256"] },
           "then": { "required": ["calibration_profile"] }
         },
@@ -156,7 +203,23 @@
           "then": { "required": ["calibration_library"] }
         },
         {
+          "if": { "required": ["component2_sha256"] },
+          "then": { "required": ["component2"] }
+        },
+        {
+          "if": { "required": ["additional_components"] },
+          "then": { "required": ["component2"] }
+        },
+        {
           "if": {
+            "properties": { "force_stitch": { "const": true } },
+            "required": ["force_stitch"]
+          },
+          "then": { "required": ["component2"] }
+        },
+        {
+          "if": {
+            "required": ["component2"],
             "anyOf": [
               { "required": ["component1_sha256"] },
               { "required": ["component2_sha256"] }
@@ -217,12 +280,164 @@
         }
       ]
     },
+    "additionalFixtureComponent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": { "$ref": "#/$defs/pathString" },
+        "sha256": { "$ref": "#/$defs/sha256Hex" }
+      }
+    },
+    "borderCropComponentExpectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "component_index",
+        "top_removed",
+        "bottom_removed",
+        "left_removed",
+        "right_removed",
+        "tolerance_px"
+      ],
+      "properties": {
+        "component_index": { "type": "integer", "minimum": 1 },
+        "top_removed": { "type": "integer", "minimum": 0 },
+        "bottom_removed": { "type": "integer", "minimum": 0 },
+        "left_removed": { "type": "integer", "minimum": 0 },
+        "right_removed": { "type": "integer", "minimum": 0 },
+        "tolerance_px": { "type": "integer", "minimum": 0, "maximum": 64 }
+      }
+    },
+    "orientationComponentExpectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "component_index",
+        "upright_approved",
+        "decoded_pixel_sha256",
+        "tag_present",
+        "tag_value",
+        "transform",
+        "applied",
+        "source_width",
+        "source_height",
+        "output_width",
+        "output_height"
+      ],
+      "properties": {
+        "component_index": { "type": "integer", "minimum": 1 },
+        "upright_approved": { "type": "boolean" },
+        "decoded_pixel_sha256": { "$ref": "#/$defs/sha256Hex" },
+        "tag_present": { "type": "boolean" },
+        "tag_value": { "type": ["integer", "null"], "minimum": 1, "maximum": 8 },
+        "transform": {
+          "enum": [
+            "identity",
+            "flip_horizontal",
+            "rotate_180",
+            "flip_vertical",
+            "rotate_90_clockwise_then_flip_horizontal",
+            "rotate_90_clockwise",
+            "rotate_270_clockwise_then_flip_horizontal",
+            "rotate_270_clockwise"
+          ]
+        },
+        "applied": { "type": "boolean" },
+        "source_width": { "type": "integer", "minimum": 1 },
+        "source_height": { "type": "integer", "minimum": 1 },
+        "output_width": { "type": "integer", "minimum": 1 },
+        "output_height": { "type": "integer", "minimum": 1 }
+      }
+    },
     "fixtureExpectations": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "deskew_status": { "$ref": "#/$defs/nonEmptyString" },
+        "deskew_applied": { "type": "boolean" },
+        "deskew_review_required": { "type": "boolean" },
+        "deskew_retained_area_ratio_min": { "type": "number", "minimum": 0, "maximum": 1 },
+        "deskew_all_components_applied": { "type": "boolean" },
+        "deskew_minimum_component_retained_area_ratio_min": { "type": "number", "minimum": 0, "maximum": 1 },
+        "border_crop_all_components_cropped": { "type": "boolean" },
+        "border_crop_minimum_removed_edge_count_per_component_min": { "type": "integer", "minimum": 1 },
+        "border_crop_retained_area_ratio_min": { "type": "number", "minimum": 0, "maximum": 1 },
+        "border_crop_retained_area_ratio_max": { "type": "number", "minimum": 0, "maximum": 1 },
+        "border_crop_rejected": { "type": "boolean" },
+        "deskew_correction_degrees_expected": { "type": "number", "minimum": -3, "maximum": 3 },
+        "deskew_correction_tolerance_degrees": { "type": "number", "minimum": 0, "maximum": 3 },
+        "border_crop_components_expected": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/borderCropComponentExpectation" }
+        },
+        "orientation_components_expected": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/orientationComponentExpectation" }
+        },
         "stitch_decision": { "$ref": "#/$defs/nonEmptyString" },
+        "inferred_component_order": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": { "type": "integer", "minimum": 1 }
+        },
+        "technical_white_balance_status": { "$ref": "#/$defs/nonEmptyString" },
+        "technical_white_balance_applied": { "type": "boolean" },
+        "technical_white_balance_review_required": { "type": "boolean" },
+        "creative_temperature": { "type": "number", "minimum": -1, "maximum": 1 },
+        "creative_tint": { "type": "number", "minimum": -1, "maximum": 1 },
+        "seam_exposure_model": { "$ref": "#/$defs/nonEmptyString" },
+        "seam_exposure_held_out_validation_passed": { "type": "boolean" },
+        "seam_exposure_held_out_improvement_over_gain_min": { "type": "number", "minimum": 0 },
+        "seam_exposure_offset_normalized_abs_max": { "type": "number", "minimum": 0, "maximum": 1 },
+        "seam_exposure_spatial_slope_abs_min": { "type": "number", "minimum": 0 },
+        "seam_exposure_spatial_slope_abs_max": { "type": "number", "minimum": 0 },
+        "seam_exposure_spatial_slope_agreement_ratio_min": { "type": "number", "minimum": 0, "maximum": 1 },
+        "seam_exposure_held_out_spatial_improvement_over_best_constant_min": { "type": "number", "minimum": 0 },
+        "seam_exposure_spatial_offset_slope_normalized_abs_min": { "type": "number", "minimum": 0, "maximum": 1 },
+        "seam_exposure_spatial_offset_slope_normalized_abs_max": { "type": "number", "minimum": 0, "maximum": 1 },
+        "seam_exposure_spatial_offset_endpoint_normalized_abs_max": { "type": "number", "minimum": 0, "maximum": 1 },
+        "seam_exposure_spatial_affine_slope_agreement_ratio_min": { "type": "number", "minimum": 0, "maximum": 1 },
+        "seam_exposure_spatial_affine_center_offset_delta_normalized_max": { "type": "number", "minimum": 0, "maximum": 1 },
+        "seam_exposure_held_out_spatial_gain_offset_improvement_over_best_simpler_min": { "type": "number", "minimum": 0 },
+        "seam_exposure_spatial_2d_gain_accepted": { "type": "boolean" },
+        "seam_exposure_spatial_2d_gain_offset_accepted": { "type": "boolean" },
+        "seam_exposure_spatial_quadratic_gain_accepted": { "type": "boolean" },
+        "seam_exposure_spatial_quadratic_gain_offset_accepted": { "type": "boolean" },
+        "seam_exposure_spatial_2d_distinct_columns_min": { "type": "integer", "minimum": 1 },
+        "seam_exposure_spatial_2d_horizontal_slope_agreement_ratio_min": { "type": "number", "minimum": 0, "maximum": 1 },
+        "seam_exposure_held_out_spatial_2d_improvement_over_best_simpler_min": { "type": "number", "minimum": 0 },
+        "seam_blend_required": { "type": "boolean" },
+        "seam_blend_mode": { "$ref": "#/$defs/nonEmptyString" },
+        "seam_blend_review_required": { "type": "boolean" },
+        "seam_detail_review_required": { "type": "boolean" },
+        "seam_detail_supported_scale_count_min": { "type": "integer", "minimum": 1 },
+        "seam_detail_max_symmetric_energy_ratio_max": { "type": "number", "minimum": 1 },
+        "seam_gradient_ratio_max": { "type": "number", "minimum": 0 },
+        "seam_overlap_p95_abs_difference_max": { "type": "number", "minimum": 0 },
         "base_estimate_source": { "$ref": "#/$defs/nonEmptyString" },
+        "base_confidence_min": { "type": "number", "minimum": 0, "maximum": 1 },
+        "density_inversion_skipped": { "type": "boolean" },
+        "negative_response_model": { "$ref": "#/$defs/nonEmptyString" },
+        "negative_response_source": { "$ref": "#/$defs/nonEmptyString" },
+        "negative_response_accepted": { "type": "boolean" },
+        "negative_response_review_required": { "type": "boolean" },
+        "negative_response_crosstalk_model": { "$ref": "#/$defs/nonEmptyString" },
+        "negative_response_characteristic_curve_model": { "$ref": "#/$defs/nonEmptyString" },
+        "negative_response_measured_model_id": { "$ref": "#/$defs/nonEmptyString" },
+        "negative_response_measured_confidence_min": { "type": "number", "minimum": 0, "maximum": 1 },
+        "negative_response_held_out_delta_e00_rms_max": { "type": "number", "minimum": 0 },
+        "negative_response_held_out_max_delta_e00_max": { "type": "number", "minimum": 0 },
+        "negative_response_held_out_improvement_over_unit_slope_min": { "type": "number", "minimum": 0 },
+        "negative_response_density_noise_gain_max": { "type": "number", "minimum": 0 },
+        "negative_response_curve_extrapolated_ratio_max": { "type": "number", "minimum": 0, "maximum": 1 },
+        "negative_response_signed_headroom_preserved": { "type": "boolean" },
+        "negative_response_curve_interpolation": { "$ref": "#/$defs/nonEmptyString" },
         "output_color_space": { "$ref": "#/$defs/nonEmptyString" },
         "render_input_source": { "$ref": "#/$defs/nonEmptyString" },
         "render_input_reason_contains": { "$ref": "#/$defs/nonEmptyString" },
@@ -234,6 +449,7 @@
           "minimum": 0
         },
         "calibration_acceptance_status": { "$ref": "#/$defs/nonEmptyString" },
+        "calibration_color_mapping_applied": { "type": "boolean" },
         "calibration_confidence_min": {
           "type": "number",
           "minimum": 0,
@@ -250,6 +466,18 @@
         },
         "candidate_risk": { "$ref": "#/$defs/nonEmptyString" },
         "tone_color_trust_state": { "$ref": "#/$defs/nonEmptyString" },
+        "neutral_safety_rescue_applied": { "type": "boolean" },
+        "neutral_safety_rescue_preserved_ratio_gain_min": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "neutral_safety_rescue_midtone_saturation_p95_reduction_min": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "neutral_safety_rescue_reason_contains": { "$ref": "#/$defs/nonEmptyString" },
         "highlight_chroma_compressed_ratio_min": {
           "type": "number",
           "minimum": 0,
@@ -270,6 +498,17 @@
           "minimum": 0,
           "maximum": 1
         },
+        "grain_reduction_enabled": { "type": "boolean" },
+        "grain_reduction_applied_ratio_min": { "type": "number", "minimum": 0, "maximum": 1 },
+        "grain_reduction_structure_excluded_ratio_min": { "type": "number", "minimum": 0, "maximum": 1 },
+        "grain_reduction_flat_luma_p95_reduction_ratio_min": { "type": "number", "minimum": 0, "maximum": 1 },
+        "grain_reduction_flat_chroma_p95_reduction_ratio_min": { "type": "number", "minimum": 0, "maximum": 1 },
+        "grain_detail_review_required": { "type": "boolean" },
+        "grain_detail_decision_supported": { "type": "boolean" },
+        "grain_detail_luminance_probe_count_min": { "type": "integer", "minimum": 1 },
+        "grain_detail_chroma_probe_count_min": { "type": "integer", "minimum": 1 },
+        "grain_detail_luminance_p10_retention_min": { "type": "number", "minimum": 0, "maximum": 2 },
+        "grain_detail_chroma_p10_retention_min": { "type": "number", "minimum": 0, "maximum": 2 },
         "selected_quality_score_max": {
           "type": "number",
           "minimum": 0
@@ -311,6 +550,43 @@
           "minimum": 0
         },
         "post_scale_preserved_ratio_min": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "render_luminance_range_p05_p95_min": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "render_review_status": {
+          "type": "string",
+          "minLength": 1
+        },
+        "render_reviewable": {
+          "type": "boolean",
+          "description": "Expected final delivery decision. False explicitly declares an intentional diagnostic fixture; true participates in the complete reviewable dynamic-range contract."
+        },
+        "tone_output_confidence_status": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tone_output_review_required": { "type": "boolean" },
+        "tone_output_evidence_confidence_min": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "render_to_mapped_luminance_range_ratio_min": {
+          "type": "number",
+          "minimum": 0
+        },
+        "post_chroma_compression_clipped_high_ratio_max": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "post_chroma_compression_clipped_low_ratio_max": {
           "type": "number",
           "minimum": 0,
           "maximum": 1

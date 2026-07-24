@@ -18,6 +18,92 @@
     { "required": ["work_to_xyz"] },
     { "required": ["fit_matrix"] }
   ],
+  "allOf": [
+    {
+      "if": {
+        "properties": { "schema_version": { "const": 2 } },
+        "required": ["schema_version", "fit"]
+      },
+      "then": {
+        "required": ["target_patch_signal_domain"],
+        "properties": { "fit": { "required": ["validation"] } }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "target_patch_signal_domain": { "const": "scanner_linearized_transmittance" }
+        },
+        "required": ["target_patch_signal_domain"]
+      },
+      "then": { "required": ["target_patch_linearization_model_id"] }
+    },
+    {
+      "if": {
+        "properties": {
+          "target_patch_signal_domain": { "const": "normalized_scanner_signal" }
+        },
+        "required": ["target_patch_signal_domain"]
+      },
+      "then": { "not": { "required": ["target_patch_linearization_model_id"] } }
+    },
+    {
+      "if": { "required": ["color_model"] },
+      "then": {
+        "required": ["patches", "target_patch_signal_domain"],
+        "properties": {
+          "schema_version": { "const": 2 },
+          "patches": { "minItems": 18 }
+        }
+      }
+    },
+    {
+      "if": { "required": ["lut_3d_model"] },
+      "then": {
+        "required": ["patches", "target_patch_signal_domain"],
+        "properties": {
+          "schema_version": { "const": 2 },
+          "patches": { "minItems": 48 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "lut_3d_model": {
+            "properties": { "grid_size": { "const": 7 } },
+            "required": ["grid_size"]
+          }
+        },
+        "required": ["lut_3d_model"]
+      },
+      "then": { "properties": { "patches": { "minItems": 96 } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "lut_3d_model": {
+            "properties": { "baseline_kind": { "const": "root_polynomial" } },
+            "required": ["baseline_kind"]
+          }
+        },
+        "required": ["lut_3d_model"]
+      },
+      "then": { "required": ["color_model"] }
+    },
+    {
+      "if": {
+        "properties": {
+          "lut_3d_model": {
+            "properties": { "baseline_kind": { "const": "matrix" } },
+            "required": ["baseline_kind"]
+          }
+        },
+        "required": ["lut_3d_model"]
+      },
+      "then": { "not": { "required": ["color_model"] } }
+    }
+  ],
   "properties": {
     "schema_version": {
       "enum": [1, 2]
@@ -66,11 +152,29 @@
     "fit": {
       "$ref": "#/$defs/fitDiagnostics"
     },
+    "target_patch_signal_domain": {
+      "enum": ["normalized_scanner_signal", "scanner_linearized_transmittance"]
+    },
+    "target_patch_linearization_model_id": { "type": "string", "minLength": 1 },
+    "target_sampling": {
+      "description": "Perspective-aware chart acquisition diagnostics retained from scanstitch-calibrate sample-target.",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "target_patch_linearization_application": {
+      "type": "object",
+      "additionalProperties": true
+    },
     "patches": {
       "type": "array",
       "minItems": 4,
       "items": { "$ref": "#/$defs/targetPatch" }
     },
+    "negative_response": { "$ref": "#/$defs/negativeResponse" },
+    "scanner_linearization": { "$ref": "#/$defs/scannerLinearization" },
+    "color_model": { "$ref": "#/$defs/rootPolynomialColorModel" },
+    "lut_3d_model": { "$ref": "#/$defs/residualLut3dColorModel" },
+    "lut_3d_fit": { "$ref": "#/$defs/residualLut3dSelectionDiagnostics" },
     "gamut_limits": {
       "type": "object",
       "additionalProperties": false,
@@ -103,6 +207,463 @@
       "minItems": 3,
       "maxItems": 3
     },
+    "chromaticity2": {
+      "type": "array",
+      "prefixItems": [
+        { "type": "number", "minimum": 0, "maximum": 1 },
+        { "type": "number", "minimum": 0, "maximum": 1 }
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "rootPolynomialValidation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "training_patch_count",
+        "held_out_patch_count",
+        "cross_validation_folds",
+        "regularization_lambda",
+        "design_condition_number",
+        "coefficient_max_abs",
+        "training_delta_e00_rms",
+        "training_delta_e00_max",
+        "held_out_delta_e00_rms",
+        "held_out_delta_e00_max",
+        "matrix_held_out_delta_e00_rms",
+        "matrix_held_out_delta_e00_max",
+        "held_out_delta_e00_rms_improvement",
+        "held_out_delta_e00_rms_improvement_fraction",
+        "held_out_xyz_rms_improvement_fraction",
+        "maximum_hue_family_delta_e00_rms_regression",
+        "selected_over_matrix"
+      ],
+      "properties": {
+        "training_patch_count": { "type": "integer", "minimum": 18 },
+        "held_out_patch_count": { "type": "integer", "minimum": 18 },
+        "cross_validation_folds": { "type": "integer", "minimum": 3, "maximum": 5 },
+        "regularization_lambda": { "type": "number", "minimum": 1e-10, "maximum": 0.001 },
+        "design_condition_number": { "type": "number", "minimum": 1, "maximum": 100000000 },
+        "coefficient_max_abs": { "type": "number", "minimum": 0, "maximum": 50 },
+        "training_delta_e00_rms": { "type": "number", "minimum": 0 },
+        "training_delta_e00_max": { "type": "number", "minimum": 0 },
+        "held_out_delta_e00_rms": { "type": "number", "minimum": 0, "maximum": 6 },
+        "held_out_delta_e00_max": { "type": "number", "minimum": 0, "maximum": 15 },
+        "matrix_held_out_delta_e00_rms": { "type": "number", "minimum": 0 },
+        "matrix_held_out_delta_e00_max": { "type": "number", "minimum": 0 },
+        "held_out_delta_e00_rms_improvement": { "type": "number", "minimum": 0.25 },
+        "held_out_delta_e00_rms_improvement_fraction": { "type": "number", "minimum": 0.05 },
+        "held_out_xyz_rms_improvement_fraction": { "type": "number", "minimum": -0.02 },
+        "maximum_hue_family_delta_e00_rms_regression": { "type": "number", "minimum": 0, "maximum": 0.5 },
+        "selected_over_matrix": { "const": true }
+      }
+    },
+    "rootPolynomialColorModel": {
+      "description": "Held-out-selected homogeneous root-polynomial scanner RGB to reference D50 XYZ model. The matrix remains mandatory as a runtime fallback.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_id",
+        "basis",
+        "degree",
+        "output_space",
+        "coefficients",
+        "training_patches",
+        "training_chromaticity_hull",
+        "validation",
+        "fit"
+      ],
+      "properties": {
+        "model_id": { "type": "string", "minLength": 1 },
+        "basis": { "const": "homogeneous_root_polynomial_rgb" },
+        "degree": { "enum": [2, 3] },
+        "output_space": { "const": "reference_xyz_d50" },
+        "coefficients": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/vector3" }
+        },
+        "training_patches": {
+          "type": "array",
+          "minItems": 18,
+          "items": { "$ref": "#/$defs/retainedRootPolynomialTrainingPatch" }
+        },
+        "training_chromaticity_hull": {
+          "type": "array",
+          "minItems": 3,
+          "items": { "$ref": "#/$defs/chromaticity2" }
+        },
+        "validation": { "$ref": "#/$defs/rootPolynomialValidation" },
+        "fit": { "$ref": "#/$defs/fitDiagnostics" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "degree": { "const": 2 } }, "required": ["degree"] },
+          "then": { "properties": { "coefficients": { "minItems": 6, "maxItems": 6 } } }
+        },
+        {
+          "if": { "properties": { "degree": { "const": 3 } }, "required": ["degree"] },
+          "then": {
+            "properties": {
+              "coefficients": { "minItems": 13, "maxItems": 13 },
+              "training_patches": { "minItems": 39 },
+              "validation": {
+                "properties": {
+                  "training_patch_count": { "minimum": 39 },
+                  "held_out_patch_count": { "minimum": 24 }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "residualLut3dValidation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "training_patch_count",
+        "held_out_patch_count",
+        "cross_validation_folds",
+        "regularization_lambda",
+        "regularized_condition_number",
+        "occupied_cell_fraction",
+        "held_out_inside_domain_fraction",
+        "residual_node_max_abs",
+        "residual_node_rms",
+        "residual_edge_roughness_rms",
+        "training_delta_e00_rms",
+        "training_delta_e00_max",
+        "held_out_delta_e00_rms",
+        "held_out_delta_e00_max",
+        "baseline_held_out_delta_e00_rms",
+        "baseline_held_out_delta_e00_max",
+        "held_out_delta_e00_rms_improvement",
+        "held_out_delta_e00_rms_improvement_fraction",
+        "held_out_xyz_rms_improvement_fraction",
+        "maximum_hue_family_delta_e00_rms_regression",
+        "selected_over_baseline"
+      ],
+      "properties": {
+        "training_patch_count": { "type": "integer", "minimum": 108 },
+        "held_out_patch_count": { "type": "integer", "minimum": 48 },
+        "cross_validation_folds": { "type": "integer", "minimum": 3, "maximum": 5 },
+        "regularization_lambda": { "type": "number", "minimum": 0.0001, "maximum": 10 },
+        "regularized_condition_number": { "type": "number", "minimum": 1, "maximum": 10000000000 },
+        "occupied_cell_fraction": { "type": "number", "minimum": 0.35, "maximum": 1 },
+        "held_out_inside_domain_fraction": { "type": "number", "minimum": 0.98, "maximum": 1 },
+        "residual_node_max_abs": { "type": "number", "minimum": 0, "maximum": 0.25 },
+        "residual_node_rms": { "type": "number", "minimum": 0, "maximum": 0.1 },
+        "residual_edge_roughness_rms": { "type": "number", "minimum": 0, "maximum": 0.1 },
+        "training_delta_e00_rms": { "type": "number", "minimum": 0 },
+        "training_delta_e00_max": { "type": "number", "minimum": 0 },
+        "held_out_delta_e00_rms": { "type": "number", "minimum": 0, "maximum": 4 },
+        "held_out_delta_e00_max": { "type": "number", "minimum": 0, "maximum": 10 },
+        "baseline_held_out_delta_e00_rms": { "type": "number", "minimum": 0 },
+        "baseline_held_out_delta_e00_max": { "type": "number", "minimum": 0 },
+        "held_out_delta_e00_rms_improvement": { "type": "number", "minimum": 0.2 },
+        "held_out_delta_e00_rms_improvement_fraction": { "type": "number", "minimum": 0.05 },
+        "held_out_xyz_rms_improvement_fraction": { "type": "number", "minimum": -0.01 },
+        "maximum_hue_family_delta_e00_rms_regression": { "type": "number", "minimum": 0, "maximum": 0.35 },
+        "selected_over_baseline": { "const": true }
+      }
+    },
+    "residualLut3dColorModel": {
+      "description": "Held-out-qualified smooth residual scanner RGB to D50 XYZ lattice. Tetrahedral interpolation adds a regularized residual over the declared matrix or root-polynomial baseline; zero boundary nodes guarantee continuous fallback.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_id",
+        "model_type",
+        "interpolation",
+        "grid_size",
+        "output_space",
+        "baseline_kind",
+        "input_min",
+        "input_max",
+        "residual_nodes_xyz",
+        "training_patches",
+        "training_chromaticity_hull",
+        "validation",
+        "fit"
+      ],
+      "properties": {
+        "model_id": { "type": "string", "minLength": 1 },
+        "model_type": { "const": "smooth_residual_lut_3d" },
+        "interpolation": { "const": "tetrahedral" },
+        "grid_size": { "enum": [5, 7] },
+        "output_space": { "const": "reference_xyz_d50" },
+        "baseline_kind": { "enum": ["matrix", "root_polynomial"] },
+        "baseline_model_id": { "type": "string", "minLength": 1 },
+        "input_min": { "$ref": "#/$defs/vector3" },
+        "input_max": { "$ref": "#/$defs/vector3" },
+        "residual_nodes_xyz": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/vector3" }
+        },
+        "training_patches": {
+          "type": "array",
+          "minItems": 108,
+          "items": { "$ref": "#/$defs/retainedRootPolynomialTrainingPatch" }
+        },
+        "training_chromaticity_hull": {
+          "type": "array",
+          "minItems": 3,
+          "items": { "$ref": "#/$defs/chromaticity2" }
+        },
+        "validation": { "$ref": "#/$defs/residualLut3dValidation" },
+        "fit": { "$ref": "#/$defs/fitDiagnostics" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "grid_size": { "const": 5 } }, "required": ["grid_size"] },
+          "then": {
+            "properties": {
+              "residual_nodes_xyz": { "minItems": 125, "maxItems": 125 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "grid_size": { "const": 7 } }, "required": ["grid_size"] },
+          "then": {
+            "properties": {
+              "residual_nodes_xyz": { "minItems": 343, "maxItems": 343 },
+              "training_patches": { "minItems": 500 },
+              "validation": {
+                "properties": {
+                  "training_patch_count": { "minimum": 500 },
+                  "held_out_patch_count": { "minimum": 96 }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "baseline_kind": { "const": "root_polynomial" } },
+            "required": ["baseline_kind"]
+          },
+          "then": { "required": ["baseline_model_id"] }
+        },
+        {
+          "if": {
+            "properties": { "baseline_kind": { "const": "matrix" } },
+            "required": ["baseline_kind"]
+          },
+          "then": { "not": { "required": ["baseline_model_id"] } }
+        }
+      ]
+    },
+    "residualLut3dCandidateDiagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["grid_size", "node_count", "fitted_interior_node_count", "status", "reason"],
+      "properties": {
+        "grid_size": { "enum": [5, 7] },
+        "node_count": { "enum": [125, 343] },
+        "fitted_interior_node_count": { "enum": [27, 125] },
+        "status": {
+          "enum": [
+            "not_evaluated_insufficient_samples",
+            "rejected_fit",
+            "rejected_held_out",
+            "selected",
+            "accepted_not_selected"
+          ]
+        },
+        "reason": { "type": "string", "minLength": 1 },
+        "model_id": { "type": "string", "minLength": 1 },
+        "validation": { "$ref": "#/$defs/residualLut3dValidation" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "grid_size": { "const": 5 } }, "required": ["grid_size"] },
+          "then": {
+            "properties": {
+              "node_count": { "const": 125 },
+              "fitted_interior_node_count": { "const": 27 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "grid_size": { "const": 7 } }, "required": ["grid_size"] },
+          "then": {
+            "properties": {
+              "node_count": { "const": 343 },
+              "fitted_interior_node_count": { "const": 125 }
+            }
+          }
+        }
+      ]
+    },
+    "residualLut3dSelectionDiagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "baseline_kind", "selection_rule", "candidates"],
+      "properties": {
+        "status": { "enum": ["selected_residual_lut_3d", "baseline_retained"] },
+        "baseline_kind": { "enum": ["matrix", "root_polynomial"] },
+        "baseline_model_id": { "type": "string", "minLength": 1 },
+        "selection_rule": { "type": "string", "minLength": 1 },
+        "selected_model_id": { "type": "string", "minLength": 1 },
+        "selected_grid_size": { "enum": [5, 7] },
+        "candidates": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "$ref": "#/$defs/residualLut3dCandidateDiagnostics" }
+        }
+      }
+    },
+    "retainedRootPolynomialTrainingPatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["patch_id", "source_rgb", "reference_xyz"],
+      "properties": {
+        "patch_id": { "type": "string", "minLength": 1 },
+        "scanner_xy": {
+          "type": "array",
+          "prefixItems": [
+            { "type": "number", "minimum": -1, "maximum": 1 },
+            { "type": "number", "minimum": -1, "maximum": 1 }
+          ],
+          "items": false,
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "source_rgb": { "$ref": "#/$defs/vector3" },
+        "reference_xyz": { "$ref": "#/$defs/vector3" }
+      }
+    },
+    "negativeResponseCurvePoint": {
+      "description": "[separated film-layer density, scene log exposure] measured on a calibration target.",
+      "type": "array",
+      "prefixItems": [
+        { "type": "number" },
+        { "type": "number" }
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "negativeResponseCurve": {
+      "type": "array",
+      "minItems": 4,
+      "items": { "$ref": "#/$defs/negativeResponseCurvePoint" }
+    },
+    "negativeResponse": {
+      "description": "Measured scanner-density crosstalk separation and monotone nonlinear negative-film response, accepted only after runtime conditioning, noise-gain, and held-out DeltaE00 validation.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_id",
+        "scanner_density_to_layer_density",
+        "characteristic_curves",
+        "confidence",
+        "validation"
+      ],
+      "properties": {
+        "model_id": { "type": "string", "minLength": 1 },
+        "scanner_density_to_layer_density": { "$ref": "#/$defs/matrix3x3" },
+        "characteristic_curves": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["red", "green", "blue"],
+          "properties": {
+            "red": { "$ref": "#/$defs/negativeResponseCurve" },
+            "green": { "$ref": "#/$defs/negativeResponseCurve" },
+            "blue": { "$ref": "#/$defs/negativeResponseCurve" }
+          }
+        },
+        "white_anchor_percentile": {
+          "type": "number",
+          "minimum": 0.95,
+          "maximum": 0.9999,
+          "default": 0.995
+        },
+        "confidence": { "type": "number", "minimum": 0.75, "maximum": 1.0 },
+        "validation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "held_out_patch_count",
+            "delta_e00_rms",
+            "delta_e00_max",
+            "unit_slope_delta_e00_rms"
+          ],
+          "properties": {
+            "held_out_patch_count": { "type": "integer", "minimum": 12 },
+            "delta_e00_rms": { "type": "number", "minimum": 0, "maximum": 6 },
+            "delta_e00_max": { "type": "number", "minimum": 0, "maximum": 15 },
+            "unit_slope_delta_e00_rms": { "type": "number", "minimum": 0 },
+            "worst_hue_family": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "scannerLinearizationCurvePoint": {
+      "description": "[level-corrected normalized scanner signal, linear transmittance].",
+      "type": "array",
+      "prefixItems": [{ "type": "number" }, { "type": "number" }],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "scannerLinearizationCurve": {
+      "type": "array",
+      "minItems": 4,
+      "items": { "$ref": "#/$defs/scannerLinearizationCurvePoint" }
+    },
+    "scannerLinearization": {
+      "description": "Held-out-validated scanner level/flare correction, monotone signal linearization, and optional bounded spatial shading gain.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model_id", "curves", "confidence", "validation"],
+      "properties": {
+        "model_id": { "type": "string", "minLength": 1 },
+        "curves": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["red", "green", "blue"],
+          "properties": {
+            "red": { "$ref": "#/$defs/scannerLinearizationCurve" },
+            "green": { "$ref": "#/$defs/scannerLinearizationCurve" },
+            "blue": { "$ref": "#/$defs/scannerLinearizationCurve" }
+          }
+        },
+        "black_level_normalized": { "$ref": "#/$defs/vector3" },
+        "white_level_normalized": { "$ref": "#/$defs/vector3" },
+        "additive_flare_normalized": { "$ref": "#/$defs/vector3" },
+        "shading_gain_polynomial": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "type": "array",
+            "minItems": 6,
+            "maxItems": 6,
+            "items": { "type": "number" }
+          }
+        },
+        "confidence": { "type": "number", "minimum": 0.85, "maximum": 1.0 },
+        "validation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "held_out_sample_count",
+            "transmittance_rmse",
+            "transmittance_max_error",
+            "identity_baseline_rmse"
+          ],
+          "properties": {
+            "held_out_sample_count": { "type": "integer", "minimum": 12 },
+            "transmittance_rmse": { "type": "number", "minimum": 0, "maximum": 0.01 },
+            "transmittance_max_error": { "type": "number", "minimum": 0, "maximum": 0.03 },
+            "identity_baseline_rmse": { "type": "number", "minimum": 0 }
+          }
+        }
+      }
+    },
     "fitDiagnostics": {
       "type": "object",
       "additionalProperties": false,
@@ -117,6 +678,7 @@
         "patch_count": { "type": "integer", "minimum": 4 },
         "target_residual_rms": { "type": "number", "minimum": 0 },
         "target_residual_max": { "type": "number", "minimum": 0 },
+        "validation": { "$ref": "#/$defs/fitValidation" },
         "per_hue_residuals": {
           "type": "array",
           "items": { "$ref": "#/$defs/hueResidual" }
@@ -125,6 +687,30 @@
           "type": "array",
           "items": { "$ref": "#/$defs/patchFitResidual" }
         }
+      }
+    },
+    "fitValidation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evaluation_set",
+        "training_patch_count",
+        "held_out_patch_count",
+        "training_residual_rms",
+        "training_residual_max",
+        "identity_baseline_residual_rms",
+        "identity_baseline_residual_max",
+        "held_out_identity_improvement_fraction"
+      ],
+      "properties": {
+        "evaluation_set": { "const": "held_out" },
+        "training_patch_count": { "type": "integer", "minimum": 12 },
+        "held_out_patch_count": { "type": "integer", "minimum": 12 },
+        "training_residual_rms": { "type": "number", "minimum": 0 },
+        "training_residual_max": { "type": "number", "minimum": 0 },
+        "identity_baseline_residual_rms": { "type": "number", "minimum": 0 },
+        "identity_baseline_residual_max": { "type": "number", "minimum": 0 },
+        "held_out_identity_improvement_fraction": { "type": "number", "maximum": 1 }
       }
     },
     "hueResidual": {
@@ -171,6 +757,17 @@
         "scanner_rgb": { "$ref": "#/$defs/vector3" },
         "source_rgb": { "$ref": "#/$defs/vector3" },
         "measured_rgb": { "$ref": "#/$defs/vector3" },
+        "scanner_xy": {
+          "description": "Normalized original scanner-frame coordinate [x,y], required when spatial scanner shading correction is applied.",
+          "type": "array",
+          "prefixItems": [
+            { "type": "number", "minimum": -1, "maximum": 1 },
+            { "type": "number", "minimum": -1, "maximum": 1 }
+          ],
+          "items": false,
+          "minItems": 2,
+          "maxItems": 2
+        },
         "xyz": { "$ref": "#/$defs/vector3" },
         "reference_xyz": { "$ref": "#/$defs/vector3" },
         "target_xyz": { "$ref": "#/$defs/vector3" },

@@ -1,5 +1,9 @@
 # CLAUDE_FINDINGS.MD — Forensic Review of ScanStitch
 
+> **SUPERSEDED by `PROJECT_ASSESSMENT.md` (2026-06-03).** Retained only as the historical 2026-05-26 audit.
+> Most of its top findings — C1–C3 (repo hygiene), E1 (colour matrix), E5 (transmittance clamp), F1 (pipeline
+> panics) — have since been resolved. Verify against the current tree before acting on anything below.
+
 Reviewer: Claude (Opus 4.7). Date: 2026-05-26. Scope: full working tree at `V:\PERSONAL\PHOTOGRAPHY\SCANSTITCH`.
 Mandate: infer the project's goals, then catalogue every mistake as harshly and exhaustively as the
 evidence supports, and finish with a prioritized remediation plan. Read-only review; no project file

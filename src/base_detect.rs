@@ -135,6 +135,27 @@ pub struct RollBaseConsensus {
     pub reason: String,
 }
 
+/// Construct an explicit not-applicable base record for already-positive input. This avoids a
+/// full negative-film rebate search while keeping report serialization and downstream component
+/// bookkeeping structurally identical.
+pub fn positive_input_not_applicable(img: &ndarray::Array3<u16>) -> BaseDetection {
+    BaseDetection {
+        left_confidence: 0.0,
+        right_confidence: 0.0,
+        top_confidence: 0.0,
+        bottom_confidence: 0.0,
+        base_color: [0.0; 3],
+        base_color_source: "not_required_positive_input",
+        base_color_reason: "film-base measurement is not applicable to already-positive input"
+            .to_string(),
+        base_color_proxy_confidence: None,
+        base_color_support_fraction: None,
+        strip_width: (img.dim().1 / 10).max(1),
+        left_base_mask: Vec::new(),
+        right_base_mask: Vec::new(),
+    }
+}
+
 impl RollBaseCandidate {
     pub fn from_detection(frame_id: impl Into<String>, detection: &BaseDetection) -> Self {
         Self {
@@ -316,6 +337,196 @@ pub fn base_detection_confidence(detection: &BaseDetection) -> f64 {
         .max(detection.right_confidence)
         .max(detection.top_confidence)
         .max(detection.bottom_confidence)
+}
+
+/// Estimate orange film base specifically from bands that the geometry stage will remove.
+///
+/// Scanner dead zones and the film rebate often occupy the same outer band. The final image
+/// should contain neither, but density inversion still needs the rebate color. This detector
+/// looks for stable orange line medians inside the removed bands, rejecting dark and neutral
+/// scanner-board lines. It returns `None` rather than manufacturing evidence when no such line
+/// cluster exists.
+pub fn detect_film_base_in_removed_bands(
+    img: &Array3<u16>,
+    top_removed: usize,
+    bottom_removed: usize,
+    left_removed: usize,
+    right_removed: usize,
+) -> Option<BaseDetection> {
+    let (height, width, channels) = img.dim();
+    if height == 0 || width == 0 || channels < 3 {
+        return None;
+    }
+
+    let mut edge_candidates: [Vec<[f64; 3]>; 4] = std::array::from_fn(|_| Vec::new());
+    for y in 0..top_removed.min(height) {
+        if let Some(color) = stable_orange_row_color(img, y) {
+            edge_candidates[0].push(color);
+        }
+    }
+    for y in height.saturating_sub(bottom_removed.min(height))..height {
+        if let Some(color) = stable_orange_row_color(img, y) {
+            edge_candidates[1].push(color);
+        }
+    }
+    for x in 0..left_removed.min(width) {
+        if let Some(color) = stable_orange_column_color(img, x) {
+            edge_candidates[2].push(color);
+        }
+    }
+    for x in width.saturating_sub(right_removed.min(width))..width {
+        if let Some(color) = stable_orange_column_color(img, x) {
+            edge_candidates[3].push(color);
+        }
+    }
+
+    let high_transmittance_envelope = robust_high_transmittance_estimate(img).color;
+    for candidates in &mut edge_candidates {
+        candidates.retain(|candidate| {
+            !base_candidate_is_much_darker_than_envelope(candidate, &high_transmittance_envelope)
+        });
+    }
+
+    let mut selected: Option<(usize, [f64; 3], f64, usize, f64)> = None;
+    for (edge, candidates) in edge_candidates.iter().enumerate() {
+        let Some((color, confidence, support, spread)) = summarize_removed_band(candidates) else {
+            continue;
+        };
+        if selected
+            .as_ref()
+            .is_none_or(|(_, _, best_confidence, best_support, _)| {
+                confidence > *best_confidence
+                    || ((confidence - *best_confidence).abs() < 1e-9 && support > *best_support)
+            })
+        {
+            selected = Some((edge, color, confidence, support, spread));
+        }
+    }
+
+    let (edge, base_color, confidence, support, spread) = selected?;
+    let mut edge_confidence = [0.0; 4];
+    edge_confidence[edge] = confidence;
+    let edge_name = ["top", "bottom", "left", "right"][edge];
+    Some(BaseDetection {
+        left_confidence: edge_confidence[2],
+        right_confidence: edge_confidence[3],
+        top_confidence: edge_confidence[0],
+        bottom_confidence: edge_confidence[1],
+        base_color,
+        base_color_source: "removed_border_rebate_band",
+        base_color_reason: format!(
+            "stable orange rebate measured in the {edge_name} band before final cropping from {support} line medians (max relative channel spread {:.2}%)",
+            spread * 100.0
+        ),
+        base_color_proxy_confidence: None,
+        base_color_support_fraction: Some(
+            support as f64
+                / match edge {
+                    0 => top_removed.max(1),
+                    1 => bottom_removed.max(1),
+                    2 => left_removed.max(1),
+                    _ => right_removed.max(1),
+                } as f64,
+        ),
+        strip_width: ((width as f64 * 0.05).round() as usize)
+            .max(1)
+            .min(width),
+        left_base_mask: Vec::new(),
+        right_base_mask: Vec::new(),
+    })
+}
+
+fn stable_orange_row_color(img: &Array3<u16>, y: usize) -> Option<[f64; 3]> {
+    let (_, width, _) = img.dim();
+    stable_orange_line_color((0..width).map(|x| {
+        [
+            img[[y, x, 0]] as f64,
+            img[[y, x, 1]] as f64,
+            img[[y, x, 2]] as f64,
+        ]
+    }))
+}
+
+fn stable_orange_column_color(img: &Array3<u16>, x: usize) -> Option<[f64; 3]> {
+    let (height, _, _) = img.dim();
+    stable_orange_line_color((0..height).map(|y| {
+        [
+            img[[y, x, 0]] as f64,
+            img[[y, x, 1]] as f64,
+            img[[y, x, 2]] as f64,
+        ]
+    }))
+}
+
+fn stable_orange_line_color<I>(pixels: I) -> Option<[f64; 3]>
+where
+    I: Iterator<Item = [f64; 3]>,
+{
+    let pixels = pixels.collect::<Vec<_>>();
+    if pixels.len() < 4 {
+        return None;
+    }
+    let color = std::array::from_fn(|channel| {
+        let mut values = pixels
+            .iter()
+            .map(|pixel| pixel[channel])
+            .collect::<Vec<_>>();
+        median(&mut values)
+    });
+    let line_luminance = luminance(&color);
+    if line_luminance < MIN_BASE_REGION_LUMINANCE
+        || color[0] < color[1] * 1.12
+        || color[1] < color[2] * 1.05
+        || color[0] < color[2] * 1.30
+    {
+        return None;
+    }
+
+    let mut deviations = pixels
+        .iter()
+        .map(|pixel| (luminance(pixel) - line_luminance).abs())
+        .collect::<Vec<_>>();
+    let relative_mad = median(&mut deviations) / line_luminance.max(1.0);
+    (relative_mad <= 0.08).then_some(color)
+}
+
+fn summarize_removed_band(candidates: &[[f64; 3]]) -> Option<([f64; 3], f64, usize, f64)> {
+    if candidates.len() < 2 {
+        return None;
+    }
+    let mut luminances = candidates.iter().map(luminance).collect::<Vec<_>>();
+    let luminance_floor = percentile(&mut luminances, 0.40) * 0.95;
+    let retained = candidates
+        .iter()
+        .copied()
+        .filter(|color| luminance(color) >= luminance_floor)
+        .collect::<Vec<_>>();
+    if retained.len() < 2 {
+        return None;
+    }
+
+    let color = std::array::from_fn(|channel| {
+        let mut values = retained
+            .iter()
+            .map(|candidate| candidate[channel])
+            .collect::<Vec<_>>();
+        median(&mut values)
+    });
+    let relative_spread = std::array::from_fn::<_, 3, _>(|channel| {
+        let mut deviations = retained
+            .iter()
+            .map(|candidate| (candidate[channel] - color[channel]).abs())
+            .collect::<Vec<_>>();
+        median(&mut deviations) / color[channel].max(1.0)
+    });
+    let max_spread = relative_spread.into_iter().fold(0.0f64, f64::max);
+    if max_spread > 0.12 {
+        return None;
+    }
+    let support_score = (retained.len() as f64 / 4.0).clamp(0.0, 1.0);
+    let stability_score = (1.0 - max_spread / 0.12).clamp(0.0, 1.0);
+    let confidence = (0.30 + 0.45 * support_score + 0.25 * stability_score).clamp(0.0, 0.95);
+    Some((color, confidence, retained.len(), max_spread))
 }
 
 fn demote_dark_base_region_against_envelope(

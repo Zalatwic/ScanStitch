@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/scanstitch/orientation-review.schema.json",
+  "title": "ScanStitch Orientation Review Draft",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "fixture",
+    "review_status",
+    "instructions",
+    "input_mode",
+    "working_bit_depth",
+    "orientation_correction",
+    "preview_transform",
+    "previews",
+    "orientation_components_expected"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "fixture": { "type": "string", "minLength": 1 },
+    "review_status": { "const": "requires_human_approval" },
+    "instructions": { "type": "string", "minLength": 1 },
+    "input_mode": { "enum": ["negative", "positive"] },
+    "working_bit_depth": { "enum": [14, 16] },
+    "orientation_correction": {
+      "enum": [
+        "none",
+        "flip-horizontal",
+        "rotate-180",
+        "flip-vertical",
+        "rotate-90-clockwise-then-flip-horizontal",
+        "rotate-90-clockwise",
+        "rotate-270-clockwise-then-flip-horizontal",
+        "rotate-270-clockwise"
+      ]
+    },
+    "preview_transform": {
+      "enum": [
+        "per_channel_stretch_inverted_gamma_orientation_only",
+        "per_channel_stretch_gamma_orientation_only"
+      ]
+    },
+    "previews": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/preview" }
+    },
+    "orientation_components_expected": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/orientationExpectationDraft" }
+    }
+  },
+  "$defs": {
+    "preview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component_index", "source_path", "preview_path"],
+      "properties": {
+        "component_index": { "type": "integer", "minimum": 1 },
+        "source_path": { "type": "string", "minLength": 1 },
+        "preview_path": { "type": "string", "minLength": 1 }
+      }
+    },
+    "orientationExpectationDraft": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "component_index",
+        "upright_approved",
+        "decoded_pixel_sha256",
+        "tag_present",
+        "tag_value",
+        "transform",
+        "applied",
+        "source_width",
+        "source_height",
+        "output_width",
+        "output_height"
+      ],
+      "properties": {
+        "component_index": { "type": "integer", "minimum": 1 },
+        "upright_approved": { "const": false },
+        "decoded_pixel_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "tag_present": { "type": "boolean" },
+        "tag_value": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 8
+        },
+        "transform": {
+          "enum": [
+            "identity",
+            "flip_horizontal",
+            "rotate_180",
+            "flip_vertical",
+            "rotate_90_clockwise_then_flip_horizontal",
+            "rotate_90_clockwise",
+            "rotate_270_clockwise_then_flip_horizontal",
+            "rotate_270_clockwise"
+          ]
+        },
+        "applied": { "type": "boolean" },
+        "source_width": { "type": "integer", "minimum": 1 },
+        "source_height": { "type": "integer", "minimum": 1 },
+        "output_width": { "type": "integer", "minimum": 1 },
+        "output_height": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

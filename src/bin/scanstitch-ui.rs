@@ -29,40 +29,59 @@ const HIGH_QUALITY_IDLE_MS: u64 = 350;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectedControl {
     Exposure,
+    CreativeTemperature,
+    CreativeTint,
     Midpoint,
     Slope,
     ToeLift,
     ShoulderMax,
+    GrainReduction,
+    GrainStrength,
+    GrainScale,
 }
 
 impl SelectedControl {
-    fn all() -> [Self; 5] {
+    fn all() -> [Self; 10] {
         [
             Self::Exposure,
+            Self::CreativeTemperature,
+            Self::CreativeTint,
             Self::Midpoint,
             Self::Slope,
             Self::ToeLift,
             Self::ShoulderMax,
+            Self::GrainReduction,
+            Self::GrainStrength,
+            Self::GrainScale,
         ]
     }
 
     fn label(self) -> &'static str {
         match self {
             Self::Exposure => "Exposure EV",
+            Self::CreativeTemperature => "Creative temperature",
+            Self::CreativeTint => "Creative tint",
             Self::Midpoint => "Midpoint",
             Self::Slope => "Slope",
             Self::ToeLift => "Toe lift",
             Self::ShoulderMax => "Shoulder max",
+            Self::GrainReduction => "Grain reduction",
+            Self::GrainStrength => "Grain strength",
+            Self::GrainScale => "Grain scale",
         }
     }
 
     fn step(self) -> f64 {
         match self {
             Self::Exposure => 0.10,
+            Self::CreativeTemperature | Self::CreativeTint => 0.05,
             Self::Midpoint => 0.01,
             Self::Slope => 0.10,
             Self::ToeLift => 0.002,
             Self::ShoulderMax => 0.002,
+            Self::GrainReduction => 1.0,
+            Self::GrainStrength => 0.05,
+            Self::GrainScale => 0.10,
         }
     }
 }
@@ -320,7 +339,7 @@ fn draw_ui(frame: &mut Frame, state: &UiState) {
         SelectedControl::all()
             .into_iter()
             .map(|control| {
-                let value = control_value(controls, control);
+                let value = control_display_value(controls, control);
                 let marker = if control == state.selected {
                     "> "
                 } else {
@@ -336,7 +355,7 @@ fn draw_ui(frame: &mut Frame, state: &UiState) {
                 ListItem::new(Line::from(vec![
                     Span::styled(marker, style),
                     Span::styled(format!("{:<14}", control.label()), style),
-                    Span::styled(format!("{:>8.4}", value), style),
+                    Span::styled(format!("{value:>8}"), style),
                 ]))
             })
             .collect::<Vec<_>>()
@@ -372,6 +391,12 @@ fn adjust_selected_control(
         SelectedControl::Exposure => {
             controls.exposure_ev = (controls.exposure_ev + delta).clamp(-4.0, 4.0)
         }
+        SelectedControl::CreativeTemperature => {
+            controls.creative_temperature = (controls.creative_temperature + delta).clamp(-1.0, 1.0)
+        }
+        SelectedControl::CreativeTint => {
+            controls.creative_tint = (controls.creative_tint + delta).clamp(-1.0, 1.0)
+        }
         SelectedControl::Midpoint => {
             controls.midpoint = (controls.midpoint + delta).clamp(0.001, 0.999)
         }
@@ -381,6 +406,15 @@ fn adjust_selected_control(
         }
         SelectedControl::ShoulderMax => {
             controls.shoulder_max = (controls.shoulder_max + delta).clamp(0.5, 1.0)
+        }
+        SelectedControl::GrainReduction => controls.grain_reduction_enabled = delta > 0.0,
+        SelectedControl::GrainStrength => {
+            controls.grain_reduction_strength =
+                (controls.grain_reduction_strength + delta).clamp(0.0, 1.0)
+        }
+        SelectedControl::GrainScale => {
+            controls.grain_reduction_scale =
+                (controls.grain_reduction_scale + delta).clamp(0.5, 4.0)
         }
     }
     state.controls = Some(controls);
@@ -398,13 +432,28 @@ fn adjust_selected_control(
     *last_edit = Instant::now();
 }
 
-fn control_value(controls: InteractiveRenderControls, control: SelectedControl) -> f64 {
+fn control_display_value(controls: InteractiveRenderControls, control: SelectedControl) -> String {
     match control {
-        SelectedControl::Exposure => controls.exposure_ev,
-        SelectedControl::Midpoint => controls.midpoint,
-        SelectedControl::Slope => controls.slope,
-        SelectedControl::ToeLift => controls.toe_lift,
-        SelectedControl::ShoulderMax => controls.shoulder_max,
+        SelectedControl::Exposure => format!("{:.4}", controls.exposure_ev),
+        SelectedControl::CreativeTemperature => {
+            format!("{:.4}", controls.creative_temperature)
+        }
+        SelectedControl::CreativeTint => format!("{:.4}", controls.creative_tint),
+        SelectedControl::Midpoint => format!("{:.4}", controls.midpoint),
+        SelectedControl::Slope => format!("{:.4}", controls.slope),
+        SelectedControl::ToeLift => format!("{:.4}", controls.toe_lift),
+        SelectedControl::ShoulderMax => format!("{:.4}", controls.shoulder_max),
+        SelectedControl::GrainReduction => {
+            if controls.grain_reduction_enabled {
+                "on".to_string()
+            } else {
+                "off".to_string()
+            }
+        }
+        SelectedControl::GrainStrength => {
+            format!("{:.4}", controls.grain_reduction_strength)
+        }
+        SelectedControl::GrainScale => format!("{:.4}", controls.grain_reduction_scale),
     }
 }
 

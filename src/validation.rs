@@ -1,4 +1,6 @@
-use crate::report::{format_system_time_utc, system_time_unix_ms, PhaseReport, PipelineReport};
+use crate::report::{
+    format_system_time_utc, hash_file_sha256, system_time_unix_ms, PhaseReport, PipelineReport,
+};
 use crate::tiff_io;
 use crate::{color_calibration, colorspace, tonemap};
 use nalgebra::{Matrix3, Vector3};
@@ -15,15 +17,140 @@ pub struct ValidationSummary {
     pub fixture: String,
     pub report: ReportIdentitySummary,
     pub render: RenderDiagnosticSummary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostic_consistency_issues: Vec<String>,
+    #[serde(default)]
+    pub input_orientation: InputOrientationValidationSummary,
+    #[serde(default)]
+    pub deskew: DeskewValidationSummary,
+    #[serde(default)]
+    pub border_crop: BorderCropValidationSummary,
     pub stitch: StitchValidationSummary,
     pub base_density: BaseDensityValidationSummary,
+    #[serde(default)]
+    pub negative_reconstruction: NegativeReconstructionValidationSummary,
     pub colorspace: ColorspaceValidationSummary,
+    #[serde(default)]
+    pub white_balance: WhiteBalanceValidationSummary,
     pub tone: ToneValidationSummary,
     pub warnings: Vec<PhaseWarnings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary_baseline_comparison: Option<SummaryBaselineComparison>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comparison: Option<RenderComparisonSummary>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct InputOrientationValidationSummary {
+    pub input_count: Option<usize>,
+    pub component_count: usize,
+    pub all_components_reported: Option<bool>,
+    pub components: Vec<InputOrientationComponentValidationSummary>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct InputOrientationComponentValidationSummary {
+    pub index: Option<usize>,
+    pub decoded_pixel_sha256: Option<String>,
+    pub source_orientation_materialized_decoded_pixel_sha256: Option<String>,
+    pub tag_value: Option<u16>,
+    pub metadata_transform: Option<String>,
+    pub metadata_applied: Option<bool>,
+    pub orientation_correction_requested: Option<String>,
+    pub orientation_correction_transform: Option<String>,
+    pub orientation_correction_applied: Option<bool>,
+    pub effective_tag_value: Option<u16>,
+    pub transform: Option<String>,
+    pub applied: Option<bool>,
+    pub source_width: Option<usize>,
+    pub source_height: Option<usize>,
+    pub output_width: Option<usize>,
+    pub output_height: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DeskewValidationSummary {
+    pub requested_mode: Option<String>,
+    pub status: Option<String>,
+    pub applied: Option<bool>,
+    pub applied_component_count: Option<usize>,
+    pub input_count: Option<usize>,
+    pub component_count: usize,
+    pub all_components_reported: Option<bool>,
+    pub all_components_applied: Option<bool>,
+    pub minimum_component_retained_area_ratio: Option<f64>,
+    pub detected_source_skew_degrees: Option<f64>,
+    pub correction_degrees: Option<f64>,
+    pub confidence: Option<f64>,
+    pub review_required: Option<bool>,
+    pub review_reason: Option<String>,
+    pub retained_area_ratio: Option<f64>,
+    pub proposed_retained_area_ratio: Option<f64>,
+    pub supporting_side_count: Option<usize>,
+    pub horizontal_side_count: Option<usize>,
+    pub vertical_side_count: Option<usize>,
+    pub side_angle_spread_degrees: Option<f64>,
+    pub interpolation: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct BorderCropValidationSummary {
+    pub input_count: Option<usize>,
+    pub component_count: usize,
+    pub all_components_reported: Option<bool>,
+    pub cropped_component_count: usize,
+    pub all_components_cropped: Option<bool>,
+    pub total_removed_edge_count: usize,
+    pub minimum_removed_edge_count_per_component: Option<usize>,
+    pub minimum_retained_area_ratio: Option<f64>,
+    pub maximum_retained_area_ratio: Option<f64>,
+    pub rejected_crop_warning_count: usize,
+    pub components: Vec<BorderCropComponentValidationSummary>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct BorderCropComponentValidationSummary {
+    pub index: Option<usize>,
+    pub top_removed: Option<usize>,
+    pub bottom_removed: Option<usize>,
+    pub left_removed: Option<usize>,
+    pub right_removed: Option<usize>,
+    pub removed_edge_count: Option<usize>,
+    pub dead_zone_detected: Option<bool>,
+    pub input_width: Option<usize>,
+    pub input_height: Option<usize>,
+    pub output_width: Option<usize>,
+    pub output_height: Option<usize>,
+    pub retained_area_ratio: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WhiteBalanceValidationSummary {
+    pub technical_requested_mode: Option<String>,
+    pub technical_status: Option<String>,
+    pub technical_source: Option<String>,
+    pub technical_reason: Option<String>,
+    pub technical_applied: Option<bool>,
+    pub technical_confidence: Option<f64>,
+    pub technical_review_required: Option<bool>,
+    pub technical_sample_count: Option<usize>,
+    pub technical_occupied_spatial_bin_count: Option<usize>,
+    pub technical_populated_luminance_band_count: Option<usize>,
+    pub technical_estimated_source_cct_kelvin: Option<f64>,
+    pub technical_pre_neutral_log_chroma: Option<f64>,
+    pub technical_post_neutral_log_chroma: Option<f64>,
+    pub creative_applied: Option<bool>,
+    pub creative_temperature: Option<f64>,
+    pub creative_tint: Option<f64>,
+    pub creative_target_temperature_kelvin: Option<f64>,
+    pub creative_separated_from_technical_master: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -33,6 +160,16 @@ pub struct ReportIdentitySummary {
     pub generated_at_unix_ms: Option<u64>,
     pub package_version: Option<String>,
     pub binary_name: Option<String>,
+    #[serde(default)]
+    pub binary_path: Option<String>,
+    #[serde(default)]
+    pub binary_sha256: Option<String>,
+    #[serde(default)]
+    pub binary_file_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub binary_identity_status: Option<String>,
+    #[serde(default)]
+    pub binary_identity_error: Option<String>,
     pub working_directory: Option<String>,
     pub cli_args: Option<Vec<String>>,
     pub output_path: Option<String>,
@@ -40,13 +177,21 @@ pub struct ReportIdentitySummary {
     pub pipeline_schema_version: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RenderDiagnosticSummary {
     pub source_report_path: Option<String>,
     pub source_report_generated_at: Option<String>,
+    #[serde(default)]
+    pub artifact_sha256_binding_required: bool,
     pub output_path: Option<String>,
     pub output_modified_at: Option<String>,
     pub output_file_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub output_sha256: Option<String>,
+    #[serde(default)]
+    pub output_file_sha256: Option<String>,
+    #[serde(default)]
+    pub output_file_sha256_matches_report: Option<bool>,
     pub output_color_space: Option<String>,
     pub output_icc_profile_embedded: Option<bool>,
     pub output_icc_profile_description: Option<String>,
@@ -55,6 +200,18 @@ pub struct RenderDiagnosticSummary {
     pub output_file_icc_profile_valid: Option<bool>,
     pub output_file_icc_profile_description: Option<String>,
     pub output_file_icc_profile_matches_report: Option<bool>,
+    #[serde(default)]
+    pub output_file_width: Option<usize>,
+    #[serde(default)]
+    pub output_file_height: Option<usize>,
+    #[serde(default)]
+    pub output_file_color_type: Option<String>,
+    #[serde(default)]
+    pub output_file_sample_format: Option<Vec<u16>>,
+    #[serde(default)]
+    pub output_file_dimensions_match_report: Option<bool>,
+    #[serde(default)]
+    pub output_file_storage_matches_report: Option<bool>,
     pub output_width: Option<usize>,
     pub output_height: Option<usize>,
     #[serde(default)]
@@ -62,9 +219,69 @@ pub struct RenderDiagnosticSummary {
     #[serde(default)]
     pub quality_mode: Option<String>,
     #[serde(default)]
+    pub master_scene_referred_requested: Option<bool>,
+    #[serde(default)]
     pub master_scene_referred_path: Option<String>,
     #[serde(default)]
+    pub master_scene_referred_sha256: Option<String>,
+    #[serde(default)]
+    pub master_scene_referred_file_sha256: Option<String>,
+    #[serde(default)]
+    pub master_scene_referred_file_sha256_matches_report: Option<bool>,
+    #[serde(default)]
+    pub master_scene_referred_file_status: Option<String>,
+    #[serde(default)]
+    pub master_scene_referred_file_width: Option<usize>,
+    #[serde(default)]
+    pub master_scene_referred_file_height: Option<usize>,
+    #[serde(default)]
+    pub master_scene_referred_file_color_type: Option<String>,
+    #[serde(default)]
+    pub master_scene_referred_file_sample_format: Option<Vec<u16>>,
+    #[serde(default)]
+    pub master_scene_referred_file_icc_profile_valid: Option<bool>,
+    #[serde(default)]
+    pub master_scene_referred_file_icc_profile_description: Option<String>,
+    #[serde(default)]
+    pub master_scene_referred_file_matches_report: Option<bool>,
+    #[serde(default)]
+    pub review_srgb_requested: Option<bool>,
+    #[serde(default)]
     pub review_srgb_path: Option<String>,
+    #[serde(default)]
+    pub review_srgb_sha256: Option<String>,
+    #[serde(default)]
+    pub review_srgb_file_sha256: Option<String>,
+    #[serde(default)]
+    pub review_srgb_file_sha256_matches_report: Option<bool>,
+    #[serde(default)]
+    pub review_srgb_file_status: Option<String>,
+    #[serde(default)]
+    pub review_srgb_file_width: Option<usize>,
+    #[serde(default)]
+    pub review_srgb_file_height: Option<usize>,
+    #[serde(default)]
+    pub review_srgb_file_color_type: Option<String>,
+    #[serde(default)]
+    pub review_srgb_file_icc_profile_valid: Option<bool>,
+    #[serde(default)]
+    pub review_srgb_file_icc_profile_description: Option<String>,
+    #[serde(default)]
+    pub review_srgb_file_icc_profile_matches_standard_srgb: Option<bool>,
+    #[serde(default)]
+    pub review_srgb_file_matches_report: Option<bool>,
+    #[serde(default)]
+    pub review_srgb_gamut_mapping_space: Option<String>,
+    #[serde(default)]
+    pub review_srgb_gamut_mapped_ratio: Option<f64>,
+    #[serde(default)]
+    pub review_srgb_gamut_mapping_mean_chroma_scale: Option<f64>,
+    #[serde(default)]
+    pub review_srgb_gamut_mapping_min_chroma_scale: Option<f64>,
+    #[serde(default)]
+    pub review_srgb_post_map_out_of_gamut_pixel_count: Option<usize>,
+    #[serde(default)]
+    pub review_srgb_gamut_mapping_supported: Option<bool>,
     #[serde(default)]
     pub review_sidecar_sha256: Option<String>,
     #[serde(default)]
@@ -75,6 +292,22 @@ pub struct RenderDiagnosticSummary {
     pub render_reviewable: Option<bool>,
     #[serde(default)]
     pub render_review_reason: Option<String>,
+    #[serde(default)]
+    pub tone_output_review_required: Option<bool>,
+    #[serde(default)]
+    pub tone_output_review_reason: Option<String>,
+    #[serde(default)]
+    pub tone_output_confidence_status: Option<String>,
+    #[serde(default)]
+    pub tone_output_evidence_confidence: Option<f64>,
+    #[serde(default)]
+    pub tone_output_render_luminance_range_p05_p95: Option<f64>,
+    #[serde(default)]
+    pub tone_output_render_to_mapped_luminance_range_ratio: Option<f64>,
+    #[serde(default)]
+    pub tone_output_maximum_post_tone_high_clip_ratio: Option<f64>,
+    #[serde(default)]
+    pub tone_output_maximum_post_tone_low_clip_ratio: Option<f64>,
     #[serde(default)]
     pub positive_input_likely_negative_like: Option<bool>,
     #[serde(default)]
@@ -117,11 +350,253 @@ pub struct RenderDiagnosticSummary {
     #[serde(default)]
     pub noise_reduction_enabled: Option<bool>,
     #[serde(default)]
+    pub noise_reduction_requested_enabled: Option<bool>,
+    #[serde(default)]
+    pub noise_reduction_requested_strength: Option<f64>,
+    #[serde(default)]
+    pub noise_reduction_requested_scale: Option<f64>,
+    #[serde(default)]
     pub noise_reduction_applied_ratio: Option<f64>,
+    #[serde(default)]
+    pub noise_reduction_structure_gate_start: Option<f64>,
+    #[serde(default)]
+    pub noise_reduction_structure_gate_end: Option<f64>,
+    #[serde(default)]
+    pub noise_reduction_structure_excluded_ratio: Option<f64>,
     #[serde(default)]
     pub noise_reduction_mean_abs_chroma_delta: Option<f64>,
     #[serde(default)]
     pub noise_reduction_mean_abs_luma_delta: Option<f64>,
+    #[serde(default)]
+    pub noise_reduction_flat_luma_p95_reduction_ratio: Option<f64>,
+    #[serde(default)]
+    pub noise_reduction_flat_chroma_p95_reduction_ratio: Option<f64>,
+}
+
+/// Returns fail-closed delivery-artifact problems for a compact render record.
+///
+/// Final image reviewability is distinct from successful processing: the referenced output must
+/// exist strongly enough to be independently inspected, have nonzero dimensions, carry the ICC
+/// profile reported by the pipeline, and have an explicit zero stale-artifact count.
+pub fn delivery_artifact_integrity_issues(render: &RenderDiagnosticSummary) -> Vec<&'static str> {
+    let mut issues = Vec::new();
+    if render
+        .output_path
+        .as_deref()
+        .is_none_or(|path| path.trim().is_empty())
+    {
+        issues.push("output_path_missing");
+    }
+    if render.output_width.is_none_or(|width| width == 0)
+        || render.output_height.is_none_or(|height| height == 0)
+    {
+        issues.push("output_dimensions_missing_or_invalid");
+    }
+    match render.output_file_dimensions_match_report {
+        Some(true) => {}
+        Some(false) => issues.push("output_dimensions_mismatch"),
+        None => issues.push("output_dimension_evidence_missing"),
+    }
+    match render.output_file_storage_matches_report {
+        Some(true) => {}
+        Some(false) => issues.push("output_storage_mismatch"),
+        None => issues.push("output_storage_evidence_missing"),
+    }
+    match render.output_file_icc_profile_matches_report {
+        Some(true) => {}
+        Some(false) => issues.push("output_icc_profile_mismatch"),
+        None => issues.push("output_icc_profile_evidence_missing"),
+    }
+    if render.artifact_sha256_binding_required {
+        append_artifact_sha256_issues(
+            &mut issues,
+            "output",
+            render.output_sha256.as_deref(),
+            render.output_file_sha256.as_deref(),
+            render.output_file_sha256_matches_report,
+        );
+    }
+    append_promised_artifact_issues(
+        &mut issues,
+        "master_scene_referred",
+        render.master_scene_referred_requested,
+        render.master_scene_referred_path.as_deref(),
+        render.master_scene_referred_file_matches_report,
+    );
+    append_promised_artifact_issues(
+        &mut issues,
+        "review_srgb",
+        render.review_srgb_requested,
+        render.review_srgb_path.as_deref(),
+        render.review_srgb_file_matches_report,
+    );
+    if render.artifact_sha256_binding_required {
+        append_promised_artifact_sha256_issues(
+            &mut issues,
+            "master_scene_referred",
+            render.master_scene_referred_requested,
+            render.master_scene_referred_sha256.as_deref(),
+            render.master_scene_referred_file_sha256.as_deref(),
+            render.master_scene_referred_file_sha256_matches_report,
+        );
+        append_promised_artifact_sha256_issues(
+            &mut issues,
+            "review_srgb",
+            render.review_srgb_requested,
+            render.review_srgb_sha256.as_deref(),
+            render.review_srgb_file_sha256.as_deref(),
+            render.review_srgb_file_sha256_matches_report,
+        );
+    }
+    match render.review_srgb_requested {
+        Some(true) => match render.review_srgb_gamut_mapping_supported {
+            Some(true) => {}
+            Some(false) => issues.push("review_srgb_gamut_mapping_not_supported"),
+            None => issues.push("review_srgb_gamut_mapping_evidence_missing"),
+        },
+        Some(false) => {
+            if render.review_srgb_gamut_mapping_supported.is_some() {
+                issues.push("review_srgb_gamut_mapping_request_evidence_inconsistent");
+            }
+        }
+        None => {}
+    }
+    match render.stale_render_artifact_count {
+        Some(0) => {}
+        Some(_) => issues.push("stale_render_artifacts"),
+        None => issues.push("stale_render_artifact_evidence_missing"),
+    }
+    issues
+}
+
+fn append_artifact_sha256_issues(
+    issues: &mut Vec<&'static str>,
+    artifact: &'static str,
+    declared_sha256: Option<&str>,
+    actual_sha256: Option<&str>,
+    matches_report: Option<bool>,
+) {
+    let declaration_valid = declared_sha256.is_some_and(is_valid_sha256_hex);
+    match artifact {
+        "output" => {
+            if !declaration_valid {
+                issues.push("output_sha256_declaration_missing_or_invalid");
+            } else if actual_sha256.is_none() {
+                issues.push("output_sha256_evidence_missing");
+            } else if matches_report != Some(true) {
+                issues.push("output_sha256_mismatch");
+            }
+        }
+        "master_scene_referred" => {
+            if !declaration_valid {
+                issues.push("master_scene_referred_sha256_declaration_missing_or_invalid");
+            } else if actual_sha256.is_none() {
+                issues.push("master_scene_referred_sha256_evidence_missing");
+            } else if matches_report != Some(true) {
+                issues.push("master_scene_referred_sha256_mismatch");
+            }
+        }
+        "review_srgb" => {
+            if !declaration_valid {
+                issues.push("review_srgb_sha256_declaration_missing_or_invalid");
+            } else if actual_sha256.is_none() {
+                issues.push("review_srgb_sha256_evidence_missing");
+            } else if matches_report != Some(true) {
+                issues.push("review_srgb_sha256_mismatch");
+            }
+        }
+        _ => unreachable!("unsupported SHA-256 delivery artifact"),
+    }
+}
+
+fn append_promised_artifact_sha256_issues(
+    issues: &mut Vec<&'static str>,
+    artifact: &'static str,
+    requested: Option<bool>,
+    declared_sha256: Option<&str>,
+    actual_sha256: Option<&str>,
+    matches_report: Option<bool>,
+) {
+    match requested {
+        Some(true) => append_artifact_sha256_issues(
+            issues,
+            artifact,
+            declared_sha256,
+            actual_sha256,
+            matches_report,
+        ),
+        Some(false) => {
+            if declared_sha256.is_some() || actual_sha256.is_some() || matches_report.is_some() {
+                match artifact {
+                    "master_scene_referred" => {
+                        issues.push("master_scene_referred_sha256_request_evidence_inconsistent")
+                    }
+                    "review_srgb" => {
+                        issues.push("review_srgb_sha256_request_evidence_inconsistent")
+                    }
+                    _ => unreachable!("unsupported promised SHA-256 delivery artifact"),
+                }
+            }
+        }
+        None => {}
+    }
+}
+
+fn is_valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn append_promised_artifact_issues(
+    issues: &mut Vec<&'static str>,
+    artifact: &'static str,
+    requested: Option<bool>,
+    path: Option<&str>,
+    matches_report: Option<bool>,
+) {
+    let path_present = path.is_some_and(|path| !path.trim().is_empty());
+    match (artifact, requested) {
+        ("master_scene_referred", Some(true)) => {
+            if !path_present {
+                issues.push("master_scene_referred_path_missing");
+            }
+            match matches_report {
+                Some(true) => {}
+                Some(false) => issues.push("master_scene_referred_artifact_mismatch"),
+                None => issues.push("master_scene_referred_artifact_evidence_missing"),
+            }
+        }
+        ("master_scene_referred", Some(false)) => {
+            if path_present || matches_report.is_some() {
+                issues.push("master_scene_referred_request_evidence_inconsistent");
+            }
+        }
+        ("master_scene_referred", None) => {
+            issues.push("master_scene_referred_request_evidence_missing");
+        }
+        ("review_srgb", Some(true)) => {
+            if !path_present {
+                issues.push("review_srgb_path_missing");
+            }
+            match matches_report {
+                Some(true) => {}
+                Some(false) => issues.push("review_srgb_artifact_mismatch"),
+                None => issues.push("review_srgb_artifact_evidence_missing"),
+            }
+        }
+        ("review_srgb", Some(false)) => {
+            if path_present || matches_report.is_some() {
+                issues.push("review_srgb_request_evidence_inconsistent");
+            }
+        }
+        ("review_srgb", None) => issues.push("review_srgb_request_evidence_missing"),
+        _ => unreachable!("unsupported delivery artifact"),
+    }
+}
+
+pub fn final_delivery_evidence_is_reviewable(render: &RenderDiagnosticSummary) -> bool {
+    render.render_review_status.as_deref() == Some("reviewable")
+        && render.render_reviewable == Some(true)
+        && delivery_artifact_integrity_issues(render).is_empty()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -179,6 +654,24 @@ pub struct RenderComparisonSummary {
     pub calibration_source_changed: bool,
     pub colorspace_candidate_risk_changed: bool,
     pub colorspace_tone_color_trust_state_changed: bool,
+    #[serde(default)]
+    pub render_review_status_changed: bool,
+    #[serde(default)]
+    pub render_reviewable_changed: bool,
+    #[serde(default)]
+    pub tone_output_confidence_status_changed: bool,
+    #[serde(default)]
+    pub tone_output_review_required_changed: bool,
+    #[serde(default)]
+    pub tone_output_evidence_confidence_delta: Option<f64>,
+    #[serde(default)]
+    pub tone_output_render_luminance_range_p05_p95_delta: Option<f64>,
+    #[serde(default)]
+    pub tone_output_render_to_mapped_luminance_range_ratio_delta: Option<f64>,
+    #[serde(default)]
+    pub tone_output_maximum_post_tone_high_clip_ratio_delta: Option<f64>,
+    #[serde(default)]
+    pub tone_output_maximum_post_tone_low_clip_ratio_delta: Option<f64>,
     pub colorspace_selected_quality_score_delta: Option<f64>,
     pub colorspace_density_monotonicity_score_delta: Option<f64>,
     #[serde(default)]
@@ -231,6 +724,30 @@ pub struct TrackedStitchBaseline {
     pub chosen_hypothesis: Option<String>,
     #[serde(default)]
     pub seam_exposure_correction_applied: Option<bool>,
+    #[serde(default)]
+    pub seam_exposure_model: Option<String>,
+    #[serde(default)]
+    pub seam_exposure_spatial_2d_gain_accepted: Option<bool>,
+    #[serde(default)]
+    pub seam_exposure_spatial_2d_gain_offset_accepted: Option<bool>,
+    #[serde(default)]
+    pub seam_exposure_spatial_quadratic_gain_accepted: Option<bool>,
+    #[serde(default)]
+    pub seam_exposure_spatial_quadratic_gain_offset_accepted: Option<bool>,
+    #[serde(default)]
+    pub seam_blend_mode: Option<String>,
+    #[serde(default)]
+    pub seam_blend_applied: Option<bool>,
+    #[serde(default)]
+    pub seam_blend_review_required: Option<bool>,
+    #[serde(default)]
+    pub seam_detail_review_required: Option<bool>,
+    #[serde(default)]
+    pub seam_detail_max_symmetric_energy_ratio: Option<f64>,
+    #[serde(default)]
+    pub seam_gradient_ratio: Option<f64>,
+    #[serde(default)]
+    pub seam_overlap_p95_abs_difference: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -254,6 +771,10 @@ pub struct TrackedRenderBaseline {
     pub render_input_source: Option<String>,
     #[serde(default)]
     pub colorspace_mapping_strategy: Option<String>,
+    #[serde(default)]
+    pub render_review_status: Option<String>,
+    #[serde(default)]
+    pub render_reviewable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -289,6 +810,8 @@ pub struct TrackedColorspaceBaseline {
     pub selected_candidate_rank: Option<usize>,
     #[serde(default)]
     pub calibration_acceptance_status: Option<String>,
+    #[serde(default)]
+    pub calibration_color_mapping_applied: Option<bool>,
     #[serde(default)]
     pub calibration_acceptance_preferred_candidate: Option<String>,
     #[serde(default)]
@@ -425,6 +948,50 @@ pub struct TrackedToneBaseline {
     pub highlight_neutral_chroma_compressed_ratio: Option<f64>,
     #[serde(default)]
     pub shadow_chroma_compressed_ratio: Option<f64>,
+    #[serde(default)]
+    pub tone_output_confidence_status: Option<String>,
+    #[serde(default)]
+    pub tone_output_review_required: Option<bool>,
+    #[serde(default)]
+    pub tone_output_evidence_confidence: Option<f64>,
+    #[serde(default)]
+    pub render_luminance_range_p05_p95: Option<f64>,
+    #[serde(default)]
+    pub render_to_mapped_luminance_range_ratio: Option<f64>,
+    #[serde(default)]
+    pub maximum_post_tone_high_clip_ratio: Option<f64>,
+    #[serde(default)]
+    pub maximum_post_tone_low_clip_ratio: Option<f64>,
+    #[serde(default)]
+    pub adaptive_vibrance_skin_memory_protection_enabled: Option<bool>,
+    #[serde(default)]
+    pub adaptive_vibrance_skin_memory_protection_space: Option<String>,
+    #[serde(default)]
+    pub adaptive_vibrance_skin_memory_protected_ratio: Option<f64>,
+    #[serde(default)]
+    pub adaptive_vibrance_skin_memory_mean_protection: Option<f64>,
+    #[serde(default)]
+    pub adaptive_vibrance_preferred_memory_color_guard_enabled: Option<bool>,
+    #[serde(default)]
+    pub adaptive_vibrance_preferred_memory_color_guard_space: Option<String>,
+    #[serde(default)]
+    pub adaptive_vibrance_preferred_memory_color_guard_reference: Option<String>,
+    #[serde(default)]
+    pub adaptive_vibrance_preferred_memory_color_matched_ratio: Option<f64>,
+    #[serde(default)]
+    pub adaptive_vibrance_preferred_memory_color_limited_ratio: Option<f64>,
+    #[serde(default)]
+    pub adaptive_vibrance_preferred_memory_color_mean_scale_reduction: Option<f64>,
+    #[serde(default)]
+    pub preferred_skin_rendering_enabled: Option<bool>,
+    #[serde(default)]
+    pub preferred_skin_rendering_space: Option<String>,
+    #[serde(default)]
+    pub preferred_skin_rendering_preference_reference: Option<String>,
+    #[serde(default)]
+    pub preferred_skin_rendering_adjusted_ratio: Option<f64>,
+    #[serde(default)]
+    pub preferred_skin_rendering_mean_delta_e_ab: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -436,6 +1003,14 @@ pub struct TrackedGrainBaseline {
     pub chroma_residual_p95: Option<f64>,
     #[serde(default)]
     pub chroma_to_luma_p95_ratio: Option<f64>,
+    #[serde(default)]
+    pub detail_review_required: Option<bool>,
+    #[serde(default)]
+    pub detail_decision_supported: Option<bool>,
+    #[serde(default)]
+    pub luminance_p10_retention: Option<f64>,
+    #[serde(default)]
+    pub chroma_p10_retention: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -452,6 +1027,30 @@ pub struct SummaryBaselineComparison {
     pub stitch_confidence_delta: Option<f64>,
     pub chosen_hypothesis_changed: bool,
     pub seam_exposure_correction_changed: bool,
+    #[serde(default)]
+    pub seam_exposure_model_changed: bool,
+    #[serde(default)]
+    pub seam_exposure_spatial_2d_gain_acceptance_changed: bool,
+    #[serde(default)]
+    pub seam_exposure_spatial_2d_gain_offset_acceptance_changed: bool,
+    #[serde(default)]
+    pub seam_exposure_spatial_quadratic_gain_acceptance_changed: bool,
+    #[serde(default)]
+    pub seam_exposure_spatial_quadratic_gain_offset_acceptance_changed: bool,
+    #[serde(default)]
+    pub seam_blend_mode_changed: bool,
+    #[serde(default)]
+    pub seam_blend_applied_changed: bool,
+    #[serde(default)]
+    pub seam_blend_review_required_changed: bool,
+    #[serde(default)]
+    pub seam_detail_review_required_changed: bool,
+    #[serde(default)]
+    pub seam_detail_max_symmetric_energy_ratio_delta: Option<f64>,
+    #[serde(default)]
+    pub seam_gradient_ratio_delta: Option<f64>,
+    #[serde(default)]
+    pub seam_overlap_p95_abs_difference_delta: Option<f64>,
     pub base_estimate_source_changed: bool,
     #[serde(default)]
     pub raw_base_proxy_confidence_delta: Option<f64>,
@@ -487,6 +1086,8 @@ pub struct SummaryBaselineComparison {
     #[serde(default)]
     pub colorspace_candidate_acceptance_changed: bool,
     pub calibration_acceptance_status_changed: bool,
+    #[serde(default)]
+    pub calibration_color_mapping_applied_changed: bool,
     pub calibration_acceptance_preferred_candidate_changed: bool,
     pub calibration_acceptance_beats_image_derived_changed: bool,
     pub colorspace_candidate_risk_changed: bool,
@@ -552,17 +1153,75 @@ pub struct SummaryBaselineComparison {
     pub colorspace_debug_artifact_invalid_count: usize,
     #[serde(default)]
     pub colorspace_debug_artifact_issues: Vec<String>,
+    #[serde(default)]
+    pub render_review_status_changed: bool,
+    #[serde(default)]
+    pub render_reviewable_changed: bool,
+    #[serde(default)]
+    pub tone_output_confidence_status_changed: bool,
+    #[serde(default)]
+    pub tone_output_review_required_changed: bool,
+    #[serde(default)]
+    pub tone_output_evidence_confidence_delta: Option<f64>,
+    #[serde(default)]
+    pub tone_output_render_luminance_range_p05_p95_delta: Option<f64>,
+    #[serde(default)]
+    pub tone_output_render_to_mapped_luminance_range_ratio_delta: Option<f64>,
+    #[serde(default)]
+    pub tone_output_maximum_post_tone_high_clip_ratio_delta: Option<f64>,
+    #[serde(default)]
+    pub tone_output_maximum_post_tone_low_clip_ratio_delta: Option<f64>,
     pub highlight_chroma_compressed_ratio_delta: Option<f64>,
     pub highlight_neutral_chroma_compressed_ratio_delta: Option<f64>,
     pub shadow_chroma_compressed_ratio_delta: Option<f64>,
+    #[serde(default)]
+    pub adaptive_vibrance_skin_memory_protection_enabled_changed: bool,
+    #[serde(default)]
+    pub adaptive_vibrance_skin_memory_protection_space_changed: bool,
+    #[serde(default)]
+    pub adaptive_vibrance_skin_memory_protected_ratio_delta: Option<f64>,
+    #[serde(default)]
+    pub adaptive_vibrance_skin_memory_mean_protection_delta: Option<f64>,
+    #[serde(default)]
+    pub adaptive_vibrance_preferred_memory_color_guard_enabled_changed: bool,
+    #[serde(default)]
+    pub adaptive_vibrance_preferred_memory_color_guard_space_changed: bool,
+    #[serde(default)]
+    pub adaptive_vibrance_preferred_memory_color_guard_reference_changed: bool,
+    #[serde(default)]
+    pub adaptive_vibrance_preferred_memory_color_matched_ratio_delta: Option<f64>,
+    #[serde(default)]
+    pub adaptive_vibrance_preferred_memory_color_limited_ratio_delta: Option<f64>,
+    #[serde(default)]
+    pub adaptive_vibrance_preferred_memory_color_mean_scale_reduction_delta: Option<f64>,
+    #[serde(default)]
+    pub preferred_skin_rendering_enabled_changed: bool,
+    #[serde(default)]
+    pub preferred_skin_rendering_space_changed: bool,
+    #[serde(default)]
+    pub preferred_skin_rendering_preference_reference_changed: bool,
+    #[serde(default)]
+    pub preferred_skin_rendering_adjusted_ratio_delta: Option<f64>,
+    #[serde(default)]
+    pub preferred_skin_rendering_mean_delta_e_ab_delta: Option<f64>,
     pub luma_residual_p95_ratio: Option<f64>,
     pub chroma_residual_p95_ratio: Option<f64>,
     pub chroma_to_luma_p95_ratio_delta: Option<f64>,
+    #[serde(default)]
+    pub grain_detail_review_required_changed: bool,
+    #[serde(default)]
+    pub grain_detail_decision_supported_changed: bool,
+    #[serde(default)]
+    pub grain_detail_luminance_p10_retention_delta: Option<f64>,
+    #[serde(default)]
+    pub grain_detail_chroma_p10_retention_delta: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StitchValidationSummary {
     pub decision: Option<String>,
+    #[serde(default)]
+    pub inferred_order: Vec<usize>,
     pub confidence: Option<f64>,
     pub chosen_hypothesis: Option<String>,
     pub rejection_reason: Option<String>,
@@ -576,7 +1235,13 @@ pub struct StitchValidationSummary {
     pub vertical_offset_plausibility_score: Option<f64>,
     pub local_consistency_score: Option<f64>,
     pub plausibility_score: Option<f64>,
+    #[serde(default)]
+    pub homography_feature_validation: Option<HomographyFeatureValidationSummary>,
+    #[serde(default)]
+    pub homography_spatial_validation: Option<HomographySpatialValidationSummary>,
     pub seam_exposure_correction: Option<SeamExposureCorrectionSummary>,
+    #[serde(default)]
+    pub seam_blend: Option<SeamBlendValidationSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -589,21 +1254,263 @@ pub struct StitchCandidateSummary {
     pub search_score: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct HomographyFeatureValidationSummary {
+    pub accepted: Option<bool>,
+    pub validation_count: usize,
+    pub accepted_count: usize,
+    pub partition_method: Option<String>,
+    pub minimum_training_match_count: Option<usize>,
+    pub minimum_held_out_match_count: Option<usize>,
+    pub minimum_training_spatial_cell_count: Option<usize>,
+    pub minimum_held_out_spatial_cell_count: Option<usize>,
+    pub minimum_training_inlier_ratio: Option<f64>,
+    pub minimum_held_out_inlier_ratio: Option<f64>,
+    pub minimum_reverse_validation_inlier_ratio: Option<f64>,
+    pub maximum_held_out_p95_error_px: Option<f64>,
+    pub maximum_reverse_validation_p95_error_px: Option<f64>,
+    pub maximum_cross_fit_disagreement_px: Option<f64>,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct HomographySpatialValidationSummary {
+    pub accepted: Option<bool>,
+    pub validation_count: usize,
+    pub accepted_count: usize,
+    pub method: Option<String>,
+    pub minimum_split_ncc_improvement: Option<f64>,
+    pub minimum_mean_ncc_improvement: Option<f64>,
+    pub minimum_split_registration_error_reduction: Option<f64>,
+    pub minimum_mean_registration_error_reduction: Option<f64>,
+    pub minimum_split_sample_count: Option<usize>,
+    pub minimum_model_deviation_from_translation_px: Option<f64>,
+    pub model_selection_limit: Option<String>,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct SeamExposureCorrectionSummary {
     pub mode: Option<String>,
+    pub model: Option<String>,
     pub applied: Option<bool>,
     pub reason: Option<String>,
     pub sample_count: Option<usize>,
     pub valid_sample_ratio: Option<f64>,
     pub gain_rgb: Option<Vec<f64>>,
     pub gain_luma: Option<f64>,
+    pub spatial_gain_log_slope_x_rgb: Option<Vec<f64>>,
+    pub spatial_gain_log_slope_x_luma: Option<f64>,
+    pub spatial_gain_log_slope_y_rgb: Option<Vec<f64>>,
+    pub spatial_gain_log_slope_y_luma: Option<f64>,
+    pub spatial_gain_log_quadratic_xx_rgb: Option<Vec<f64>>,
+    pub spatial_gain_log_quadratic_xx_luma: Option<f64>,
+    pub spatial_gain_log_quadratic_xy_rgb: Option<Vec<f64>>,
+    pub spatial_gain_log_quadratic_xy_luma: Option<f64>,
+    pub spatial_gain_log_quadratic_yy_rgb: Option<Vec<f64>>,
+    pub spatial_gain_log_quadratic_yy_luma: Option<f64>,
+    pub spatial_gain_top_rgb: Option<Vec<f64>>,
+    pub spatial_gain_bottom_rgb: Option<Vec<f64>>,
+    pub spatial_offset_slope_x_rgb: Option<Vec<f64>>,
+    pub spatial_offset_slope_x_luma: Option<f64>,
+    pub spatial_offset_slope_x_rgb_normalized: Option<Vec<f64>>,
+    pub spatial_offset_slope_y_rgb: Option<Vec<f64>>,
+    pub spatial_offset_slope_y_luma: Option<f64>,
+    pub spatial_offset_slope_y_rgb_normalized: Option<Vec<f64>>,
+    pub spatial_offset_quadratic_xx_rgb: Option<Vec<f64>>,
+    pub spatial_offset_quadratic_xx_luma: Option<f64>,
+    pub spatial_offset_quadratic_xx_rgb_normalized: Option<Vec<f64>>,
+    pub spatial_offset_quadratic_xy_rgb: Option<Vec<f64>>,
+    pub spatial_offset_quadratic_xy_luma: Option<f64>,
+    pub spatial_offset_quadratic_xy_rgb_normalized: Option<Vec<f64>>,
+    pub spatial_offset_quadratic_yy_rgb: Option<Vec<f64>>,
+    pub spatial_offset_quadratic_yy_luma: Option<f64>,
+    pub spatial_offset_quadratic_yy_rgb_normalized: Option<Vec<f64>>,
+    pub spatial_offset_top_rgb: Option<Vec<f64>>,
+    pub spatial_offset_bottom_rgb: Option<Vec<f64>>,
+    pub spatial_offset_top_rgb_normalized: Option<Vec<f64>>,
+    pub spatial_offset_bottom_rgb_normalized: Option<Vec<f64>>,
+    pub offset_rgb: Option<Vec<f64>>,
+    pub offset_luma: Option<f64>,
+    pub offset_rgb_normalized: Option<Vec<f64>>,
     pub seam_score_before: Option<f64>,
     pub seam_score_after: Option<f64>,
     pub clipped_high_before: Option<Vec<f64>>,
     pub clipped_high_after: Option<Vec<f64>>,
     pub clipped_low_before: Option<Vec<f64>>,
     pub clipped_low_after: Option<Vec<f64>>,
+    pub training_window_count: Option<usize>,
+    pub held_out_window_count: Option<usize>,
+    pub training_sample_count: Option<usize>,
+    pub held_out_sample_count: Option<usize>,
+    pub gain_offset_training_window_count: Option<usize>,
+    pub gain_offset_held_out_window_count: Option<usize>,
+    pub gain_offset_consistent_window_ratio: Option<f64>,
+    pub spatial_training_window_count: Option<usize>,
+    pub spatial_held_out_window_count: Option<usize>,
+    pub spatial_distinct_training_rows: Option<usize>,
+    pub spatial_distinct_held_out_rows: Option<usize>,
+    pub spatial_consistent_window_ratio: Option<f64>,
+    pub spatial_slope_agreement_ratio: Option<f64>,
+    pub spatial_affine_training_window_count: Option<usize>,
+    pub spatial_affine_held_out_window_count: Option<usize>,
+    pub spatial_affine_distinct_training_rows: Option<usize>,
+    pub spatial_affine_distinct_held_out_rows: Option<usize>,
+    pub spatial_affine_consistent_window_ratio: Option<f64>,
+    pub spatial_affine_slope_agreement_ratio: Option<f64>,
+    pub spatial_affine_center_offset_delta_normalized: Option<f64>,
+    pub held_out_identity_seam_score: Option<f64>,
+    pub held_out_gain_seam_score: Option<f64>,
+    pub held_out_gain_offset_seam_score: Option<f64>,
+    pub held_out_spatial_gain_seam_score: Option<f64>,
+    pub held_out_spatial_gain_offset_seam_score: Option<f64>,
+    pub held_out_selected_seam_score: Option<f64>,
+    pub held_out_improvement_over_identity: Option<f64>,
+    pub held_out_improvement_over_gain: Option<f64>,
+    pub held_out_spatial_improvement_over_best_constant: Option<f64>,
+    pub held_out_spatial_gain_offset_improvement_over_best_simpler: Option<f64>,
+    pub held_out_validation_passed: Option<bool>,
+    pub gain_offset_rejection_reason: Option<String>,
+    pub spatial_rejection_reason: Option<String>,
+    pub spatial_gain_offset_rejection_reason: Option<String>,
+    pub spatial_2d_validation: Option<SpatialPhotometric2dSummary>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SpatialPhotometric2dSummary {
+    pub coordinate_system: Option<String>,
+    pub training_window_count: Option<usize>,
+    pub held_out_window_count: Option<usize>,
+    pub distinct_training_rows: Option<usize>,
+    pub distinct_held_out_rows: Option<usize>,
+    pub distinct_training_columns: Option<usize>,
+    pub distinct_held_out_columns: Option<usize>,
+    pub gain_consistent_window_ratio: Option<f64>,
+    pub gain_slope_agreement_ratio: Option<f64>,
+    pub gain_horizontal_slope_agreement_ratio: Option<f64>,
+    pub gain_center_log_delta: Option<f64>,
+    pub gain_offset_consistent_window_ratio: Option<f64>,
+    pub gain_offset_slope_agreement_ratio: Option<f64>,
+    pub gain_offset_horizontal_slope_agreement_ratio: Option<f64>,
+    pub gain_offset_center_gain_log_delta: Option<f64>,
+    pub gain_offset_center_offset_delta_normalized: Option<f64>,
+    pub held_out_gain_seam_score: Option<f64>,
+    pub held_out_gain_offset_seam_score: Option<f64>,
+    pub gain_best_simpler_model: Option<String>,
+    pub gain_improvement_over_best_simpler: Option<f64>,
+    pub gain_offset_best_simpler_model: Option<String>,
+    pub gain_offset_improvement_over_best_simpler: Option<f64>,
+    pub gain_accepted: Option<bool>,
+    pub gain_offset_accepted: Option<bool>,
+    pub gain_rejection_reason: Option<String>,
+    pub gain_offset_rejection_reason: Option<String>,
+    pub quadratic: Option<SpatialPhotometricQuadraticSummary>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SpatialPhotometricQuadraticSummary {
+    pub basis: Option<Vec<String>>,
+    pub evaluation_grid_size: Option<usize>,
+    pub regularization_lambda: Option<f64>,
+    pub minimum_windows_per_split: Option<usize>,
+    pub minimum_rows_per_split: Option<usize>,
+    pub minimum_columns_per_split: Option<usize>,
+    pub training_window_count: Option<usize>,
+    pub held_out_window_count: Option<usize>,
+    pub distinct_training_rows: Option<usize>,
+    pub distinct_held_out_rows: Option<usize>,
+    pub distinct_training_columns: Option<usize>,
+    pub distinct_held_out_columns: Option<usize>,
+    pub gain_design_condition_number: Option<f64>,
+    pub held_out_gain_design_condition_number: Option<f64>,
+    pub gain_consistent_window_ratio: Option<f64>,
+    pub gain_curvature_coefficient_agreement_ratio: Option<f64>,
+    pub gain_max_validation_field_log_delta: Option<f64>,
+    pub gain_curvature_signal: Option<f64>,
+    pub estimated_gain_log_quadratic_xx_rgb: Option<Vec<f64>>,
+    pub estimated_gain_log_quadratic_xy_rgb: Option<Vec<f64>>,
+    pub estimated_gain_log_quadratic_yy_rgb: Option<Vec<f64>>,
+    pub gain_grid_min_rgb: Option<Vec<f64>>,
+    pub gain_grid_max_rgb: Option<Vec<f64>>,
+    pub gain_offset_design_condition_number: Option<f64>,
+    pub held_out_gain_offset_design_condition_number: Option<f64>,
+    pub gain_offset_consistent_window_ratio: Option<f64>,
+    pub gain_offset_curvature_coefficient_agreement_ratio: Option<f64>,
+    pub gain_offset_max_validation_gain_field_log_delta: Option<f64>,
+    pub gain_offset_max_validation_offset_field_delta_normalized: Option<f64>,
+    pub gain_offset_curvature_signal: Option<f64>,
+    pub estimated_gain_offset_log_quadratic_xx_rgb: Option<Vec<f64>>,
+    pub estimated_gain_offset_log_quadratic_xy_rgb: Option<Vec<f64>>,
+    pub estimated_gain_offset_log_quadratic_yy_rgb: Option<Vec<f64>>,
+    pub estimated_gain_offset_quadratic_xx_rgb: Option<Vec<f64>>,
+    pub estimated_gain_offset_quadratic_xy_rgb: Option<Vec<f64>>,
+    pub estimated_gain_offset_quadratic_yy_rgb: Option<Vec<f64>>,
+    pub gain_offset_grid_gain_min_rgb: Option<Vec<f64>>,
+    pub gain_offset_grid_gain_max_rgb: Option<Vec<f64>>,
+    pub gain_offset_grid_offset_abs_max_normalized: Option<f64>,
+    pub held_out_gain_seam_score: Option<f64>,
+    pub held_out_gain_offset_seam_score: Option<f64>,
+    pub gain_best_simpler_model: Option<String>,
+    pub gain_improvement_over_best_simpler: Option<f64>,
+    pub gain_offset_best_simpler_model: Option<String>,
+    pub gain_offset_improvement_over_best_simpler: Option<f64>,
+    pub gain_accepted: Option<bool>,
+    pub gain_offset_accepted: Option<bool>,
+    pub gain_rejection_reason: Option<String>,
+    pub gain_offset_rejection_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SeamBlendValidationSummary {
+    pub mode: Option<String>,
+    pub applied: Option<bool>,
+    pub reason: Option<String>,
+    pub review_required: Option<bool>,
+    pub review_required_merge_count: usize,
+    pub review_reasons: Vec<String>,
+    pub merge_count: usize,
+    pub applied_merge_count: usize,
+    pub overlap_width_px: Option<usize>,
+    pub overlap_height_px: Option<usize>,
+    pub transition_width_px: Option<usize>,
+    pub pyramid_levels: Option<usize>,
+    pub seam_path_mean_normalized_cost: Option<f64>,
+    pub seam_path_p95_normalized_cost: Option<f64>,
+    pub overlap_mean_abs_difference: Option<f64>,
+    pub overlap_p95_abs_difference: Option<f64>,
+    pub output_seam_gradient_p95: Option<f64>,
+    pub source_seam_gradient_p95: Option<f64>,
+    pub output_to_source_seam_gradient_ratio: Option<f64>,
+    #[serde(default)]
+    pub detail_consistency: Option<SeamDetailConsistencyValidationSummary>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SeamDetailConsistencyValidationSummary {
+    pub method: Option<String>,
+    pub evaluated: Option<bool>,
+    pub merge_count: usize,
+    pub evaluated_merge_count: usize,
+    pub decision_supported: Option<bool>,
+    pub decision_supported_merge_count: usize,
+    pub review_required: Option<bool>,
+    pub review_required_merge_count: usize,
+    pub minimum_supported_scale_count: Option<usize>,
+    pub maximum_imbalanced_scale_count: Option<usize>,
+    pub maximum_symmetric_energy_ratio: Option<f64>,
+    pub review_ratio_threshold: Option<f64>,
+    pub minimum_direction_consistency: Option<f64>,
+    pub maximum_cross_split_ratio: Option<f64>,
+    pub minimum_repeated_scale_count: Option<usize>,
+    pub reasons: Vec<String>,
+    pub review_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -618,10 +1525,37 @@ pub struct BaseDensityValidationSummary {
     pub density_confidence: Option<f64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct NegativeReconstructionValidationSummary {
+    pub input_mode: Option<String>,
+    pub density_inversion_skipped: Option<bool>,
+    pub density_confidence: Option<f64>,
+    pub response_model: Option<String>,
+    pub response_source: Option<String>,
+    pub response_accepted: Option<bool>,
+    pub response_model_review_required: Option<bool>,
+    pub crosstalk_model: Option<String>,
+    pub characteristic_curve_model: Option<String>,
+    pub measured_model_id: Option<String>,
+    pub measured_confidence: Option<f64>,
+    pub held_out_delta_e00_rms: Option<f64>,
+    pub held_out_delta_e00_max: Option<f64>,
+    pub unit_slope_delta_e00_rms: Option<f64>,
+    pub held_out_improvement_over_unit_slope: Option<f64>,
+    pub maximum_density_noise_gain: Option<f64>,
+    pub reconstruction_review_required: Option<bool>,
+    pub signed_headroom_preserved: Option<bool>,
+    pub curve_extrapolated_any_ratio: Option<f64>,
+    pub curve_interpolation: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ColorspaceValidationSummary {
     pub calibration_status: Option<String>,
     pub calibration_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_color_mapping_application: Option<CalibrationColorMappingApplicationSummary>,
     #[serde(default)]
     pub calibration_scanner_profile_status: Option<String>,
     #[serde(default)]
@@ -675,6 +1609,8 @@ pub struct ColorspaceValidationSummary {
     pub neutral_trim_before_after: Option<NeutralTrimBeforeAfterSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub calibration_acceptance: Option<CalibrationAcceptanceSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub neutral_safety_rescue: Option<NeutralSafetyRescueSummary>,
     pub selection_rejections: Vec<String>,
     pub regularization_lambda: Option<f64>,
     pub neutral_sample_bands: Option<Vec<usize>>,
@@ -708,6 +1644,663 @@ pub struct ColorspaceValidationSummary {
     pub post_scale_preserved_ratio: Option<f64>,
     pub post_scale_clipped_high_ratio: Option<Vec<f64>>,
     pub post_scale_clipped_low_ratio: Option<Vec<f64>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CalibrationColorMappingApplicationSummary {
+    pub evaluated: Option<bool>,
+    pub applied: Option<bool>,
+    pub selection_status: Option<String>,
+    pub selected_candidate: Option<String>,
+    pub preferred_candidate: Option<String>,
+    pub reason: Option<String>,
+    pub definition: Option<String>,
+}
+
+/// Checks that the explicit calibration color-mapping application record agrees with the
+/// independently reported candidate-selection diagnostics. Reports created before this record
+/// existed remain readable and are not treated as contradictory merely because it is absent.
+pub fn calibration_color_mapping_consistency_issues(
+    colorspace: &ColorspaceValidationSummary,
+) -> Vec<String> {
+    let Some(application) = colorspace.calibration_color_mapping_application.as_ref() else {
+        return Vec::new();
+    };
+    let mut issues = Vec::new();
+    let acceptance = colorspace.calibration_acceptance.as_ref();
+
+    if application.evaluated.is_none() {
+        issues.push("calibration_color_mapping_evaluated_missing".to_string());
+    }
+    if application.applied.is_none() {
+        issues.push("calibration_color_mapping_applied_missing".to_string());
+    }
+    if application.selection_status.is_none() {
+        issues.push("calibration_color_mapping_selection_status_missing".to_string());
+    }
+    if application.selected_candidate.is_none() {
+        issues.push("calibration_color_mapping_selected_candidate_missing".to_string());
+    }
+    if application.reason.as_deref().is_none_or(str::is_empty) {
+        issues.push("calibration_color_mapping_reason_missing".to_string());
+    }
+    if application.definition.as_deref().is_none_or(str::is_empty) {
+        issues.push("calibration_color_mapping_definition_missing".to_string());
+    }
+
+    if let Some(evaluated) = application.evaluated {
+        if evaluated != application.preferred_candidate.is_some() {
+            issues.push(
+                "calibration_color_mapping_evaluated_preferred_candidate_mismatch".to_string(),
+            );
+        }
+    }
+    if let (Some(applied), Some(status)) =
+        (application.applied, application.selection_status.as_deref())
+    {
+        let status_means_applied = matches!(status, "accepted" | "forced");
+        if applied != status_means_applied {
+            issues.push("calibration_color_mapping_applied_status_mismatch".to_string());
+        }
+    }
+    match (
+        application.selection_status.as_deref(),
+        acceptance.and_then(|value| value.status.as_deref()),
+    ) {
+        (Some(application_status), Some(acceptance_status))
+            if application_status != acceptance_status =>
+        {
+            issues.push("calibration_color_mapping_acceptance_status_mismatch".to_string());
+        }
+        (_, None) => {
+            issues.push("calibration_color_mapping_acceptance_status_missing".to_string());
+        }
+        _ => {}
+    }
+    if application.selected_candidate.as_deref() != colorspace.selected_candidate.as_deref() {
+        issues.push("calibration_color_mapping_selected_candidate_mismatch".to_string());
+    }
+    if application.preferred_candidate.as_deref()
+        != acceptance.and_then(|value| value.preferred_candidate.as_deref())
+    {
+        issues.push("calibration_color_mapping_preferred_candidate_mismatch".to_string());
+    }
+
+    issues
+}
+
+/// Checks the one-way preferred-memory-colour creative guard for internally contradictory
+/// population and model diagnostics. Legacy reports without the optional guard remain readable.
+pub fn adaptive_vibrance_preferred_memory_color_guard_consistency_issues(
+    tone: &ToneValidationSummary,
+) -> Vec<String> {
+    let Some(guard) = tone.adaptive_vibrance_preferred_memory_color_guard.as_ref() else {
+        return Vec::new();
+    };
+    let mut issues = Vec::new();
+    let required_text = [
+        ("method", guard.method.as_deref()),
+        ("working_space", guard.working_space.as_deref()),
+        ("reference", guard.reference.as_deref()),
+        ("interpretation", guard.interpretation.as_deref()),
+    ];
+    if guard.enabled.is_none() {
+        issues.push("preferred_memory_color_guard_enabled_missing".to_string());
+    }
+    for (field, value) in required_text {
+        if value.is_none_or(str::is_empty) {
+            issues.push(format!("preferred_memory_color_guard_{field}_missing"));
+        }
+    }
+    match (
+        guard.core_normalized_radius,
+        guard.support_normalized_radius,
+    ) {
+        (Some(core), Some(support)) if core > 0.0 && support > core => {}
+        (Some(_), Some(_)) => {
+            issues.push("preferred_memory_color_guard_radius_order_invalid".to_string())
+        }
+        _ => issues.push("preferred_memory_color_guard_radius_missing".to_string()),
+    }
+
+    let ratio_fields = [
+        ("evaluated", guard.evaluated_pixel_ratio),
+        ("matched", guard.matched_pixel_ratio),
+        ("limited", guard.limited_pixel_ratio),
+    ];
+    for (field, value) in ratio_fields {
+        match value {
+            Some(value) if (0.0..=1.0).contains(&value) => {}
+            Some(_) => issues.push(format!(
+                "preferred_memory_color_guard_{field}_pixel_ratio_invalid"
+            )),
+            None => issues.push(format!(
+                "preferred_memory_color_guard_{field}_pixel_ratio_missing"
+            )),
+        }
+    }
+    if guard
+        .matched_pixel_ratio
+        .zip(guard.evaluated_pixel_ratio)
+        .is_some_and(|(matched, evaluated)| matched > evaluated + 1e-12)
+    {
+        issues.push("preferred_memory_color_guard_matched_exceeds_evaluated".to_string());
+    }
+    if guard
+        .limited_pixel_ratio
+        .zip(guard.matched_pixel_ratio)
+        .is_some_and(|(limited, matched)| limited > matched + 1e-12)
+    {
+        issues.push("preferred_memory_color_guard_limited_exceeds_matched".to_string());
+    }
+    if guard.enabled == Some(false)
+        && [
+            guard.evaluated_pixel_ratio,
+            guard.matched_pixel_ratio,
+            guard.limited_pixel_ratio,
+            guard.mean_scale_reduction,
+            guard.max_scale_reduction,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| value.abs() > 1e-12)
+    {
+        issues.push("preferred_memory_color_guard_disabled_with_nonzero_effect".to_string());
+    }
+    match (guard.mean_scale_reduction, guard.max_scale_reduction) {
+        (Some(mean), Some(maximum)) if mean >= 0.0 && maximum >= 0.0 && mean <= maximum + 1e-12 => {
+        }
+        (Some(_), Some(_)) => {
+            issues.push("preferred_memory_color_guard_scale_reduction_invalid".to_string())
+        }
+        _ => issues.push("preferred_memory_color_guard_scale_reduction_missing".to_string()),
+    }
+
+    let expected_families = ["sky", "spring_grass", "autumn_grass"];
+    let actual_families = guard
+        .families
+        .iter()
+        .filter_map(|family| family.family.as_deref())
+        .collect::<Vec<_>>();
+    if actual_families != expected_families {
+        issues.push("preferred_memory_color_guard_family_set_invalid".to_string());
+    }
+    let mut family_matched_sum = 0.0f64;
+    let mut family_limited_sum = 0.0f64;
+    for family in &guard.families {
+        let name = family.family.as_deref().unwrap_or("unknown");
+        if family
+            .preferred_center_lab
+            .as_ref()
+            .is_none_or(|values| values.len() != 3)
+            || family
+                .preferred_center_lch
+                .as_ref()
+                .is_none_or(|values| values.len() != 3)
+        {
+            issues.push(format!(
+                "preferred_memory_color_guard_family_{name}_center_invalid"
+            ));
+        }
+        match (
+            family.semi_major_axis_ab,
+            family.semi_minor_axis_ab,
+            family.axis_ratio,
+        ) {
+            (Some(major), Some(minor), Some(ratio))
+                if major > 0.0
+                    && minor > 0.0
+                    && ratio > 0.0
+                    && (minor - major / ratio).abs() <= 1e-9 => {}
+            _ => issues.push(format!(
+                "preferred_memory_color_guard_family_{name}_ellipse_invalid"
+            )),
+        }
+        if family.ellipse_rotation_degrees.is_none() {
+            issues.push(format!(
+                "preferred_memory_color_guard_family_{name}_rotation_missing"
+            ));
+        }
+        match (family.matched_pixel_ratio, family.limited_pixel_ratio) {
+            (Some(matched), Some(limited))
+                if (0.0..=1.0).contains(&matched)
+                    && (0.0..=1.0).contains(&limited)
+                    && limited <= matched + 1e-12 =>
+            {
+                family_matched_sum += matched;
+                family_limited_sum += limited;
+            }
+            _ => issues.push(format!(
+                "preferred_memory_color_guard_family_{name}_population_invalid"
+            )),
+        }
+        match (family.mean_scale_reduction, family.max_scale_reduction) {
+            (Some(mean), Some(maximum))
+                if mean >= 0.0 && maximum >= 0.0 && mean <= maximum + 1e-12 => {}
+            _ => issues.push(format!(
+                "preferred_memory_color_guard_family_{name}_scale_reduction_invalid"
+            )),
+        }
+    }
+    if guard
+        .matched_pixel_ratio
+        .is_some_and(|overall| (family_matched_sum - overall).abs() > 1e-9)
+    {
+        issues.push("preferred_memory_color_guard_family_matched_sum_mismatch".to_string());
+    }
+    if guard
+        .limited_pixel_ratio
+        .is_some_and(|overall| (family_limited_sum - overall).abs() > 1e-9)
+    {
+        issues.push("preferred_memory_color_guard_family_limited_sum_mismatch".to_string());
+    }
+
+    issues
+}
+
+/// Checks the bounded preferred-skin display shoulder for coherent provenance, model geometry,
+/// populations, and effect accounting. Legacy reports without the optional object remain readable.
+pub fn preferred_skin_rendering_consistency_issues(tone: &ToneValidationSummary) -> Vec<String> {
+    let Some(rendering) = tone.preferred_skin_rendering.as_ref() else {
+        return Vec::new();
+    };
+    let mut issues = Vec::new();
+    if rendering.enabled.is_none() {
+        issues.push("preferred_skin_rendering_enabled_missing".to_string());
+    }
+    for (field, value) in [
+        ("reason", rendering.reason.as_deref()),
+        ("method", rendering.method.as_deref()),
+        ("working_space", rendering.working_space.as_deref()),
+        (
+            "preference_reference",
+            rendering.preference_reference.as_deref(),
+        ),
+        ("support_reference", rendering.support_reference.as_deref()),
+        ("interpretation", rendering.interpretation.as_deref()),
+    ] {
+        if value.is_none_or(str::is_empty) {
+            issues.push(format!("preferred_skin_rendering_{field}_missing"));
+        }
+    }
+
+    let center_lab = rendering.preferred_center_lab.as_deref();
+    let center_lch = rendering.preferred_center_lch.as_deref();
+    if center_lab
+        .is_none_or(|values| values.len() != 3 || values.iter().any(|value| !value.is_finite()))
+        || center_lch
+            .is_none_or(|values| values.len() != 3 || values.iter().any(|value| !value.is_finite()))
+    {
+        issues.push("preferred_skin_rendering_center_invalid".to_string());
+    } else if let (Some(lab), Some(lch)) = (center_lab, center_lch) {
+        let hue = lch[2].to_radians();
+        if (lab[0] - lch[0]).abs() > 1e-9
+            || (lab[1] - lch[1] * hue.cos()).abs() > 1e-9
+            || (lab[2] - lch[1] * hue.sin()).abs() > 1e-9
+        {
+            issues.push("preferred_skin_rendering_center_lab_lch_mismatch".to_string());
+        }
+    }
+    match (
+        rendering.semi_major_axis_ab,
+        rendering.semi_minor_axis_ab,
+        rendering.axis_ratio,
+    ) {
+        (Some(major), Some(minor), Some(ratio))
+            if major.is_finite()
+                && minor.is_finite()
+                && ratio.is_finite()
+                && major > 0.0
+                && minor > 0.0
+                && ratio > 0.0
+                && (minor - major / ratio).abs() <= 1e-9 => {}
+        _ => issues.push("preferred_skin_rendering_ellipse_invalid".to_string()),
+    }
+    if rendering
+        .ellipse_rotation_degrees
+        .is_none_or(|value| !value.is_finite())
+    {
+        issues.push("preferred_skin_rendering_rotation_invalid".to_string());
+    }
+    match (
+        rendering.core_normalized_radius,
+        rendering.radial_excess_reduction,
+        rendering.maximum_delta_e_ab,
+        rendering.minimum_support_weight,
+    ) {
+        (Some(core), Some(reduction), Some(maximum), Some(support))
+            if core.is_finite()
+                && reduction.is_finite()
+                && maximum.is_finite()
+                && support.is_finite()
+                && core > 0.0
+                && reduction > 0.0
+                && reduction <= 1.0
+                && maximum > 0.0
+                && (0.0..=1.0).contains(&support) => {}
+        _ => issues.push("preferred_skin_rendering_policy_bounds_invalid".to_string()),
+    }
+
+    let ratio_fields = [
+        ("evaluated", rendering.evaluated_pixel_ratio),
+        ("matched", rendering.matched_pixel_ratio),
+        (
+            "outside_preferred_core",
+            rendering.outside_preferred_core_ratio,
+        ),
+        ("adjusted", rendering.adjusted_pixel_ratio),
+        ("gamut_limited", rendering.gamut_limited_pixel_ratio),
+    ];
+    for (field, value) in ratio_fields {
+        match value {
+            Some(value) if value.is_finite() && (0.0..=1.0).contains(&value) => {}
+            Some(_) => issues.push(format!(
+                "preferred_skin_rendering_{field}_pixel_ratio_invalid"
+            )),
+            None => issues.push(format!(
+                "preferred_skin_rendering_{field}_pixel_ratio_missing"
+            )),
+        }
+    }
+    for (issue, smaller, larger) in [
+        (
+            "preferred_skin_rendering_matched_exceeds_evaluated",
+            rendering.matched_pixel_ratio,
+            rendering.evaluated_pixel_ratio,
+        ),
+        (
+            "preferred_skin_rendering_outside_core_exceeds_matched",
+            rendering.outside_preferred_core_ratio,
+            rendering.matched_pixel_ratio,
+        ),
+        (
+            "preferred_skin_rendering_adjusted_exceeds_outside_core",
+            rendering.adjusted_pixel_ratio,
+            rendering.outside_preferred_core_ratio,
+        ),
+        (
+            "preferred_skin_rendering_gamut_limited_exceeds_adjusted",
+            rendering.gamut_limited_pixel_ratio,
+            rendering.adjusted_pixel_ratio,
+        ),
+    ] {
+        if smaller
+            .zip(larger)
+            .is_some_and(|(smaller, larger)| smaller > larger + 1e-12)
+        {
+            issues.push(issue.to_string());
+        }
+    }
+
+    let nonnegative_effect_pairs = [
+        (
+            "delta_e_ab",
+            rendering.mean_delta_e_ab,
+            rendering.max_delta_e_ab,
+        ),
+        (
+            "abs_hue_shift_degrees",
+            rendering.mean_abs_hue_shift_degrees,
+            rendering.max_abs_hue_shift_degrees,
+        ),
+    ];
+    for (field, mean, maximum) in nonnegative_effect_pairs {
+        match (mean, maximum) {
+            (Some(mean), Some(maximum))
+                if mean.is_finite()
+                    && maximum.is_finite()
+                    && mean >= 0.0
+                    && maximum >= 0.0
+                    && mean <= maximum + 1e-12 => {}
+            _ => issues.push(format!("preferred_skin_rendering_{field}_invalid")),
+        }
+    }
+    if rendering
+        .max_delta_e_ab
+        .zip(rendering.maximum_delta_e_ab)
+        .is_some_and(|(observed, configured)| observed > configured + 1e-9)
+    {
+        issues.push("preferred_skin_rendering_delta_e_cap_exceeded".to_string());
+    }
+    if rendering
+        .max_abs_hue_shift_degrees
+        .is_some_and(|value| value > 180.0 + 1e-9)
+    {
+        issues.push("preferred_skin_rendering_hue_shift_exceeds_180".to_string());
+    }
+    match (rendering.mean_chroma_delta, rendering.max_abs_chroma_delta) {
+        (Some(mean), Some(maximum))
+            if mean.is_finite()
+                && maximum.is_finite()
+                && maximum >= 0.0
+                && mean.abs() <= maximum + 1e-12 => {}
+        _ => issues.push("preferred_skin_rendering_chroma_effect_invalid".to_string()),
+    }
+    if rendering.enabled == Some(true)
+        && rendering
+            .mean_chroma_delta
+            .is_some_and(|value| value > 1e-12)
+    {
+        issues.push("preferred_skin_rendering_chroma_increase_detected".to_string());
+    }
+
+    let effect_values = [
+        rendering.mean_delta_e_ab,
+        rendering.max_delta_e_ab,
+        rendering.mean_abs_hue_shift_degrees,
+        rendering.max_abs_hue_shift_degrees,
+        rendering.mean_chroma_delta,
+        rendering.max_abs_chroma_delta,
+    ];
+    if rendering.enabled == Some(false)
+        && ratio_fields
+            .into_iter()
+            .filter_map(|(_, value)| value)
+            .chain(effect_values.into_iter().flatten())
+            .any(|value| value.abs() > 1e-12)
+    {
+        issues.push("preferred_skin_rendering_disabled_with_nonzero_effect".to_string());
+    }
+    if rendering.adjusted_pixel_ratio == Some(0.0)
+        && effect_values
+            .into_iter()
+            .flatten()
+            .any(|value| value.abs() > 1e-12)
+    {
+        issues.push("preferred_skin_rendering_zero_adjusted_with_nonzero_effect".to_string());
+    }
+    if rendering.enabled == Some(true) && tone.color_trust_state.as_deref() != Some("trusted") {
+        issues.push("preferred_skin_rendering_enabled_without_trusted_color".to_string());
+    }
+
+    issues
+}
+
+/// Checks that optional grain-reduction evidence describes a selective, bounded operation.
+/// Legacy reports without any grain fields remain readable, while a current enabled pass must
+/// expose its exact structure-exclusion policy and coherent pre/post detail decision.
+pub fn grain_reduction_consistency_issues(tone: &ToneValidationSummary) -> Vec<String> {
+    let grain_fields_present = tone.noise_reduction_enabled.is_some()
+        || tone.noise_reduction_requested_enabled.is_some()
+        || tone.noise_reduction_applied_ratio.is_some()
+        || tone.noise_reduction_structure_excluded_ratio.is_some()
+        || tone.grain_detail_retention.is_some();
+    if !grain_fields_present {
+        return Vec::new();
+    }
+
+    let mut issues = Vec::new();
+    let enabled = tone.noise_reduction_enabled;
+    if enabled.is_none() {
+        issues.push("grain_reduction_enabled_missing".to_string());
+    }
+    for (field, value) in [
+        ("applied", tone.noise_reduction_applied_ratio),
+        (
+            "structure_excluded",
+            tone.noise_reduction_structure_excluded_ratio,
+        ),
+        (
+            "texture_limited",
+            tone.noise_reduction_texture_limited_ratio,
+        ),
+        (
+            "saturation_limited",
+            tone.noise_reduction_saturation_limited_ratio,
+        ),
+    ] {
+        match value {
+            Some(value) if value.is_finite() && (0.0..=1.0).contains(&value) => {}
+            Some(_) => issues.push(format!("grain_reduction_{field}_ratio_invalid")),
+            None if enabled == Some(true) => {
+                issues.push(format!("grain_reduction_{field}_ratio_missing"));
+            }
+            None => {}
+        }
+    }
+
+    match (
+        tone.noise_reduction_structure_gate_start,
+        tone.noise_reduction_structure_gate_end,
+    ) {
+        (Some(start), Some(end))
+            if start.is_finite() && end.is_finite() && start >= 0.0 && start < end => {}
+        (None, None) if enabled != Some(true) => {}
+        _ => issues.push("grain_reduction_structure_gate_invalid".to_string()),
+    }
+    if tone
+        .noise_reduction_applied_ratio
+        .zip(tone.noise_reduction_structure_excluded_ratio)
+        .is_some_and(|(applied, excluded)| applied + excluded > 1.0 + 1e-12)
+    {
+        issues.push("grain_reduction_applied_and_excluded_overlap".to_string());
+    }
+    if tone
+        .grain_detail_retention
+        .as_ref()
+        .and_then(|detail| detail.luminance_contrast_threshold)
+        .zip(tone.noise_reduction_structure_gate_end)
+        .is_some_and(|(detail_floor, gate_end)| (detail_floor - gate_end).abs() > 1e-12)
+    {
+        issues.push("grain_reduction_structure_gate_detail_floor_mismatch".to_string());
+    }
+
+    for (field, value) in [
+        (
+            "mean_abs_chroma_delta",
+            tone.noise_reduction_mean_abs_chroma_delta,
+        ),
+        (
+            "max_abs_chroma_delta",
+            tone.noise_reduction_max_abs_chroma_delta,
+        ),
+        (
+            "mean_abs_luma_delta",
+            tone.noise_reduction_mean_abs_luma_delta,
+        ),
+        (
+            "max_abs_luma_delta",
+            tone.noise_reduction_max_abs_luma_delta,
+        ),
+    ] {
+        if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
+            issues.push(format!("grain_reduction_{field}_invalid"));
+        } else if enabled == Some(true) && value.is_none() {
+            issues.push(format!("grain_reduction_{field}_missing"));
+        }
+    }
+    if tone
+        .noise_reduction_mean_abs_chroma_delta
+        .zip(tone.noise_reduction_max_abs_chroma_delta)
+        .is_some_and(|(mean, maximum)| mean > maximum + 1e-12)
+    {
+        issues.push("grain_reduction_chroma_delta_mean_exceeds_max".to_string());
+    }
+    if tone
+        .noise_reduction_mean_abs_luma_delta
+        .zip(tone.noise_reduction_max_abs_luma_delta)
+        .is_some_and(|(mean, maximum)| mean > maximum + 1e-12)
+    {
+        issues.push("grain_reduction_luma_delta_mean_exceeds_max".to_string());
+    }
+
+    if enabled == Some(true) {
+        if tone.noise_reduction_requested_enabled != Some(true) {
+            issues.push("grain_reduction_enabled_without_request".to_string());
+        }
+        if tone
+            .noise_reduction_requested_strength
+            .is_none_or(|value| !value.is_finite() || value <= 0.0 || value > 1.0)
+        {
+            issues.push("grain_reduction_enabled_strength_invalid".to_string());
+        }
+        if tone
+            .noise_reduction_requested_scale
+            .is_none_or(|value| !value.is_finite() || !(0.5..=4.0).contains(&value))
+        {
+            issues.push("grain_reduction_enabled_scale_invalid".to_string());
+        }
+        if tone
+            .noise_reduction_reason
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
+            issues.push("grain_reduction_reason_missing".to_string());
+        }
+        match tone.grain_detail_retention.as_ref() {
+            Some(detail) if detail.evaluated == Some(true) => {}
+            _ => issues.push("grain_reduction_detail_retention_not_evaluated".to_string()),
+        }
+    } else if enabled == Some(false) {
+        let nonzero_effect = [
+            tone.noise_reduction_applied_ratio,
+            tone.noise_reduction_structure_excluded_ratio,
+            tone.noise_reduction_mean_abs_chroma_delta,
+            tone.noise_reduction_max_abs_chroma_delta,
+            tone.noise_reduction_mean_abs_luma_delta,
+            tone.noise_reduction_max_abs_luma_delta,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| value.abs() > 1e-12);
+        if nonzero_effect {
+            issues.push("grain_reduction_disabled_with_nonzero_effect".to_string());
+        }
+    }
+
+    issues
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct NeutralSafetyRescueSummary {
+    pub evaluated: Option<bool>,
+    pub applied: Option<bool>,
+    pub matrix_candidate: Option<String>,
+    pub matrix_candidate_kind: Option<String>,
+    pub matrix_anchor_evidence_supported: Option<bool>,
+    pub neutral_estimate_supported: Option<bool>,
+    pub neutral_model_evidence_supported: Option<bool>,
+    pub matrix_pre_scale_preserved_ratio: Option<f64>,
+    pub neutral_pre_scale_preserved_ratio: Option<f64>,
+    pub preserved_ratio_gain: Option<f64>,
+    pub minimum_preserved_ratio: Option<f64>,
+    pub minimum_preserved_ratio_gain: Option<f64>,
+    pub matrix_midtone_saturation_p95: Option<f64>,
+    pub neutral_midtone_saturation_p95: Option<f64>,
+    pub midtone_saturation_p95_reduction: Option<f64>,
+    pub maximum_midtone_saturation_p95: Option<f64>,
+    pub minimum_midtone_saturation_p95_reduction: Option<f64>,
+    pub matrix_memory_color_penalty: Option<f64>,
+    pub neutral_memory_color_penalty: Option<f64>,
+    pub matrix_spatial_consistency_penalty: Option<f64>,
+    pub neutral_spatial_consistency_penalty: Option<f64>,
+    pub neutral_saturation_preservation_sample_count: Option<usize>,
+    pub neutral_saturation_preservation_p05_ratio: Option<f64>,
+    pub neutral_saturation_preservation_median_ratio: Option<f64>,
+    pub neutral_saturation_preservation_p95_ratio: Option<f64>,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -910,7 +2503,115 @@ pub struct CalibrationAcceptanceSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdaptiveVibranceSkinMemoryProtectionSummary {
+    pub enabled: Option<bool>,
+    pub method: Option<String>,
+    pub working_space: Option<String>,
+    pub reference: Option<String>,
+    pub core_lightness: Option<Vec<f64>>,
+    pub support_lightness: Option<Vec<f64>>,
+    pub core_chroma: Option<Vec<f64>>,
+    pub support_chroma: Option<Vec<f64>>,
+    pub core_hue_degrees: Option<Vec<f64>>,
+    pub support_hue_degrees: Option<Vec<f64>>,
+    pub maximum_vibrance_reduction: Option<f64>,
+    pub evaluated_pixel_ratio: Option<f64>,
+    pub protected_pixel_ratio: Option<f64>,
+    pub mean_protection_weight: Option<f64>,
+    pub max_protection_weight: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdaptiveVibrancePreferredMemoryColorFamilySummary {
+    pub family: Option<String>,
+    pub preferred_center_lab: Option<Vec<f64>>,
+    pub preferred_center_lch: Option<Vec<f64>>,
+    pub semi_major_axis_ab: Option<f64>,
+    pub semi_minor_axis_ab: Option<f64>,
+    pub axis_ratio: Option<f64>,
+    pub ellipse_rotation_degrees: Option<f64>,
+    pub matched_pixel_ratio: Option<f64>,
+    pub limited_pixel_ratio: Option<f64>,
+    pub mean_scale_reduction: Option<f64>,
+    pub max_scale_reduction: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdaptiveVibrancePreferredMemoryColorGuardSummary {
+    pub enabled: Option<bool>,
+    pub method: Option<String>,
+    pub working_space: Option<String>,
+    pub reference: Option<String>,
+    pub interpretation: Option<String>,
+    pub core_normalized_radius: Option<f64>,
+    pub support_normalized_radius: Option<f64>,
+    pub evaluated_pixel_ratio: Option<f64>,
+    pub matched_pixel_ratio: Option<f64>,
+    pub limited_pixel_ratio: Option<f64>,
+    pub mean_scale_reduction: Option<f64>,
+    pub max_scale_reduction: Option<f64>,
+    #[serde(default)]
+    pub families: Vec<AdaptiveVibrancePreferredMemoryColorFamilySummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PreferredSkinRenderingSummary {
+    pub enabled: Option<bool>,
+    pub reason: Option<String>,
+    pub method: Option<String>,
+    pub working_space: Option<String>,
+    pub preference_reference: Option<String>,
+    pub support_reference: Option<String>,
+    pub interpretation: Option<String>,
+    pub preferred_center_lab: Option<Vec<f64>>,
+    pub preferred_center_lch: Option<Vec<f64>>,
+    pub semi_major_axis_ab: Option<f64>,
+    pub semi_minor_axis_ab: Option<f64>,
+    pub axis_ratio: Option<f64>,
+    pub ellipse_rotation_degrees: Option<f64>,
+    pub core_normalized_radius: Option<f64>,
+    pub radial_excess_reduction: Option<f64>,
+    pub maximum_delta_e_ab: Option<f64>,
+    pub minimum_support_weight: Option<f64>,
+    pub evaluated_pixel_ratio: Option<f64>,
+    pub matched_pixel_ratio: Option<f64>,
+    pub outside_preferred_core_ratio: Option<f64>,
+    pub adjusted_pixel_ratio: Option<f64>,
+    pub gamut_limited_pixel_ratio: Option<f64>,
+    pub mean_delta_e_ab: Option<f64>,
+    pub max_delta_e_ab: Option<f64>,
+    pub mean_abs_hue_shift_degrees: Option<f64>,
+    pub max_abs_hue_shift_degrees: Option<f64>,
+    pub mean_chroma_delta: Option<f64>,
+    pub max_abs_chroma_delta: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToneValidationSummary {
+    #[serde(default)]
+    pub tone_confidence_status: Option<String>,
+    #[serde(default)]
+    pub tone_output_evidence_evaluated: Option<bool>,
+    #[serde(default)]
+    pub tone_output_evidence_confidence: Option<f64>,
+    #[serde(default)]
+    pub tone_output_confidence_status: Option<String>,
+    #[serde(default)]
+    pub tone_output_review_required: Option<bool>,
+    #[serde(default)]
+    pub tone_output_review_reason: Option<String>,
+    #[serde(default)]
+    pub confidence_limited_by_tone_output_evidence: Option<bool>,
+    #[serde(default)]
+    pub input_luminance_range_p05_p95: Option<f64>,
+    #[serde(default)]
+    pub mapped_luminance_range_p05_p95: Option<f64>,
+    #[serde(default)]
+    pub render_to_mapped_luminance_range_ratio: Option<f64>,
+    #[serde(default)]
+    pub maximum_post_tone_high_clip_ratio: Option<f64>,
+    #[serde(default)]
+    pub maximum_post_tone_low_clip_ratio: Option<f64>,
     pub highlight_chroma_compressed_ratio: Option<f64>,
     pub highlight_neutral_chroma_compressed_ratio: Option<f64>,
     pub highlight_neutral_chroma_enabled: Option<bool>,
@@ -961,9 +2662,31 @@ pub struct ToneValidationSummary {
     pub post_chroma_compression_clipped_high_ratio: Option<Vec<f64>>,
     pub post_chroma_compression_clipped_low_ratio: Option<Vec<f64>>,
     #[serde(default)]
+    pub perceptual_gamut_mapping_space: Option<String>,
+    #[serde(default)]
+    pub perceptual_gamut_mapped_ratio: Option<f64>,
+    #[serde(default)]
+    pub perceptual_gamut_mean_chroma_scale: Option<f64>,
+    #[serde(default)]
+    pub perceptual_gamut_min_chroma_scale: Option<f64>,
+    #[serde(default)]
+    pub adaptive_vibrance_skin_memory_protection:
+        Option<AdaptiveVibranceSkinMemoryProtectionSummary>,
+    #[serde(default)]
+    pub adaptive_vibrance_preferred_memory_color_guard:
+        Option<AdaptiveVibrancePreferredMemoryColorGuardSummary>,
+    #[serde(default)]
+    pub preferred_skin_rendering: Option<PreferredSkinRenderingSummary>,
+    #[serde(default)]
     pub noise_reduction_enabled: Option<bool>,
     #[serde(default)]
+    pub noise_reduction_requested_enabled: Option<bool>,
+    #[serde(default)]
     pub noise_reduction_reason: Option<String>,
+    #[serde(default)]
+    pub noise_reduction_requested_strength: Option<f64>,
+    #[serde(default)]
+    pub noise_reduction_requested_scale: Option<f64>,
     #[serde(default)]
     pub noise_reduction_radius: Option<usize>,
     #[serde(default)]
@@ -972,6 +2695,12 @@ pub struct ToneValidationSummary {
     pub noise_reduction_luma_amount: Option<f64>,
     #[serde(default)]
     pub noise_reduction_applied_ratio: Option<f64>,
+    #[serde(default)]
+    pub noise_reduction_structure_gate_start: Option<f64>,
+    #[serde(default)]
+    pub noise_reduction_structure_gate_end: Option<f64>,
+    #[serde(default)]
+    pub noise_reduction_structure_excluded_ratio: Option<f64>,
     #[serde(default)]
     pub noise_reduction_texture_limited_ratio: Option<f64>,
     #[serde(default)]
@@ -984,7 +2713,39 @@ pub struct ToneValidationSummary {
     pub noise_reduction_mean_abs_luma_delta: Option<f64>,
     #[serde(default)]
     pub noise_reduction_max_abs_luma_delta: Option<f64>,
+    #[serde(default)]
+    pub noise_reduction_flat_luma_p95_reduction_ratio: Option<f64>,
+    #[serde(default)]
+    pub noise_reduction_flat_chroma_p95_reduction_ratio: Option<f64>,
+    #[serde(default)]
+    pub grain_detail_retention: Option<GrainDetailRetentionValidationSummary>,
     pub high_frequency_grain: Option<HighFrequencyGrainSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GrainDetailRetentionValidationSummary {
+    pub method: Option<String>,
+    pub evaluated: Option<bool>,
+    pub decision_supported: Option<bool>,
+    pub sample_stride: Option<usize>,
+    pub probe_radius: Option<usize>,
+    pub minimum_probe_count: Option<usize>,
+    pub luminance_probe_count: Option<usize>,
+    pub chroma_probe_count: Option<usize>,
+    pub luminance_decision_supported: Option<bool>,
+    pub chroma_decision_supported: Option<bool>,
+    pub luminance_median_retention: Option<f64>,
+    pub luminance_p10_retention: Option<f64>,
+    pub chroma_median_retention: Option<f64>,
+    pub chroma_p10_retention: Option<f64>,
+    pub luminance_contrast_threshold: Option<f64>,
+    pub chroma_contrast_threshold: Option<f64>,
+    pub coherence_threshold: Option<f64>,
+    pub median_retention_threshold: Option<f64>,
+    pub p10_retention_threshold: Option<f64>,
+    pub review_required: Option<bool>,
+    pub reason: Option<String>,
+    pub review_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1098,6 +2859,7 @@ pub struct SyntheticSampleRejectionMinimums {
     pub dust: Option<usize>,
 }
 
+#[derive(Default)]
 struct SyntheticCaseExpectations<'a> {
     selected_candidate: Option<&'a str>,
     mapping_strategy: Option<&'a str>,
@@ -1129,6 +2891,10 @@ struct SyntheticCaseExpectations<'a> {
 pub fn run_synthetic_color_suite() -> SyntheticColorSuiteSummary {
     let cases = vec![
         synthetic_case_calibrated_profile_beats_image_derived(),
+        synthetic_case_root_polynomial_selected_inside_measured_support(),
+        synthetic_case_root_polynomial_rejected_outside_measured_support(),
+        synthetic_case_residual_lut_selected_inside_measured_support(),
+        synthetic_case_residual_lut_rejected_outside_measured_rgb_volume(),
         synthetic_case_weak_calibration_rejected(),
         synthetic_case_calibration_neutral_regression_rejected(),
         synthetic_case_unsafe_calibration_rejected_auto(),
@@ -1488,6 +3254,162 @@ fn synthetic_case_calibrated_profile_beats_image_derived() -> SyntheticColorCase
     )
 }
 
+fn summarize_synthetic_nonlinear_support_result(
+    name: &str,
+    result: Result<colorspace::ColorspaceMappingResult, String>,
+    nonlinear_candidate: &str,
+    expected_support_status: &str,
+    expected_candidate_rejected: bool,
+    expected_selected_candidate: &str,
+    expected_mapping_strategy: &str,
+) -> SyntheticColorCaseSummary {
+    let actual_support_status = result
+        .as_ref()
+        .ok()
+        .and_then(|mapped| mapped.diagnostics.nonlinear_color_model.as_ref())
+        .map(|diagnostics| diagnostics.support_status.clone());
+    let actual_candidate_rejected = result.as_ref().ok().and_then(|mapped| {
+        mapped
+            .diagnostics
+            .candidate_scores
+            .iter()
+            .find(|candidate| candidate.candidate == nonlinear_candidate)
+            .map(|candidate| candidate.rejected)
+    });
+    let mut summary = summarize_synthetic_result(
+        name,
+        result,
+        SyntheticCaseExpectations {
+            selected_candidate: Some(expected_selected_candidate),
+            mapping_strategy: Some(expected_mapping_strategy),
+            ..SyntheticCaseExpectations::default()
+        },
+    );
+    if actual_support_status.as_deref() != Some(expected_support_status) {
+        summary.issues.push(format!(
+            "nonlinear support status expected `{expected_support_status}` got `{actual_support_status:?}`"
+        ));
+    }
+    if actual_candidate_rejected != Some(expected_candidate_rejected) {
+        summary.issues.push(format!(
+            "nonlinear candidate rejected expected `{expected_candidate_rejected}` got `{actual_candidate_rejected:?}`"
+        ));
+    }
+    summary.status = if summary.issues.is_empty() {
+        "passed"
+    } else {
+        "failed"
+    }
+    .to_string();
+    summary
+}
+
+fn synthetic_case_root_polynomial_selected_inside_measured_support() -> SyntheticColorCaseSummary {
+    let (profile, held_out) = synthetic_nonlinear_calibration_profile();
+    let mut image = Array3::<f64>::zeros((16, 16, 3));
+    for y in 0..16 {
+        for x in 0..16 {
+            let rgb = held_out[(y * 16 + x) % held_out.len()].source_rgb;
+            for channel in 0..3 {
+                image[[y, x, channel]] = rgb[channel];
+            }
+        }
+    }
+    summarize_synthetic_nonlinear_support_result(
+        "root_polynomial_selected_inside_measured_support",
+        colorspace::map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
+            &image,
+            Some(&profile),
+            colorspace::ColorMode::Calibrated,
+        ),
+        "calibrated_root_polynomial",
+        "accepted",
+        false,
+        "calibrated_root_polynomial",
+        "calibrated_root_polynomial",
+    )
+}
+
+fn synthetic_case_root_polynomial_rejected_outside_measured_support() -> SyntheticColorCaseSummary {
+    let (profile, _) = synthetic_nonlinear_calibration_profile();
+    let mut image = Array3::<f64>::zeros((16, 16, 3));
+    for y in 0..16 {
+        for x in 0..16 {
+            image[[y, x, 0]] = 1.0;
+            image[[y, x, 1]] = 0.001;
+            image[[y, x, 2]] = 0.001;
+        }
+    }
+    summarize_synthetic_nonlinear_support_result(
+        "root_polynomial_rejected_outside_measured_support",
+        colorspace::map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
+            &image,
+            Some(&profile),
+            colorspace::ColorMode::Calibrated,
+        ),
+        "calibrated_root_polynomial",
+        "rejected",
+        true,
+        "calibrated_direct_profile",
+        "calibrated_profile",
+    )
+}
+
+fn synthetic_case_residual_lut_selected_inside_measured_support() -> SyntheticColorCaseSummary {
+    let (profile, held_out) = synthetic_residual_lut_calibration_profile();
+    let model = profile
+        .lut_3d_model
+        .as_ref()
+        .expect("synthetic residual LUT model");
+    let supported = held_out
+        .iter()
+        .filter(|patch| {
+            color_calibration::residual_lut_3d_has_full_support(model, patch.source_rgb)
+        })
+        .collect::<Vec<_>>();
+    let mut image = Array3::<f64>::zeros((16, 16, 3));
+    for y in 0..16 {
+        for x in 0..16 {
+            let rgb = supported[(y * 16 + x) % supported.len()].source_rgb;
+            for channel in 0..3 {
+                image[[y, x, channel]] = rgb[channel];
+            }
+        }
+    }
+    summarize_synthetic_nonlinear_support_result(
+        "residual_lut_selected_inside_measured_support",
+        colorspace::map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
+            &image,
+            Some(&profile),
+            colorspace::ColorMode::Calibrated,
+        ),
+        "calibrated_residual_lut_3d",
+        "accepted",
+        false,
+        "calibrated_residual_lut_3d",
+        "calibrated_residual_lut_3d",
+    )
+}
+
+fn synthetic_case_residual_lut_rejected_outside_measured_rgb_volume() -> SyntheticColorCaseSummary {
+    let (profile, _) = synthetic_residual_lut_calibration_profile();
+    let mut image = Array3::<f64>::zeros((16, 16, 3));
+    image.fill(1.25);
+    summarize_synthetic_nonlinear_support_result(
+        "residual_lut_rejected_outside_measured_rgb_volume",
+        colorspace::map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
+            &image,
+            Some(&profile),
+            colorspace::ColorMode::Calibrated,
+        ),
+        "calibrated_residual_lut_3d",
+        "rejected",
+        true,
+        "calibrated_direct_profile",
+        "calibrated_profile",
+    )
+}
+
 fn synthetic_case_weak_calibration_rejected() -> SyntheticColorCaseSummary {
     let mut img = Array3::<f64>::zeros((30, 30, 3));
     for y in 0..30 {
@@ -1514,6 +3436,7 @@ fn synthetic_case_weak_calibration_rejected() -> SyntheticColorCaseSummary {
         patch_count: 24,
         target_residual_rms: 0.50,
         target_residual_max: 1.20,
+        validation: None,
         per_hue_residuals: Vec::new(),
         worst_patches: Vec::new(),
     });
@@ -1833,8 +3756,8 @@ fn synthetic_case_biased_scene_anchor_review_required() -> SyntheticColorCaseSum
             colorspace::ColorMode::Auto,
         ),
         SyntheticCaseExpectations {
-            selected_candidate: Some("gamut_trusted_image_matrix_blend"),
-            mapping_strategy: None,
+            selected_candidate: Some("neutral_balance_fallback"),
+            mapping_strategy: Some("neutral_balance_evidence_rescue"),
             gamut_fallback_used: None,
             image_matrix_pre_scale_low_clip_total_min: None,
             selected_pre_scale_low_clip_total_max: None,
@@ -1843,7 +3766,7 @@ fn synthetic_case_biased_scene_anchor_review_required() -> SyntheticColorCaseSum
             calibration_beats_image_derived: None,
             calibrated_candidate_status: None,
             preferred_calibration_candidate_status: None,
-            candidate_risk: None,
+            candidate_risk: Some("fallback_only"),
             tone_color_trust_state: Some("review_required"),
             neutral_estimate_accepted: Some(true),
             dominant_anchor_accepted: Some(false),
@@ -2094,7 +4017,7 @@ fn synthetic_case_tone_policy_model_review_keeps_bounded_neutral_cleanup(
         shadow_chroma_enabled: true,
         reason: "synthetic model-plausibility review".to_string(),
     };
-    let mut img = Array3::<f64>::zeros((3, 1, 3));
+    let mut img = Array3::<f64>::zeros((4, 1, 3));
     img[[0, 0, 0]] = 0.20;
     img[[0, 0, 1]] = 0.90;
     img[[0, 0, 2]] = 1.00;
@@ -2104,6 +4027,11 @@ fn synthetic_case_tone_policy_model_review_keeps_bounded_neutral_cleanup(
     img[[2, 0, 0]] = 0.03;
     img[[2, 0, 1]] = 0.10;
     img[[2, 0, 2]] = 0.22;
+    // A bright, low-saturation pixel is required to exercise the bounded neutral-highlight
+    // cleanup independently of the saturated-highlight gamut mapping above.
+    img[[3, 0, 0]] = 0.80;
+    img[[3, 0, 1]] = 0.83;
+    img[[3, 0, 2]] = 0.86;
 
     summarize_synthetic_tone_policy_result(
         "tone_policy_model_review_keeps_bounded_neutral_cleanup",
@@ -2477,7 +4405,7 @@ fn reference_patch_regressed_candidates(
                 .iter()
                 .filter(|candidate| candidate.regresses_image_derived == Some(true))
                 .map(|candidate| candidate.candidate.clone())
-                .collect()
+                .collect::<Vec<_>>()
         })
         .unwrap_or_default()
 }
@@ -3271,6 +5199,179 @@ fn synthetic_calibration_profile() -> color_calibration::CalibrationProfile {
         .expect("synthetic calibration profile")
 }
 
+fn synthetic_nonlinear_target_patches(
+    count: usize,
+    prefix: &str,
+    seed_offset: usize,
+) -> Vec<color_calibration::TargetPatch> {
+    let coefficients = [
+        [0.65, 0.25, 0.03],
+        [0.14, 0.69, 0.08],
+        [0.05, 0.10, 0.76],
+        [0.055, -0.030, 0.010],
+        [-0.025, 0.012, 0.045],
+        [0.012, 0.040, -0.018],
+    ];
+    (0..count)
+        .map(|index| {
+            let seed = index + seed_offset;
+            let code =
+                |multiplier: usize, add: usize| ((seed * multiplier + add) % 997) as f64 / 996.0;
+            let source_rgb = [
+                0.025 + 0.95 * code(173, 31),
+                0.025 + 0.95 * code(379, 97),
+                0.025 + 0.95 * code(613, 211),
+            ];
+            let basis = color_calibration::root_polynomial_basis_values(2, source_rgb)
+                .expect("degree-two nonlinear validation basis");
+            let reference_xyz = std::array::from_fn(|channel| {
+                basis
+                    .iter()
+                    .zip(coefficients)
+                    .map(|(term, coefficient)| term * coefficient[channel])
+                    .sum()
+            });
+            color_calibration::TargetPatch {
+                patch_id: Some(format!("{prefix}-{index:03}")),
+                scanner_xy: None,
+                source_rgb,
+                reference_xyz,
+            }
+        })
+        .collect()
+}
+
+fn synthetic_nonlinear_calibration_profile() -> (
+    color_calibration::CalibrationProfile,
+    Vec<color_calibration::TargetPatch>,
+) {
+    let training = synthetic_nonlinear_target_patches(48, "suite-train", 0);
+    let held_out = synthetic_nonlinear_target_patches(36, "suite-held", 409);
+    let matrix = color_calibration::fit_rgb_to_xyz_from_disjoint_patches(
+        &training,
+        &held_out,
+        "suite_matrix_baseline",
+        Some(crate::constants::D50_WHITE),
+        None,
+    )
+    .expect("synthetic nonlinear matrix fit");
+    let model = color_calibration::fit_root_polynomial_color_model_from_disjoint_patches(
+        "suite-nonlinear",
+        &training,
+        &held_out,
+        &matrix.matrix,
+    )
+    .expect("synthetic nonlinear model fit")
+    .selected_model
+    .expect("synthetic nonlinear model selection");
+    let mut profile = synthetic_calibration_profile();
+    profile.schema_version = color_calibration::CALIBRATION_PROFILE_SCHEMA_VERSION;
+    profile.work_to_xyz = matrix.matrix;
+    profile.whitepoint = crate::constants::D50_WHITE;
+    profile.confidence = matrix.confidence;
+    profile.matrix_condition_number = matrix.matrix_condition_number;
+    profile.fit = Some(matrix.fit);
+    profile.target_patches = held_out.clone();
+    profile.application_mode = color_calibration::CalibrationApplicationMode::DirectProfile;
+    profile.color_model = Some(model);
+    profile.color_model_post_xyz = None;
+    (profile, held_out)
+}
+
+fn synthetic_residual_lut_target_patches(
+    count: usize,
+    prefix: &str,
+    seed_offset: usize,
+    include_domain_corners: bool,
+) -> Vec<color_calibration::TargetPatch> {
+    let matrix = [[0.65, 0.14, 0.05], [0.25, 0.69, 0.10], [0.03, 0.08, 0.76]];
+    (0..count)
+        .map(|index| {
+            let seed = index + seed_offset;
+            let code =
+                |multiplier: usize, add: usize| ((seed * multiplier + add) % 997) as f64 / 996.0;
+            let source_rgb = if include_domain_corners && index < 8 {
+                [
+                    if index & 1 == 0 { 0.025 } else { 0.975 },
+                    if index & 2 == 0 { 0.025 } else { 0.975 },
+                    if index & 4 == 0 { 0.025 } else { 0.975 },
+                ]
+            } else {
+                [
+                    0.04 + 0.92 * code(173, 31),
+                    0.04 + 0.92 * code(379, 97),
+                    0.04 + 0.92 * code(613, 211),
+                ]
+            };
+            let mut reference_xyz = std::array::from_fn(|row| {
+                matrix[row][0] * source_rgb[0]
+                    + matrix[row][1] * source_rgb[1]
+                    + matrix[row][2] * source_rgb[2]
+            });
+            let normalized = source_rgb.map(|value| (value - 0.025) / 0.95);
+            let shape = 64.0
+                * normalized[0]
+                * (1.0 - normalized[0])
+                * normalized[1]
+                * (1.0 - normalized[1])
+                * normalized[2]
+                * (1.0 - normalized[2]);
+            let residual = [
+                0.055 * shape * (0.70 + 0.30 * (2.0 * normalized[0] - 1.0)),
+                -0.040 * shape * (0.75 + 0.25 * (2.0 * normalized[1] - 1.0)),
+                0.050 * shape * (0.65 + 0.35 * (2.0 * normalized[2] - 1.0)),
+            ];
+            for channel in 0..3 {
+                reference_xyz[channel] += residual[channel];
+            }
+            color_calibration::TargetPatch {
+                patch_id: Some(format!("{prefix}-{index:03}")),
+                scanner_xy: None,
+                source_rgb,
+                reference_xyz,
+            }
+        })
+        .collect()
+}
+
+fn synthetic_residual_lut_calibration_profile() -> (
+    color_calibration::CalibrationProfile,
+    Vec<color_calibration::TargetPatch>,
+) {
+    let training = synthetic_residual_lut_target_patches(180, "suite-lut-train", 0, true);
+    let held_out = synthetic_residual_lut_target_patches(80, "suite-lut-held", 431, false);
+    let matrix = color_calibration::fit_rgb_to_xyz_from_disjoint_patches(
+        &training,
+        &held_out,
+        "suite_lut_matrix_baseline",
+        Some(crate::constants::D50_WHITE),
+        None,
+    )
+    .expect("synthetic residual LUT matrix fit");
+    let model = color_calibration::fit_residual_lut_3d_color_model_from_disjoint_patches(
+        "suite-residual-lut",
+        &training,
+        &held_out,
+        &matrix.matrix,
+        None,
+    )
+    .expect("synthetic residual LUT fit")
+    .selected_model
+    .expect("synthetic residual LUT selection");
+    let mut profile = synthetic_calibration_profile();
+    profile.schema_version = color_calibration::CALIBRATION_PROFILE_SCHEMA_VERSION;
+    profile.work_to_xyz = matrix.matrix;
+    profile.whitepoint = crate::constants::D50_WHITE;
+    profile.confidence = matrix.confidence;
+    profile.matrix_condition_number = matrix.matrix_condition_number;
+    profile.fit = Some(matrix.fit);
+    profile.target_patches = held_out.clone();
+    profile.application_mode = color_calibration::CalibrationApplicationMode::DirectProfile;
+    profile.lut_3d_model = Some(model);
+    profile.color_model_post_xyz = None;
+    (profile, held_out)
+}
+
 fn synthetic_scanner_prior_profile() -> color_calibration::CalibrationProfile {
     let mut profile = synthetic_calibration_profile();
     profile.application_mode =
@@ -3305,6 +5406,7 @@ fn reference_fit_patches_for_matrix(
             * (matrix_to_prophoto * Vector3::new(source_rgb[0], source_rgb[1], source_rgb[2]));
         color_calibration::TargetPatch {
             patch_id: Some(format!("patch-{idx}")),
+            scanner_xy: None,
             source_rgb,
             reference_xyz: [xyz[0], xyz[1], xyz[2]],
         }
@@ -3511,12 +5613,19 @@ pub fn summarize_report_with_source(
     report: &PipelineReport,
     source_report_path: Option<&Path>,
 ) -> ValidationSummary {
+    let load_phase = phase(report, "load");
+    let deskew_phase = phase(report, "deskew");
+    let border_phase = phase(report, "border_removal");
     let stitch_phase = phase(report, "stitch");
     let working_phase = phase(report, "working_image_select");
     let density_phase = phase(report, "density_inversion");
     let colorspace_phase = phase(report, "colorspace_mapping");
+    let white_balance_phase = phase(report, "white_balance");
     let tone_phase = phase(report, "tone_mapping");
     let report_identity = summarize_report_identity(report, source_report_path);
+    let input_orientation = summarize_input_orientation(load_phase);
+    let deskew = summarize_deskew(deskew_phase);
+    let border_crop = summarize_border_crop(border_phase);
     let stitch = summarize_stitch(stitch_phase);
     let base_density = BaseDensityValidationSummary {
         base_confidence: working_phase.map(|p| p.confidence),
@@ -3528,12 +5637,21 @@ pub fn summarize_report_with_source(
         base_estimate_source: working_phase.and_then(|p| string_metric(p, "base_estimate_source")),
         density_confidence: density_phase.map(|p| p.confidence),
     };
+    let negative_reconstruction =
+        summarize_negative_reconstruction(density_phase, colorspace_phase);
     let colorspace = colorspace_phase
         .map(|phase| summarize_colorspace(phase, &report_identity))
         .unwrap_or_else(empty_colorspace_summary);
     let tone = tone_phase
         .map(summarize_tone)
         .unwrap_or_else(empty_tone_summary);
+    let mut diagnostic_consistency_issues =
+        calibration_color_mapping_consistency_issues(&colorspace);
+    diagnostic_consistency_issues
+        .extend(adaptive_vibrance_preferred_memory_color_guard_consistency_issues(&tone));
+    diagnostic_consistency_issues.extend(preferred_skin_rendering_consistency_issues(&tone));
+    diagnostic_consistency_issues.extend(grain_reduction_consistency_issues(&tone));
+    let white_balance = summarize_white_balance(white_balance_phase, tone_phase);
     let render = summarize_render(
         report,
         &report_identity,
@@ -3547,9 +5665,15 @@ pub fn summarize_report_with_source(
         fixture: fixture.into(),
         report: report_identity,
         render,
+        diagnostic_consistency_issues,
+        input_orientation,
+        deskew,
+        border_crop,
         stitch,
         base_density,
+        negative_reconstruction,
         colorspace,
+        white_balance,
         tone,
         warnings: report
             .phases
@@ -3615,6 +5739,42 @@ pub fn compare_render_summaries(
         colorspace_tone_color_trust_state_changed: changed(
             &baseline.colorspace_tone_color_trust_state,
             &current.colorspace_tone_color_trust_state,
+        ),
+        render_review_status_changed: changed_expected(
+            &baseline.render_review_status,
+            &current.render_review_status,
+        ),
+        render_reviewable_changed: changed_expected(
+            &baseline.render_reviewable,
+            &current.render_reviewable,
+        ),
+        tone_output_confidence_status_changed: changed_expected(
+            &baseline.tone_output_confidence_status,
+            &current.tone_output_confidence_status,
+        ),
+        tone_output_review_required_changed: changed_expected(
+            &baseline.tone_output_review_required,
+            &current.tone_output_review_required,
+        ),
+        tone_output_evidence_confidence_delta: delta(
+            baseline.tone_output_evidence_confidence,
+            current.tone_output_evidence_confidence,
+        ),
+        tone_output_render_luminance_range_p05_p95_delta: delta(
+            baseline.tone_output_render_luminance_range_p05_p95,
+            current.tone_output_render_luminance_range_p05_p95,
+        ),
+        tone_output_render_to_mapped_luminance_range_ratio_delta: delta(
+            baseline.tone_output_render_to_mapped_luminance_range_ratio,
+            current.tone_output_render_to_mapped_luminance_range_ratio,
+        ),
+        tone_output_maximum_post_tone_high_clip_ratio_delta: delta(
+            baseline.tone_output_maximum_post_tone_high_clip_ratio,
+            current.tone_output_maximum_post_tone_high_clip_ratio,
+        ),
+        tone_output_maximum_post_tone_low_clip_ratio_delta: delta(
+            baseline.tone_output_maximum_post_tone_low_clip_ratio,
+            current.tone_output_maximum_post_tone_low_clip_ratio,
         ),
         colorspace_selected_quality_score_delta: delta(
             baseline.colorspace_selected_quality_score,
@@ -3718,6 +5878,20 @@ pub fn compare_summary_baseline(
         .seam_exposure_correction
         .as_ref()
         .and_then(|correction| correction.applied);
+    let seam_model = current
+        .stitch
+        .seam_exposure_correction
+        .as_ref()
+        .and_then(|correction| correction.model.clone());
+    let seam_spatial_2d = current
+        .stitch
+        .seam_exposure_correction
+        .as_ref()
+        .and_then(|correction| correction.spatial_2d_validation.as_ref());
+    let seam_spatial_quadratic =
+        seam_spatial_2d.and_then(|validation| validation.quadratic.as_ref());
+    let seam_blend = current.stitch.seam_blend.as_ref();
+    let seam_detail = seam_blend.and_then(|blend| blend.detail_consistency.as_ref());
     let dimensions_expected =
         baseline.render.output_width.is_some() || baseline.render.output_height.is_some();
     let output_dimensions_match = if dimensions_expected {
@@ -3734,6 +5908,16 @@ pub fn compare_summary_baseline(
         None
     };
     let current_grain = current.tone.high_frequency_grain.as_ref();
+    let current_grain_detail = current.tone.grain_detail_retention.as_ref();
+    let current_skin_memory = current
+        .tone
+        .adaptive_vibrance_skin_memory_protection
+        .as_ref();
+    let current_preferred_memory = current
+        .tone
+        .adaptive_vibrance_preferred_memory_color_guard
+        .as_ref();
+    let current_preferred_skin = current.tone.preferred_skin_rendering.as_ref();
     let reference_patch = current.colorspace.reference_patch_evaluation.as_ref();
     let neutral_quality = current.colorspace.neutral_estimate_quality.as_ref();
     let dominant_anchor_quality = current.colorspace.dominant_anchor_quality.as_ref();
@@ -3776,6 +5960,60 @@ pub fn compare_summary_baseline(
         seam_exposure_correction_changed: changed_expected(
             &baseline.stitch.seam_exposure_correction_applied,
             &seam_applied,
+        ),
+        seam_exposure_model_changed: changed_expected(
+            &baseline.stitch.seam_exposure_model,
+            &seam_model,
+        ),
+        seam_exposure_spatial_2d_gain_acceptance_changed: changed_expected(
+            &baseline.stitch.seam_exposure_spatial_2d_gain_accepted,
+            &seam_spatial_2d.and_then(|validation| validation.gain_accepted),
+        ),
+        seam_exposure_spatial_2d_gain_offset_acceptance_changed: changed_expected(
+            &baseline
+                .stitch
+                .seam_exposure_spatial_2d_gain_offset_accepted,
+            &seam_spatial_2d.and_then(|validation| validation.gain_offset_accepted),
+        ),
+        seam_exposure_spatial_quadratic_gain_acceptance_changed: changed_expected(
+            &baseline
+                .stitch
+                .seam_exposure_spatial_quadratic_gain_accepted,
+            &seam_spatial_quadratic.and_then(|validation| validation.gain_accepted),
+        ),
+        seam_exposure_spatial_quadratic_gain_offset_acceptance_changed: changed_expected(
+            &baseline
+                .stitch
+                .seam_exposure_spatial_quadratic_gain_offset_accepted,
+            &seam_spatial_quadratic.and_then(|validation| validation.gain_offset_accepted),
+        ),
+        seam_blend_mode_changed: changed_expected(
+            &baseline.stitch.seam_blend_mode,
+            &seam_blend.and_then(|blend| blend.mode.clone()),
+        ),
+        seam_blend_applied_changed: changed_expected(
+            &baseline.stitch.seam_blend_applied,
+            &seam_blend.and_then(|blend| blend.applied),
+        ),
+        seam_blend_review_required_changed: changed_expected(
+            &baseline.stitch.seam_blend_review_required,
+            &seam_blend.and_then(|blend| blend.review_required),
+        ),
+        seam_detail_review_required_changed: changed_expected(
+            &baseline.stitch.seam_detail_review_required,
+            &seam_detail.and_then(|detail| detail.review_required),
+        ),
+        seam_detail_max_symmetric_energy_ratio_delta: delta(
+            baseline.stitch.seam_detail_max_symmetric_energy_ratio,
+            seam_detail.and_then(|detail| detail.maximum_symmetric_energy_ratio),
+        ),
+        seam_gradient_ratio_delta: delta(
+            baseline.stitch.seam_gradient_ratio,
+            seam_blend.and_then(|blend| blend.output_to_source_seam_gradient_ratio),
+        ),
+        seam_overlap_p95_abs_difference_delta: delta(
+            baseline.stitch.seam_overlap_p95_abs_difference,
+            seam_blend.and_then(|blend| blend.overlap_p95_abs_difference),
         ),
         base_estimate_source_changed: changed_expected(
             &baseline.render.base_estimate_source,
@@ -3874,6 +6112,14 @@ pub fn compare_summary_baseline(
                 .calibration_acceptance
                 .as_ref()
                 .and_then(|acceptance| acceptance.status.clone()),
+        ),
+        calibration_color_mapping_applied_changed: changed_expected(
+            &baseline.colorspace.calibration_color_mapping_applied,
+            &current
+                .colorspace
+                .calibration_color_mapping_application
+                .as_ref()
+                .and_then(|application| application.applied),
         ),
         calibration_acceptance_preferred_candidate_changed: changed_expected(
             &baseline
@@ -4084,6 +6330,42 @@ pub fn compare_summary_baseline(
         ),
         colorspace_debug_artifact_invalid_count: debug_artifact_issues.len(),
         colorspace_debug_artifact_issues: debug_artifact_issues,
+        render_review_status_changed: changed_expected(
+            &baseline.render.render_review_status,
+            &current.render.render_review_status,
+        ),
+        render_reviewable_changed: changed_expected(
+            &baseline.render.render_reviewable,
+            &current.render.render_reviewable,
+        ),
+        tone_output_confidence_status_changed: changed_expected(
+            &baseline.tone.tone_output_confidence_status,
+            &current.tone.tone_output_confidence_status,
+        ),
+        tone_output_review_required_changed: changed_expected(
+            &baseline.tone.tone_output_review_required,
+            &current.tone.tone_output_review_required,
+        ),
+        tone_output_evidence_confidence_delta: delta(
+            baseline.tone.tone_output_evidence_confidence,
+            current.tone.tone_output_evidence_confidence,
+        ),
+        tone_output_render_luminance_range_p05_p95_delta: delta(
+            baseline.tone.render_luminance_range_p05_p95,
+            current.tone.render_luminance_range_p05_p95,
+        ),
+        tone_output_render_to_mapped_luminance_range_ratio_delta: delta(
+            baseline.tone.render_to_mapped_luminance_range_ratio,
+            current.tone.render_to_mapped_luminance_range_ratio,
+        ),
+        tone_output_maximum_post_tone_high_clip_ratio_delta: delta(
+            baseline.tone.maximum_post_tone_high_clip_ratio,
+            current.tone.maximum_post_tone_high_clip_ratio,
+        ),
+        tone_output_maximum_post_tone_low_clip_ratio_delta: delta(
+            baseline.tone.maximum_post_tone_low_clip_ratio,
+            current.tone.maximum_post_tone_low_clip_ratio,
+        ),
         highlight_chroma_compressed_ratio_delta: delta(
             baseline.tone.highlight_chroma_compressed_ratio,
             current.tone.highlight_chroma_compressed_ratio,
@@ -4095,6 +6377,80 @@ pub fn compare_summary_baseline(
         shadow_chroma_compressed_ratio_delta: delta(
             baseline.tone.shadow_chroma_compressed_ratio,
             current.tone.shadow_chroma_compressed_ratio,
+        ),
+        adaptive_vibrance_skin_memory_protection_enabled_changed: changed_expected(
+            &baseline
+                .tone
+                .adaptive_vibrance_skin_memory_protection_enabled,
+            &current_skin_memory.and_then(|protection| protection.enabled),
+        ),
+        adaptive_vibrance_skin_memory_protection_space_changed: changed_expected(
+            &baseline.tone.adaptive_vibrance_skin_memory_protection_space,
+            &current_skin_memory.and_then(|protection| protection.working_space.clone()),
+        ),
+        adaptive_vibrance_skin_memory_protected_ratio_delta: delta(
+            baseline.tone.adaptive_vibrance_skin_memory_protected_ratio,
+            current_skin_memory.and_then(|protection| protection.protected_pixel_ratio),
+        ),
+        adaptive_vibrance_skin_memory_mean_protection_delta: delta(
+            baseline.tone.adaptive_vibrance_skin_memory_mean_protection,
+            current_skin_memory.and_then(|protection| protection.mean_protection_weight),
+        ),
+        adaptive_vibrance_preferred_memory_color_guard_enabled_changed: changed_expected(
+            &baseline
+                .tone
+                .adaptive_vibrance_preferred_memory_color_guard_enabled,
+            &current_preferred_memory.and_then(|guard| guard.enabled),
+        ),
+        adaptive_vibrance_preferred_memory_color_guard_space_changed: changed_expected(
+            &baseline
+                .tone
+                .adaptive_vibrance_preferred_memory_color_guard_space,
+            &current_preferred_memory.and_then(|guard| guard.working_space.clone()),
+        ),
+        adaptive_vibrance_preferred_memory_color_guard_reference_changed: changed_expected(
+            &baseline
+                .tone
+                .adaptive_vibrance_preferred_memory_color_guard_reference,
+            &current_preferred_memory.and_then(|guard| guard.reference.clone()),
+        ),
+        adaptive_vibrance_preferred_memory_color_matched_ratio_delta: delta(
+            baseline
+                .tone
+                .adaptive_vibrance_preferred_memory_color_matched_ratio,
+            current_preferred_memory.and_then(|guard| guard.matched_pixel_ratio),
+        ),
+        adaptive_vibrance_preferred_memory_color_limited_ratio_delta: delta(
+            baseline
+                .tone
+                .adaptive_vibrance_preferred_memory_color_limited_ratio,
+            current_preferred_memory.and_then(|guard| guard.limited_pixel_ratio),
+        ),
+        adaptive_vibrance_preferred_memory_color_mean_scale_reduction_delta: delta(
+            baseline
+                .tone
+                .adaptive_vibrance_preferred_memory_color_mean_scale_reduction,
+            current_preferred_memory.and_then(|guard| guard.mean_scale_reduction),
+        ),
+        preferred_skin_rendering_enabled_changed: changed_expected(
+            &baseline.tone.preferred_skin_rendering_enabled,
+            &current_preferred_skin.and_then(|rendering| rendering.enabled),
+        ),
+        preferred_skin_rendering_space_changed: changed_expected(
+            &baseline.tone.preferred_skin_rendering_space,
+            &current_preferred_skin.and_then(|rendering| rendering.working_space.clone()),
+        ),
+        preferred_skin_rendering_preference_reference_changed: changed_expected(
+            &baseline.tone.preferred_skin_rendering_preference_reference,
+            &current_preferred_skin.and_then(|rendering| rendering.preference_reference.clone()),
+        ),
+        preferred_skin_rendering_adjusted_ratio_delta: delta(
+            baseline.tone.preferred_skin_rendering_adjusted_ratio,
+            current_preferred_skin.and_then(|rendering| rendering.adjusted_pixel_ratio),
+        ),
+        preferred_skin_rendering_mean_delta_e_ab_delta: delta(
+            baseline.tone.preferred_skin_rendering_mean_delta_e_ab,
+            current_preferred_skin.and_then(|rendering| rendering.mean_delta_e_ab),
         ),
         luma_residual_p95_ratio: ratio(
             baseline.grain.luma_residual_p95,
@@ -4108,6 +6464,22 @@ pub fn compare_summary_baseline(
             baseline.grain.chroma_to_luma_p95_ratio,
             current_grain.and_then(|grain| grain.chroma_to_luma_p95_ratio),
         ),
+        grain_detail_review_required_changed: changed_expected(
+            &baseline.grain.detail_review_required,
+            &current_grain_detail.and_then(|detail| detail.review_required),
+        ),
+        grain_detail_decision_supported_changed: changed_expected(
+            &baseline.grain.detail_decision_supported,
+            &current_grain_detail.and_then(|detail| detail.decision_supported),
+        ),
+        grain_detail_luminance_p10_retention_delta: delta(
+            baseline.grain.luminance_p10_retention,
+            current_grain_detail.and_then(|detail| detail.luminance_p10_retention),
+        ),
+        grain_detail_chroma_p10_retention_delta: delta(
+            baseline.grain.chroma_p10_retention,
+            current_grain_detail.and_then(|detail| detail.chroma_p10_retention),
+        ),
     };
     comparison.issues = summary_baseline_issues(&comparison, baseline);
     comparison.status = if comparison.issues.is_empty() {
@@ -4119,16 +6491,30 @@ pub fn compare_summary_baseline(
 }
 
 pub fn tracked_baseline_from_summary(summary: &ValidationSummary) -> TrackedValidationBaseline {
-    let seam_exposure_correction_applied = summary
-        .stitch
-        .seam_exposure_correction
-        .as_ref()
-        .and_then(|correction| correction.applied);
+    let seam_exposure = summary.stitch.seam_exposure_correction.as_ref();
+    let seam_exposure_correction_applied = seam_exposure.and_then(|correction| correction.applied);
+    let seam_exposure_model = seam_exposure.and_then(|correction| correction.model.clone());
+    let seam_spatial_2d =
+        seam_exposure.and_then(|correction| correction.spatial_2d_validation.as_ref());
+    let seam_spatial_quadratic =
+        seam_spatial_2d.and_then(|validation| validation.quadratic.as_ref());
+    let seam_blend = summary.stitch.seam_blend.as_ref();
+    let seam_detail = seam_blend.and_then(|blend| blend.detail_consistency.as_ref());
     let calibration_acceptance = summary.colorspace.calibration_acceptance.as_ref();
     let reference_patch = summary.colorspace.reference_patch_evaluation.as_ref();
     let neutral_quality = summary.colorspace.neutral_estimate_quality.as_ref();
     let dominant_anchor_quality = summary.colorspace.dominant_anchor_quality.as_ref();
     let grain = summary.tone.high_frequency_grain.as_ref();
+    let grain_detail = summary.tone.grain_detail_retention.as_ref();
+    let skin_memory = summary
+        .tone
+        .adaptive_vibrance_skin_memory_protection
+        .as_ref();
+    let preferred_memory = summary
+        .tone
+        .adaptive_vibrance_preferred_memory_color_guard
+        .as_ref();
+    let preferred_skin = summary.tone.preferred_skin_rendering.as_ref();
 
     TrackedValidationBaseline {
         fixture: Some(summary.fixture.clone()),
@@ -4137,6 +6523,25 @@ pub fn tracked_baseline_from_summary(summary: &ValidationSummary) -> TrackedVali
             confidence: summary.stitch.confidence,
             chosen_hypothesis: summary.stitch.chosen_hypothesis.clone(),
             seam_exposure_correction_applied,
+            seam_exposure_model,
+            seam_exposure_spatial_2d_gain_accepted: seam_spatial_2d
+                .and_then(|validation| validation.gain_accepted),
+            seam_exposure_spatial_2d_gain_offset_accepted: seam_spatial_2d
+                .and_then(|validation| validation.gain_offset_accepted),
+            seam_exposure_spatial_quadratic_gain_accepted: seam_spatial_quadratic
+                .and_then(|validation| validation.gain_accepted),
+            seam_exposure_spatial_quadratic_gain_offset_accepted: seam_spatial_quadratic
+                .and_then(|validation| validation.gain_offset_accepted),
+            seam_blend_mode: seam_blend.and_then(|blend| blend.mode.clone()),
+            seam_blend_applied: seam_blend.and_then(|blend| blend.applied),
+            seam_blend_review_required: seam_blend.and_then(|blend| blend.review_required),
+            seam_detail_review_required: seam_detail.and_then(|detail| detail.review_required),
+            seam_detail_max_symmetric_energy_ratio: seam_detail
+                .and_then(|detail| detail.maximum_symmetric_energy_ratio),
+            seam_gradient_ratio: seam_blend
+                .and_then(|blend| blend.output_to_source_seam_gradient_ratio),
+            seam_overlap_p95_abs_difference: seam_blend
+                .and_then(|blend| blend.overlap_p95_abs_difference),
         },
         render: TrackedRenderBaseline {
             output_width: summary.render.output_width,
@@ -4150,6 +6555,8 @@ pub fn tracked_baseline_from_summary(summary: &ValidationSummary) -> TrackedVali
             raw_base_support_fraction: summary.base_density.raw_base_support_fraction,
             render_input_source: summary.render.render_input_source.clone(),
             colorspace_mapping_strategy: summary.render.colorspace_mapping_strategy.clone(),
+            render_review_status: summary.render.render_review_status.clone(),
+            render_reviewable: summary.render.render_reviewable,
         },
         colorspace: TrackedColorspaceBaseline {
             calibration_status: summary.colorspace.calibration_status.clone(),
@@ -4185,6 +6592,11 @@ pub fn tracked_baseline_from_summary(summary: &ValidationSummary) -> TrackedVali
             selected_candidate_rank: summary.colorspace.selected_candidate_rank,
             calibration_acceptance_status: calibration_acceptance
                 .and_then(|acceptance| acceptance.status.clone()),
+            calibration_color_mapping_applied: summary
+                .colorspace
+                .calibration_color_mapping_application
+                .as_ref()
+                .and_then(|application| application.applied),
             calibration_acceptance_preferred_candidate: calibration_acceptance
                 .and_then(|acceptance| acceptance.preferred_candidate.clone()),
             calibration_acceptance_beats_image_derived: calibration_acceptance
@@ -4270,11 +6682,54 @@ pub fn tracked_baseline_from_summary(summary: &ValidationSummary) -> TrackedVali
                 .tone
                 .highlight_neutral_chroma_compressed_ratio,
             shadow_chroma_compressed_ratio: summary.tone.shadow_chroma_compressed_ratio,
+            tone_output_confidence_status: summary.tone.tone_output_confidence_status.clone(),
+            tone_output_review_required: summary.tone.tone_output_review_required,
+            tone_output_evidence_confidence: summary.tone.tone_output_evidence_confidence,
+            render_luminance_range_p05_p95: summary.tone.render_luminance_range_p05_p95,
+            render_to_mapped_luminance_range_ratio: summary
+                .tone
+                .render_to_mapped_luminance_range_ratio,
+            maximum_post_tone_high_clip_ratio: summary.tone.maximum_post_tone_high_clip_ratio,
+            maximum_post_tone_low_clip_ratio: summary.tone.maximum_post_tone_low_clip_ratio,
+            adaptive_vibrance_skin_memory_protection_enabled: skin_memory
+                .and_then(|protection| protection.enabled),
+            adaptive_vibrance_skin_memory_protection_space: skin_memory
+                .and_then(|protection| protection.working_space.clone()),
+            adaptive_vibrance_skin_memory_protected_ratio: skin_memory
+                .and_then(|protection| protection.protected_pixel_ratio),
+            adaptive_vibrance_skin_memory_mean_protection: skin_memory
+                .and_then(|protection| protection.mean_protection_weight),
+            adaptive_vibrance_preferred_memory_color_guard_enabled: preferred_memory
+                .and_then(|guard| guard.enabled),
+            adaptive_vibrance_preferred_memory_color_guard_space: preferred_memory
+                .and_then(|guard| guard.working_space.clone()),
+            adaptive_vibrance_preferred_memory_color_guard_reference: preferred_memory
+                .and_then(|guard| guard.reference.clone()),
+            adaptive_vibrance_preferred_memory_color_matched_ratio: preferred_memory
+                .and_then(|guard| guard.matched_pixel_ratio),
+            adaptive_vibrance_preferred_memory_color_limited_ratio: preferred_memory
+                .and_then(|guard| guard.limited_pixel_ratio),
+            adaptive_vibrance_preferred_memory_color_mean_scale_reduction: preferred_memory
+                .and_then(|guard| guard.mean_scale_reduction),
+            preferred_skin_rendering_enabled: preferred_skin
+                .and_then(|rendering| rendering.enabled),
+            preferred_skin_rendering_space: preferred_skin
+                .and_then(|rendering| rendering.working_space.clone()),
+            preferred_skin_rendering_preference_reference: preferred_skin
+                .and_then(|rendering| rendering.preference_reference.clone()),
+            preferred_skin_rendering_adjusted_ratio: preferred_skin
+                .and_then(|rendering| rendering.adjusted_pixel_ratio),
+            preferred_skin_rendering_mean_delta_e_ab: preferred_skin
+                .and_then(|rendering| rendering.mean_delta_e_ab),
         },
         grain: TrackedGrainBaseline {
             luma_residual_p95: grain.and_then(|grain| grain.luma_residual_p95),
             chroma_residual_p95: grain.and_then(|grain| grain.chroma_residual_p95),
             chroma_to_luma_p95_ratio: grain.and_then(|grain| grain.chroma_to_luma_p95_ratio),
+            detail_review_required: grain_detail.and_then(|detail| detail.review_required),
+            detail_decision_supported: grain_detail.and_then(|detail| detail.decision_supported),
+            luminance_p10_retention: grain_detail.and_then(|detail| detail.luminance_p10_retention),
+            chroma_p10_retention: grain_detail.and_then(|detail| detail.chroma_p10_retention),
         },
     }
 }
@@ -4341,6 +6796,48 @@ pub fn comparison_issues(comparison: &RenderComparisonSummary) -> Vec<String> {
     }
     if comparison.colorspace_tone_color_trust_state_changed {
         issues.push("colorspace_tone_color_trust_state_changed".to_string());
+    }
+    if comparison.render_review_status_changed {
+        issues.push("render_review_status_changed".to_string());
+    }
+    if comparison.render_reviewable_changed {
+        issues.push("render_reviewable_changed".to_string());
+    }
+    if comparison.tone_output_confidence_status_changed {
+        issues.push("tone_output_confidence_status_changed".to_string());
+    }
+    if comparison.tone_output_review_required_changed {
+        issues.push("tone_output_review_required_changed".to_string());
+    }
+    if comparison
+        .tone_output_evidence_confidence_delta
+        .is_some_and(|delta| delta < -1e-12)
+    {
+        issues.push("tone_output_evidence_confidence_regressed".to_string());
+    }
+    if comparison
+        .tone_output_render_luminance_range_p05_p95_delta
+        .is_some_and(|delta| delta < -0.02)
+    {
+        issues.push("tone_output_render_luminance_range_regressed".to_string());
+    }
+    if comparison
+        .tone_output_render_to_mapped_luminance_range_ratio_delta
+        .is_some_and(|delta| delta < -0.05)
+    {
+        issues.push("tone_output_range_retention_regressed".to_string());
+    }
+    if comparison
+        .tone_output_maximum_post_tone_high_clip_ratio_delta
+        .is_some_and(|delta| delta > 0.01)
+    {
+        issues.push("tone_output_high_clipping_regressed".to_string());
+    }
+    if comparison
+        .tone_output_maximum_post_tone_low_clip_ratio_delta
+        .is_some_and(|delta| delta > 0.01)
+    {
+        issues.push("tone_output_low_clipping_regressed".to_string());
     }
     if comparison
         .colorspace_selected_quality_score_delta
@@ -4480,6 +6977,51 @@ fn summary_baseline_issues(
     if comparison.seam_exposure_correction_changed {
         issues.push("seam_exposure_correction_changed".to_string());
     }
+    if comparison.seam_exposure_model_changed {
+        issues.push("seam_exposure_model_changed".to_string());
+    }
+    if comparison.seam_exposure_spatial_2d_gain_acceptance_changed {
+        issues.push("seam_exposure_spatial_2d_gain_acceptance_changed".to_string());
+    }
+    if comparison.seam_exposure_spatial_2d_gain_offset_acceptance_changed {
+        issues.push("seam_exposure_spatial_2d_gain_offset_acceptance_changed".to_string());
+    }
+    if comparison.seam_exposure_spatial_quadratic_gain_acceptance_changed {
+        issues.push("seam_exposure_spatial_quadratic_gain_acceptance_changed".to_string());
+    }
+    if comparison.seam_exposure_spatial_quadratic_gain_offset_acceptance_changed {
+        issues.push("seam_exposure_spatial_quadratic_gain_offset_acceptance_changed".to_string());
+    }
+    if comparison.seam_blend_mode_changed {
+        issues.push("seam_blend_mode_changed".to_string());
+    }
+    if comparison.seam_blend_applied_changed {
+        issues.push("seam_blend_applied_changed".to_string());
+    }
+    if comparison.seam_blend_review_required_changed {
+        issues.push("seam_blend_review_required_changed".to_string());
+    }
+    if comparison.seam_detail_review_required_changed {
+        issues.push("seam_detail_review_required_changed".to_string());
+    }
+    if comparison
+        .seam_detail_max_symmetric_energy_ratio_delta
+        .is_some_and(|delta| delta.abs() > tolerances.tone_ratio_abs)
+    {
+        issues.push("seam_detail_energy_ratio_changed_materially".to_string());
+    }
+    if comparison
+        .seam_gradient_ratio_delta
+        .is_some_and(|delta| delta.abs() > tolerances.tone_ratio_abs)
+    {
+        issues.push("seam_gradient_ratio_changed_materially".to_string());
+    }
+    if comparison
+        .seam_overlap_p95_abs_difference_delta
+        .is_some_and(|delta| delta.abs() > tolerances.tone_ratio_abs)
+    {
+        issues.push("seam_overlap_p95_abs_difference_changed_materially".to_string());
+    }
     if comparison.base_estimate_source_changed {
         issues.push("base_estimate_source_changed".to_string());
     }
@@ -4562,6 +7104,9 @@ fn summary_baseline_issues(
     }
     if comparison.calibration_acceptance_status_changed {
         issues.push("calibration_acceptance_status_changed".to_string());
+    }
+    if comparison.calibration_color_mapping_applied_changed {
+        issues.push("calibration_color_mapping_applied_changed".to_string());
     }
     if comparison.calibration_acceptance_preferred_candidate_changed {
         issues.push("calibration_acceptance_preferred_candidate_changed".to_string());
@@ -4744,6 +7289,48 @@ fn summary_baseline_issues(
         issues.push("colorspace_neutral_trim_applied_changed".to_string());
     }
     issues.extend(comparison.colorspace_debug_artifact_issues.iter().cloned());
+    if comparison.render_review_status_changed {
+        issues.push("render_review_status_changed".to_string());
+    }
+    if comparison.render_reviewable_changed {
+        issues.push("render_reviewable_changed".to_string());
+    }
+    if comparison.tone_output_confidence_status_changed {
+        issues.push("tone_output_confidence_status_changed".to_string());
+    }
+    if comparison.tone_output_review_required_changed {
+        issues.push("tone_output_review_required_changed".to_string());
+    }
+    if comparison
+        .tone_output_evidence_confidence_delta
+        .is_some_and(|delta| delta < -tolerances.confidence_abs)
+    {
+        issues.push("tone_output_evidence_confidence_regressed".to_string());
+    }
+    if comparison
+        .tone_output_render_luminance_range_p05_p95_delta
+        .is_some_and(|delta| delta < -tolerances.tone_ratio_abs)
+    {
+        issues.push("tone_output_render_luminance_range_regressed".to_string());
+    }
+    if comparison
+        .tone_output_render_to_mapped_luminance_range_ratio_delta
+        .is_some_and(|delta| delta < -tolerances.tone_ratio_abs)
+    {
+        issues.push("tone_output_range_retention_regressed".to_string());
+    }
+    if comparison
+        .tone_output_maximum_post_tone_high_clip_ratio_delta
+        .is_some_and(|delta| delta > tolerances.tone_ratio_abs)
+    {
+        issues.push("tone_output_high_clipping_regressed".to_string());
+    }
+    if comparison
+        .tone_output_maximum_post_tone_low_clip_ratio_delta
+        .is_some_and(|delta| delta > tolerances.tone_ratio_abs)
+    {
+        issues.push("tone_output_low_clipping_regressed".to_string());
+    }
     if comparison
         .highlight_chroma_compressed_ratio_delta
         .is_some_and(|delta| delta.abs() > tolerances.tone_ratio_abs)
@@ -4762,6 +7349,79 @@ fn summary_baseline_issues(
     {
         issues.push("shadow_chroma_compression_changed_materially".to_string());
     }
+    if comparison.adaptive_vibrance_skin_memory_protection_enabled_changed {
+        issues.push("adaptive_vibrance_skin_memory_protection_enabled_changed".to_string());
+    }
+    if comparison.adaptive_vibrance_skin_memory_protection_space_changed {
+        issues.push("adaptive_vibrance_skin_memory_protection_space_changed".to_string());
+    }
+    if comparison
+        .adaptive_vibrance_skin_memory_protected_ratio_delta
+        .is_some_and(|delta| delta.abs() > tolerances.tone_ratio_abs)
+    {
+        issues.push("adaptive_vibrance_skin_memory_protected_ratio_changed_materially".to_string());
+    }
+    if comparison
+        .adaptive_vibrance_skin_memory_mean_protection_delta
+        .is_some_and(|delta| delta.abs() > tolerances.tone_ratio_abs)
+    {
+        issues.push("adaptive_vibrance_skin_memory_mean_protection_changed_materially".to_string());
+    }
+    if comparison.adaptive_vibrance_preferred_memory_color_guard_enabled_changed {
+        issues.push("adaptive_vibrance_preferred_memory_color_guard_enabled_changed".to_string());
+    }
+    if comparison.adaptive_vibrance_preferred_memory_color_guard_space_changed {
+        issues.push("adaptive_vibrance_preferred_memory_color_guard_space_changed".to_string());
+    }
+    if comparison.adaptive_vibrance_preferred_memory_color_guard_reference_changed {
+        issues.push("adaptive_vibrance_preferred_memory_color_guard_reference_changed".to_string());
+    }
+    if comparison
+        .adaptive_vibrance_preferred_memory_color_matched_ratio_delta
+        .is_some_and(|delta| delta.abs() > tolerances.tone_ratio_abs)
+    {
+        issues.push(
+            "adaptive_vibrance_preferred_memory_color_matched_ratio_changed_materially".to_string(),
+        );
+    }
+    if comparison
+        .adaptive_vibrance_preferred_memory_color_limited_ratio_delta
+        .is_some_and(|delta| delta.abs() > tolerances.tone_ratio_abs)
+    {
+        issues.push(
+            "adaptive_vibrance_preferred_memory_color_limited_ratio_changed_materially".to_string(),
+        );
+    }
+    if comparison
+        .adaptive_vibrance_preferred_memory_color_mean_scale_reduction_delta
+        .is_some_and(|delta| delta.abs() > tolerances.tone_ratio_abs)
+    {
+        issues.push(
+            "adaptive_vibrance_preferred_memory_color_mean_scale_reduction_changed_materially"
+                .to_string(),
+        );
+    }
+    if comparison.preferred_skin_rendering_enabled_changed {
+        issues.push("preferred_skin_rendering_enabled_changed".to_string());
+    }
+    if comparison.preferred_skin_rendering_space_changed {
+        issues.push("preferred_skin_rendering_space_changed".to_string());
+    }
+    if comparison.preferred_skin_rendering_preference_reference_changed {
+        issues.push("preferred_skin_rendering_preference_reference_changed".to_string());
+    }
+    if comparison
+        .preferred_skin_rendering_adjusted_ratio_delta
+        .is_some_and(|delta| delta.abs() > tolerances.tone_ratio_abs)
+    {
+        issues.push("preferred_skin_rendering_adjusted_ratio_changed_materially".to_string());
+    }
+    if comparison
+        .preferred_skin_rendering_mean_delta_e_ab_delta
+        .is_some_and(|delta| delta.abs() > tolerances.reference_delta_e_abs)
+    {
+        issues.push("preferred_skin_rendering_mean_delta_e_ab_changed_materially".to_string());
+    }
     let grain_low = 1.0 - tolerances.grain_ratio_abs;
     let grain_high = 1.0 + tolerances.grain_ratio_abs;
     if ratio_outside(comparison.luma_residual_p95_ratio, grain_low, grain_high) {
@@ -4775,6 +7435,24 @@ fn summary_baseline_issues(
         .is_some_and(|delta| delta.abs() > tolerances.grain_ratio_abs)
     {
         issues.push("chroma_to_luma_p95_ratio_changed_materially".to_string());
+    }
+    if comparison.grain_detail_review_required_changed {
+        issues.push("grain_detail_review_required_changed".to_string());
+    }
+    if comparison.grain_detail_decision_supported_changed {
+        issues.push("grain_detail_decision_supported_changed".to_string());
+    }
+    if comparison
+        .grain_detail_luminance_p10_retention_delta
+        .is_some_and(|delta| delta < -tolerances.grain_ratio_abs)
+    {
+        issues.push("grain_detail_luminance_retention_regressed".to_string());
+    }
+    if comparison
+        .grain_detail_chroma_p10_retention_delta
+        .is_some_and(|delta| delta < -tolerances.grain_ratio_abs)
+    {
+        issues.push("grain_detail_chroma_retention_regressed".to_string());
     }
     issues
 }
@@ -4790,6 +7468,12 @@ fn summarize_report_identity(
         generated_at_unix_ms: metadata.map(|metadata| metadata.generated_at_unix_ms),
         package_version: metadata.map(|metadata| metadata.package_version.clone()),
         binary_name: metadata.map(|metadata| metadata.binary_name.clone()),
+        binary_path: metadata.and_then(|metadata| metadata.binary_path.clone()),
+        binary_sha256: metadata.and_then(|metadata| metadata.binary_sha256.clone()),
+        binary_file_size_bytes: metadata.and_then(|metadata| metadata.binary_file_size_bytes),
+        binary_identity_status: metadata
+            .and_then(|metadata| metadata.binary_identity_status.clone()),
+        binary_identity_error: metadata.and_then(|metadata| metadata.binary_identity_error.clone()),
         working_directory: metadata.map(|metadata| metadata.working_directory.clone()),
         cli_args: metadata.map(|metadata| metadata.cli_args.clone()),
         output_path: metadata.map(|metadata| metadata.output_path.clone()),
@@ -4833,6 +7517,20 @@ fn summarize_render(
     let output_path = save_phase
         .and_then(|phase| string_metric(phase, "output_path"))
         .or_else(|| identity.output_path.clone());
+    let artifact_sha256_binding_required = identity
+        .report_schema_version
+        .is_some_and(|version| version >= 4);
+    let output_sha256 = save_phase.and_then(|phase| string_metric(phase, "output_sha256"));
+    let output_file_sha256 = output_path.as_deref().and_then(|path| {
+        (artifact_sha256_binding_required || output_sha256.is_some())
+            .then(|| inspect_file_sha256(&resolve_report_relative_path(identity, path)))
+            .flatten()
+    });
+    let output_file_sha256_matches_report = artifact_sha256_match(
+        artifact_sha256_binding_required,
+        output_sha256.as_deref(),
+        output_file_sha256.as_deref(),
+    );
     let output_icc_profile_embedded = save_phase
         .and_then(|phase| phase.metrics.get("output_icc_profile"))
         .and_then(|profile| profile.get("embedded"))
@@ -4848,14 +7546,267 @@ fn summarize_render(
             inspection,
         )
     });
+    let output_file_dimensions_match_report = output_file_icc
+        .as_ref()
+        .map(|inspection| inspection.width == output_width && inspection.height == output_height);
+    let output_encoding_claim_is_supported = save_phase
+        .and_then(|phase| phase.metrics.get("output_encoding"))
+        .is_some_and(|encoding| {
+            string_value(encoding.get("container")).as_deref() == Some("tiff")
+                && string_value(encoding.get("channels")).as_deref() == Some("RGB")
+                && string_value(encoding.get("sample_format")).as_deref() == Some("UINT")
+                && encoding
+                    .get("bits_per_sample")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|values| {
+                        values.len() == 3 && values.iter().all(|value| value.as_u64() == Some(16))
+                    })
+        });
+    let output_file_storage_matches_report = output_file_icc.as_ref().map(|inspection| {
+        output_encoding_claim_is_supported
+            && inspection.color_type.as_deref() == Some("RGB(16)")
+            && inspection.sample_format.as_deref().is_some_and(|formats| {
+                !formats.is_empty() && formats.iter().all(|format| *format == 1)
+            })
+    });
+    let quality_mode = save_phase.and_then(|phase| string_metric(phase, "quality_mode"));
+    let master_scene_referred_path =
+        save_phase.and_then(|phase| string_metric(phase, "master_scene_referred_path"));
+    let master_scene_referred_sha256 =
+        save_phase.and_then(|phase| string_metric(phase, "master_scene_referred_sha256"));
+    let master_scene_referred_requested = save_phase
+        .and_then(|phase| bool_metric(phase, "master_scene_referred_requested"))
+        .or_else(|| {
+            quality_mode
+                .as_deref()
+                .map(|quality| quality == "perfect" || master_scene_referred_path.is_some())
+        });
+    let master_scene_referred_file = master_scene_referred_path
+        .as_deref()
+        .map(|path| inspect_tiff_artifact(&resolve_report_relative_path(identity, path)));
+    let master_scene_referred_file_sha256 =
+        master_scene_referred_path.as_deref().and_then(|path| {
+            (artifact_sha256_binding_required || master_scene_referred_sha256.is_some())
+                .then(|| inspect_file_sha256(&resolve_report_relative_path(identity, path)))
+                .flatten()
+        });
+    let master_scene_referred_file_sha256_matches_report = artifact_sha256_match(
+        artifact_sha256_binding_required && master_scene_referred_requested == Some(true),
+        master_scene_referred_sha256.as_deref(),
+        master_scene_referred_file_sha256.as_deref(),
+    );
+    let master_report_claim_is_supported = save_phase.is_some_and(|phase| {
+        string_metric(phase, "master_scene_referred_color_space").as_deref()
+            == Some("scene_referred_linear_prophoto_rgb_d50")
+            && phase
+                .metrics
+                .get("master_scene_referred_icc_profile")
+                .and_then(|profile| profile.get("embedded"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && phase
+                .metrics
+                .get("master_scene_referred_icc_profile")
+                .and_then(|profile| string_value(profile.get("description")))
+                .as_deref()
+                == Some(tiff_io::PROPHOTO_LINEAR_ICC_DESCRIPTION)
+            && phase
+                .metrics
+                .get("master_scene_referred_diagnostics")
+                .and_then(|diagnostics| string_value(diagnostics.get("sample_format")))
+                .as_deref()
+                == Some("IEEEFP")
+    });
+    let master_scene_referred_file_matches_report = match (
+        master_scene_referred_requested,
+        master_scene_referred_path.as_deref(),
+    ) {
+        (Some(true), None) => Some(false),
+        (_, Some(_)) => master_scene_referred_file.as_ref().map(|inspection| {
+            let dimensions_match = output_file_icc.as_ref().is_some_and(|output| {
+                inspection.width == output.width && inspection.height == output.height
+            });
+            master_report_claim_is_supported
+                && dimensions_match
+                && inspection.color_type.as_deref() == Some("RGB(32)")
+                && inspection.sample_format.as_deref().is_some_and(|formats| {
+                    !formats.is_empty() && formats.iter().all(|format| *format == 3)
+                })
+                && inspection.image_description.as_deref()
+                    == Some(tiff_io::PROPHOTO_SCENE_REFERRED_FLOAT_DESCRIPTION)
+                && inspection.embedded
+                && inspection.valid
+                && inspection.description.as_deref()
+                    == Some(tiff_io::PROPHOTO_LINEAR_ICC_DESCRIPTION)
+        }),
+        _ => None,
+    };
+    let master_scene_referred_file_status =
+        if master_scene_referred_requested == Some(true) && master_scene_referred_path.is_none() {
+            Some("missing_path".to_string())
+        } else {
+            master_scene_referred_file.as_ref().map(|inspection| {
+                if inspection.status == "inspection_failed" {
+                    "inspection_failed"
+                } else if master_scene_referred_file_matches_report == Some(true) {
+                    "valid_scene_referred_master"
+                } else {
+                    "invalid_scene_referred_master"
+                }
+                .to_string()
+            })
+        };
+    let review_srgb_path = save_phase.and_then(|phase| string_metric(phase, "review_srgb_path"));
+    let review_srgb_sha256 =
+        save_phase.and_then(|phase| string_metric(phase, "review_srgb_sha256"));
+    let review_srgb_requested = save_phase
+        .and_then(|phase| bool_metric(phase, "review_srgb_requested"))
+        .or_else(|| quality_mode.as_deref().map(|quality| quality == "perfect"));
+    let review_srgb_file = review_srgb_path
+        .as_deref()
+        .map(|path| inspect_review_srgb_artifact(&resolve_report_relative_path(identity, path)));
+    let review_srgb_file_sha256 = review_srgb_path.as_deref().and_then(|path| {
+        (artifact_sha256_binding_required || review_srgb_sha256.is_some())
+            .then(|| inspect_file_sha256(&resolve_report_relative_path(identity, path)))
+            .flatten()
+    });
+    let review_srgb_file_sha256_matches_report = artifact_sha256_match(
+        artifact_sha256_binding_required && review_srgb_requested == Some(true),
+        review_srgb_sha256.as_deref(),
+        review_srgb_file_sha256.as_deref(),
+    );
+    let review_srgb_gamut_mapping = save_phase
+        .and_then(|phase| phase.metrics.get("review_srgb_gamut_mapping"))
+        .filter(|mapping| mapping.is_object());
+    let review_srgb_gamut_mapping_space =
+        review_srgb_gamut_mapping.and_then(|mapping| string_value(mapping.get("space")));
+    let review_srgb_gamut_mapped_ratio =
+        review_srgb_gamut_mapping.and_then(|mapping| f64_value(mapping.get("gamut_mapped_ratio")));
+    let review_srgb_gamut_mapping_mean_chroma_scale = review_srgb_gamut_mapping
+        .and_then(|mapping| f64_value(mapping.get("mapped_mean_chroma_scale")));
+    let review_srgb_gamut_mapping_min_chroma_scale = review_srgb_gamut_mapping
+        .and_then(|mapping| f64_value(mapping.get("mapped_min_chroma_scale")));
+    let review_srgb_post_map_out_of_gamut_pixel_count = review_srgb_gamut_mapping
+        .and_then(|mapping| usize_value(mapping.get("post_map_out_of_gamut_pixel_count")));
+    let review_srgb_gamut_mapping_supported =
+        match review_srgb_requested {
+            Some(true) => Some(review_srgb_gamut_mapping.is_some_and(|mapping| {
+                let width = usize_value(mapping.get("width"));
+                let height = usize_value(mapping.get("height"));
+                let pixel_count = usize_value(mapping.get("pixel_count"));
+                let nonfinite = usize_value(mapping.get("nonfinite_input_pixel_count"));
+                let mapped_count = usize_value(mapping.get("gamut_mapped_pixel_count"));
+                let mapped_ratio = f64_value(mapping.get("gamut_mapped_ratio"));
+                let mean_scale = f64_value(mapping.get("mapped_mean_chroma_scale"));
+                let min_scale = f64_value(mapping.get("mapped_min_chroma_scale"));
+                let dimensions_match = width
+                    .zip(height)
+                    .zip(
+                        output_file_icc
+                            .as_ref()
+                            .and_then(|output| output.width.zip(output.height)),
+                    )
+                    .is_some_and(|((width, height), (output_width, output_height))| {
+                        width == output_width && height == output_height
+                    });
+                let counts_are_coherent = width.zip(height).zip(pixel_count).is_some_and(
+                    |((width, height), pixel_count)| width.checked_mul(height) == Some(pixel_count),
+                ) && mapped_count
+                    .zip(pixel_count)
+                    .is_some_and(|(mapped, total)| mapped <= total)
+                    && mapped_count.zip(pixel_count).zip(mapped_ratio).is_some_and(
+                        |((mapped, total), ratio)| {
+                            total > 0 && (ratio - mapped as f64 / total as f64).abs() <= 1e-12
+                        },
+                    );
+                review_srgb_gamut_mapping_space.as_deref()
+                    == Some(tiff_io::SRGB_REVIEW_GAMUT_MAPPING_SPACE)
+                    && dimensions_match
+                    && pixel_count.is_some_and(|count| count > 0)
+                    && counts_are_coherent
+                    && nonfinite == Some(0)
+                    && mapped_ratio
+                        .is_some_and(|ratio| ratio.is_finite() && (0.0..=1.0).contains(&ratio))
+                    && mean_scale
+                        .is_some_and(|scale| scale.is_finite() && (0.0..=1.0).contains(&scale))
+                    && min_scale
+                        .is_some_and(|scale| scale.is_finite() && (0.0..=1.0).contains(&scale))
+                    && min_scale
+                        .zip(mean_scale)
+                        .is_some_and(|(min, mean)| min <= mean + 1e-12)
+                    && review_srgb_post_map_out_of_gamut_pixel_count == Some(0)
+            })),
+            Some(false) if review_srgb_gamut_mapping.is_some() => Some(false),
+            _ => None,
+        };
+    let review_report_claim_is_supported = save_phase.is_some_and(|phase| {
+        string_metric(phase, "review_srgb_color_space").as_deref() == Some("srgb_display_png")
+            && phase
+                .metrics
+                .get("review_srgb_encoding")
+                .is_some_and(|encoding| {
+                    string_value(encoding.get("container")).as_deref() == Some("png")
+                        && string_value(encoding.get("channels")).as_deref() == Some("RGB")
+                        && string_value(encoding.get("sample_format")).as_deref() == Some("UINT")
+                        && encoding
+                            .get("bits_per_sample")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|values| {
+                                values.len() == 3
+                                    && values.iter().all(|value| value.as_u64() == Some(8))
+                            })
+                })
+            && phase
+                .metrics
+                .get("review_srgb_icc_profile")
+                .and_then(|profile| profile.get("embedded"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && phase
+                .metrics
+                .get("review_srgb_icc_profile")
+                .and_then(|profile| string_value(profile.get("description")))
+                .as_deref()
+                == Some(tiff_io::SRGB_ICC_DESCRIPTION)
+    });
+    let review_srgb_file_matches_report = match (review_srgb_requested, review_srgb_path.as_deref())
+    {
+        (Some(true), None) => Some(false),
+        (_, Some(_)) => review_srgb_file.as_ref().map(|inspection| {
+            let dimensions_match = output_file_icc.as_ref().is_some_and(|output| {
+                inspection.width == output.width && inspection.height == output.height
+            });
+            review_report_claim_is_supported
+                && dimensions_match
+                && inspection.status == "valid_srgb_review_png"
+                && inspection.color_type.as_deref() == Some("Rgb8")
+                && inspection.icc_profile_valid
+                && inspection.icc_profile_description.as_deref()
+                    == Some(tiff_io::SRGB_ICC_DESCRIPTION)
+                && inspection.icc_profile_matches_standard_srgb
+        }),
+        _ => None,
+    };
+    let review_srgb_file_status =
+        if review_srgb_requested == Some(true) && review_srgb_path.is_none() {
+            Some("missing_path".to_string())
+        } else {
+            review_srgb_file
+                .as_ref()
+                .map(|inspection| inspection.status.clone())
+        };
 
     RenderDiagnosticSummary {
         source_report_path: identity.source_report_path.clone(),
         source_report_generated_at: identity.generated_at.clone(),
+        artifact_sha256_binding_required,
         output_path,
         output_modified_at: save_phase.and_then(|phase| string_metric(phase, "output_modified_at")),
         output_file_size_bytes: save_phase
             .and_then(|phase| u64_metric(phase, "output_file_size_bytes")),
+        output_sha256,
+        output_file_sha256,
+        output_file_sha256_matches_report,
         output_color_space: save_phase.and_then(|phase| string_metric(phase, "output_color_space")),
         output_icc_profile_embedded,
         output_icc_profile_description,
@@ -4870,13 +7821,80 @@ fn summarize_render(
             .as_ref()
             .and_then(|inspection| inspection.description.clone()),
         output_file_icc_profile_matches_report,
+        output_file_width: output_file_icc
+            .as_ref()
+            .and_then(|inspection| inspection.width),
+        output_file_height: output_file_icc
+            .as_ref()
+            .and_then(|inspection| inspection.height),
+        output_file_color_type: output_file_icc
+            .as_ref()
+            .and_then(|inspection| inspection.color_type.clone()),
+        output_file_sample_format: output_file_icc
+            .as_ref()
+            .and_then(|inspection| inspection.sample_format.clone()),
+        output_file_dimensions_match_report,
+        output_file_storage_matches_report,
         output_width,
         output_height,
         render_intent: save_phase.and_then(|phase| string_metric(phase, "render_intent")),
-        quality_mode: save_phase.and_then(|phase| string_metric(phase, "quality_mode")),
-        master_scene_referred_path: save_phase
-            .and_then(|phase| string_metric(phase, "master_scene_referred_path")),
-        review_srgb_path: save_phase.and_then(|phase| string_metric(phase, "review_srgb_path")),
+        quality_mode,
+        master_scene_referred_requested,
+        master_scene_referred_path,
+        master_scene_referred_sha256,
+        master_scene_referred_file_sha256,
+        master_scene_referred_file_sha256_matches_report,
+        master_scene_referred_file_status,
+        master_scene_referred_file_width: master_scene_referred_file
+            .as_ref()
+            .and_then(|inspection| inspection.width),
+        master_scene_referred_file_height: master_scene_referred_file
+            .as_ref()
+            .and_then(|inspection| inspection.height),
+        master_scene_referred_file_color_type: master_scene_referred_file
+            .as_ref()
+            .and_then(|inspection| inspection.color_type.clone()),
+        master_scene_referred_file_sample_format: master_scene_referred_file
+            .as_ref()
+            .and_then(|inspection| inspection.sample_format.clone()),
+        master_scene_referred_file_icc_profile_valid: master_scene_referred_file
+            .as_ref()
+            .map(|inspection| inspection.valid),
+        master_scene_referred_file_icc_profile_description: master_scene_referred_file
+            .as_ref()
+            .and_then(|inspection| inspection.description.clone()),
+        master_scene_referred_file_matches_report,
+        review_srgb_requested,
+        review_srgb_path,
+        review_srgb_sha256,
+        review_srgb_file_sha256,
+        review_srgb_file_sha256_matches_report,
+        review_srgb_file_status,
+        review_srgb_file_width: review_srgb_file
+            .as_ref()
+            .and_then(|inspection| inspection.width),
+        review_srgb_file_height: review_srgb_file
+            .as_ref()
+            .and_then(|inspection| inspection.height),
+        review_srgb_file_color_type: review_srgb_file
+            .as_ref()
+            .and_then(|inspection| inspection.color_type.clone()),
+        review_srgb_file_icc_profile_valid: review_srgb_file
+            .as_ref()
+            .map(|inspection| inspection.icc_profile_valid),
+        review_srgb_file_icc_profile_description: review_srgb_file
+            .as_ref()
+            .and_then(|inspection| inspection.icc_profile_description.clone()),
+        review_srgb_file_icc_profile_matches_standard_srgb: review_srgb_file
+            .as_ref()
+            .map(|inspection| inspection.icc_profile_matches_standard_srgb),
+        review_srgb_file_matches_report,
+        review_srgb_gamut_mapping_space,
+        review_srgb_gamut_mapped_ratio,
+        review_srgb_gamut_mapping_mean_chroma_scale,
+        review_srgb_gamut_mapping_min_chroma_scale,
+        review_srgb_post_map_out_of_gamut_pixel_count,
+        review_srgb_gamut_mapping_supported,
         review_sidecar_sha256: save_phase
             .and_then(|phase| string_metric(phase, "review_sidecar_sha256")),
         input_base_confidence: save_phase
@@ -4886,6 +7904,23 @@ fn summarize_render(
         render_reviewable: save_phase.and_then(|phase| bool_metric(phase, "render_reviewable")),
         render_review_reason: save_phase
             .and_then(|phase| string_metric(phase, "render_review_reason")),
+        tone_output_review_required: save_phase
+            .and_then(|phase| bool_metric(phase, "tone_output_review_required"))
+            .or(tone.tone_output_review_required),
+        tone_output_review_reason: save_phase
+            .and_then(|phase| string_metric(phase, "tone_output_review_reason"))
+            .or_else(|| tone.tone_output_review_reason.clone()),
+        tone_output_confidence_status: save_phase
+            .and_then(|phase| string_metric(phase, "tone_output_confidence_status"))
+            .or_else(|| tone.tone_output_confidence_status.clone()),
+        tone_output_evidence_confidence: save_phase
+            .and_then(|phase| f64_metric(phase, "tone_output_evidence_confidence"))
+            .or(tone.tone_output_evidence_confidence),
+        tone_output_render_luminance_range_p05_p95: tone.render_luminance_range_p05_p95,
+        tone_output_render_to_mapped_luminance_range_ratio: tone
+            .render_to_mapped_luminance_range_ratio,
+        tone_output_maximum_post_tone_high_clip_ratio: tone.maximum_post_tone_high_clip_ratio,
+        tone_output_maximum_post_tone_low_clip_ratio: tone.maximum_post_tone_low_clip_ratio,
         positive_input_likely_negative_like: positive_input_inspection
             .and_then(|inspection| inspection.get("likely_negative_like"))
             .and_then(serde_json::Value::as_bool),
@@ -4954,15 +7989,30 @@ fn summarize_render(
         shadow_chroma_compressed_ratio: tone.shadow_chroma_compressed_ratio,
         high_frequency_grain: tone.high_frequency_grain.clone(),
         noise_reduction_enabled: tone.noise_reduction_enabled,
+        noise_reduction_requested_enabled: tone.noise_reduction_requested_enabled,
+        noise_reduction_requested_strength: tone.noise_reduction_requested_strength,
+        noise_reduction_requested_scale: tone.noise_reduction_requested_scale,
         noise_reduction_applied_ratio: tone.noise_reduction_applied_ratio,
+        noise_reduction_structure_gate_start: tone.noise_reduction_structure_gate_start,
+        noise_reduction_structure_gate_end: tone.noise_reduction_structure_gate_end,
+        noise_reduction_structure_excluded_ratio: tone.noise_reduction_structure_excluded_ratio,
         noise_reduction_mean_abs_chroma_delta: tone.noise_reduction_mean_abs_chroma_delta,
         noise_reduction_mean_abs_luma_delta: tone.noise_reduction_mean_abs_luma_delta,
+        noise_reduction_flat_luma_p95_reduction_ratio: tone
+            .noise_reduction_flat_luma_p95_reduction_ratio,
+        noise_reduction_flat_chroma_p95_reduction_ratio: tone
+            .noise_reduction_flat_chroma_p95_reduction_ratio,
     }
 }
 
 #[derive(Debug, Clone)]
 struct RenderOutputIccInspectionSummary {
     status: String,
+    width: Option<usize>,
+    height: Option<usize>,
+    color_type: Option<String>,
+    sample_format: Option<Vec<u16>>,
+    image_description: Option<String>,
     embedded: bool,
     valid: bool,
     description: Option<String>,
@@ -4972,16 +8022,25 @@ fn inspect_render_output_icc_profile(
     identity: &ReportIdentitySummary,
     output_path: Option<&str>,
 ) -> Option<RenderOutputIccInspectionSummary> {
-    let path = absolute_render_output_path(identity, output_path)?;
-    let inspection = match tiff_io::inspect_tiff_icc_profile(&path) {
+    let path = render_output_path(identity, output_path)?;
+    Some(inspect_tiff_artifact(&path))
+}
+
+fn inspect_tiff_artifact(path: &Path) -> RenderOutputIccInspectionSummary {
+    let inspection = match tiff_io::inspect_tiff_icc_profile(path) {
         Ok(inspection) => inspection,
         Err(_) => {
-            return Some(RenderOutputIccInspectionSummary {
+            return RenderOutputIccInspectionSummary {
                 status: "inspection_failed".to_string(),
+                width: None,
+                height: None,
+                color_type: None,
+                sample_format: None,
+                image_description: None,
                 embedded: false,
                 valid: false,
                 description: None,
-            });
+            };
         }
     };
     let status = if inspection.icc_profile_valid {
@@ -4991,23 +8050,28 @@ fn inspect_render_output_icc_profile(
     } else {
         "missing_icc_profile"
     };
-    Some(RenderOutputIccInspectionSummary {
+    RenderOutputIccInspectionSummary {
         status: status.to_string(),
+        width: usize::try_from(inspection.width).ok(),
+        height: usize::try_from(inspection.height).ok(),
+        color_type: Some(inspection.color_type),
+        sample_format: inspection.sample_format,
+        image_description: inspection.image_description,
         embedded: inspection.icc_profile_embedded,
         valid: inspection.icc_profile_valid,
         description: inspection.icc_profile_description,
-    })
+    }
 }
 
-fn absolute_render_output_path(
+fn render_output_path(
     identity: &ReportIdentitySummary,
     output_path: Option<&str>,
 ) -> Option<PathBuf> {
     [identity.output_path.as_deref(), output_path]
         .into_iter()
         .flatten()
-        .map(PathBuf::from)
-        .find(|path| path.is_absolute())
+        .next()
+        .map(|path| resolve_report_relative_path(identity, path))
 }
 
 fn profile_inspection_matches_report(
@@ -5028,6 +8092,51 @@ fn profile_inspection_matches_report(
     Some(true)
 }
 
+#[derive(Debug, Clone)]
+struct ReviewSrgbInspectionSummary {
+    status: String,
+    width: Option<usize>,
+    height: Option<usize>,
+    color_type: Option<String>,
+    icc_profile_valid: bool,
+    icc_profile_description: Option<String>,
+    icc_profile_matches_standard_srgb: bool,
+}
+
+fn inspect_review_srgb_artifact(path: &Path) -> ReviewSrgbInspectionSummary {
+    let inspection = match tiff_io::inspect_srgb_png(path) {
+        Ok(inspection) => inspection,
+        Err(_) => {
+            return ReviewSrgbInspectionSummary {
+                status: "inspection_failed".to_string(),
+                width: None,
+                height: None,
+                color_type: None,
+                icc_profile_valid: false,
+                icc_profile_description: None,
+                icc_profile_matches_standard_srgb: false,
+            };
+        }
+    };
+    let valid = inspection.color_type == "Rgb8"
+        && inspection.icc_profile_valid
+        && inspection.icc_profile_matches_standard_srgb;
+    ReviewSrgbInspectionSummary {
+        status: if valid {
+            "valid_srgb_review_png"
+        } else {
+            "invalid_srgb_review_png"
+        }
+        .to_string(),
+        width: usize::try_from(inspection.width).ok(),
+        height: usize::try_from(inspection.height).ok(),
+        color_type: Some(inspection.color_type),
+        icc_profile_valid: inspection.icc_profile_valid,
+        icc_profile_description: inspection.icc_profile_description,
+        icc_profile_matches_standard_srgb: inspection.icc_profile_matches_standard_srgb,
+    }
+}
+
 fn summarize_stale_render_artifact(value: &serde_json::Value) -> StaleRenderArtifactSummary {
     StaleRenderArtifactSummary {
         path: string_value(value.get("path")),
@@ -5046,6 +8155,26 @@ fn summarize_crop(value: &serde_json::Value) -> Option<CropSummary> {
         width: usize_value(value.get("width")),
         height: usize_value(value.get("height")),
     })
+}
+
+fn inspect_file_sha256(path: &Path) -> Option<String> {
+    hash_file_sha256(path).ok().map(|(sha256, _)| sha256)
+}
+
+fn artifact_sha256_match(
+    required: bool,
+    declared_sha256: Option<&str>,
+    actual_sha256: Option<&str>,
+) -> Option<bool> {
+    if !required && declared_sha256.is_none() {
+        return None;
+    }
+    Some(
+        declared_sha256.is_some_and(is_valid_sha256_hex)
+            && declared_sha256
+                .zip(actual_sha256)
+                .is_some_and(|(declared, actual)| declared.eq_ignore_ascii_case(actual)),
+    )
 }
 
 fn resolve_report_relative_path(identity: &ReportIdentitySummary, path: &str) -> PathBuf {
@@ -5167,6 +8296,18 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
     );
     push_row(
         &mut out,
+        "report",
+        "binary_identity_status",
+        &summary.report.binary_identity_status,
+    );
+    push_row(
+        &mut out,
+        "report",
+        "binary_sha256",
+        &summary.report.binary_sha256,
+    );
+    push_row(
+        &mut out,
         "render",
         "output_path",
         &summary.render.output_path,
@@ -5203,6 +8344,21 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
             .render
             .render_reviewable
             .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "render",
+        "tone_output_review_required",
+        &summary
+            .render
+            .tone_output_review_required
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "render",
+        "tone_output_confidence_status",
+        &summary.render.tone_output_confidence_status,
     );
     push_row(
         &mut out,
@@ -5261,6 +8417,39 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
     push_row(
         &mut out,
         "render",
+        "output_file_dimensions_match_report",
+        &summary
+            .render
+            .output_file_dimensions_match_report
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "render",
+        "output_file_storage_matches_report",
+        &summary
+            .render
+            .output_file_storage_matches_report
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "render",
+        "artifact_sha256_binding_required",
+        &Some(summary.render.artifact_sha256_binding_required.to_string()),
+    );
+    push_row(
+        &mut out,
+        "render",
+        "output_file_sha256_matches_report",
+        &summary
+            .render
+            .output_file_sha256_matches_report
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "render",
         "render_intent",
         &summary.render.render_intent,
     );
@@ -5273,8 +8462,50 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
     push_row(
         &mut out,
         "render",
+        "master_scene_referred_requested",
+        &summary
+            .render
+            .master_scene_referred_requested
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "render",
         "master_scene_referred_path",
         &summary.render.master_scene_referred_path,
+    );
+    push_row(
+        &mut out,
+        "render",
+        "master_scene_referred_file_status",
+        &summary.render.master_scene_referred_file_status,
+    );
+    push_row(
+        &mut out,
+        "render",
+        "master_scene_referred_file_matches_report",
+        &summary
+            .render
+            .master_scene_referred_file_matches_report
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "render",
+        "master_scene_referred_file_sha256_matches_report",
+        &summary
+            .render
+            .master_scene_referred_file_sha256_matches_report
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "render",
+        "review_srgb_requested",
+        &summary
+            .render
+            .review_srgb_requested
+            .map(|value| value.to_string()),
     );
     push_row(
         &mut out,
@@ -5285,11 +8516,182 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
     push_row(
         &mut out,
         "render",
+        "review_srgb_file_status",
+        &summary.render.review_srgb_file_status,
+    );
+    push_row(
+        &mut out,
+        "render",
+        "review_srgb_file_matches_report",
+        &summary
+            .render
+            .review_srgb_file_matches_report
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "render",
+        "review_srgb_file_sha256_matches_report",
+        &summary
+            .render
+            .review_srgb_file_sha256_matches_report
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "render",
+        "review_srgb_gamut_mapping_space",
+        &summary.render.review_srgb_gamut_mapping_space,
+    );
+    push_row(
+        &mut out,
+        "render",
+        "review_srgb_gamut_mapped_ratio",
+        &format_f64(summary.render.review_srgb_gamut_mapped_ratio),
+    );
+    push_row(
+        &mut out,
+        "render",
+        "review_srgb_gamut_mapping_min_chroma_scale",
+        &format_f64(summary.render.review_srgb_gamut_mapping_min_chroma_scale),
+    );
+    push_row(
+        &mut out,
+        "render",
+        "review_srgb_post_map_out_of_gamut_pixel_count",
+        &summary
+            .render
+            .review_srgb_post_map_out_of_gamut_pixel_count
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "render",
+        "review_srgb_gamut_mapping_supported",
+        &summary
+            .render
+            .review_srgb_gamut_mapping_supported
+            .map(|value| value.to_string()),
+    );
+    let delivery_issues = delivery_artifact_integrity_issues(&summary.render);
+    push_row(
+        &mut out,
+        "render",
+        "delivery_artifact_integrity_issues",
+        &Some(if delivery_issues.is_empty() {
+            "none".to_string()
+        } else {
+            delivery_issues.join(",")
+        }),
+    );
+    push_row(
+        &mut out,
+        "render",
         "stale_render_artifact_count",
         &summary
             .render
             .stale_render_artifact_count
             .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "input_orientation",
+        "all_components_reported",
+        &summary
+            .input_orientation
+            .all_components_reported
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "input_orientation",
+        "components",
+        &format_input_orientation_components(&summary.input_orientation.components),
+    );
+    push_row(&mut out, "deskew", "status", &summary.deskew.status);
+    push_row(
+        &mut out,
+        "deskew",
+        "applied",
+        &summary.deskew.applied.map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "deskew",
+        "detected_source_skew_degrees",
+        &format_f64(summary.deskew.detected_source_skew_degrees),
+    );
+    push_row(
+        &mut out,
+        "deskew",
+        "correction_degrees",
+        &format_f64(summary.deskew.correction_degrees),
+    );
+    push_row(
+        &mut out,
+        "deskew",
+        "retained_area_ratio",
+        &format_f64(summary.deskew.retained_area_ratio),
+    );
+    push_row(
+        &mut out,
+        "deskew",
+        "proposed_retained_area_ratio",
+        &format_f64(summary.deskew.proposed_retained_area_ratio),
+    );
+    push_row(
+        &mut out,
+        "deskew",
+        "review_required",
+        &summary
+            .deskew
+            .review_required
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "deskew",
+        "all_components_applied",
+        &summary
+            .deskew
+            .all_components_applied
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "deskew",
+        "minimum_component_retained_area_ratio",
+        &format_f64(summary.deskew.minimum_component_retained_area_ratio),
+    );
+    push_row(
+        &mut out,
+        "border_crop",
+        "all_components_cropped",
+        &summary
+            .border_crop
+            .all_components_cropped
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "border_crop",
+        "minimum_removed_edge_count_per_component",
+        &summary
+            .border_crop
+            .minimum_removed_edge_count_per_component
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "border_crop",
+        "minimum_retained_area_ratio",
+        &format_f64(summary.border_crop.minimum_retained_area_ratio),
+    );
+    push_row(
+        &mut out,
+        "border_crop",
+        "maximum_retained_area_ratio",
+        &format_f64(summary.border_crop.maximum_retained_area_ratio),
     );
     push_row(&mut out, "stitch", "decision", &summary.stitch.decision);
     push_row(
@@ -5310,6 +8712,120 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
         "selection_reason",
         &summary.stitch.search_selection_reason,
     );
+    let homography_spatial = summary.stitch.homography_spatial_validation.as_ref();
+    let homography_feature = summary.stitch.homography_feature_validation.as_ref();
+    push_row(
+        &mut out,
+        "stitch",
+        "homography_feature_validation_accepted",
+        &homography_feature
+            .and_then(|validation| validation.accepted)
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "homography_feature_validations",
+        &homography_feature.map(|validation| {
+            format!(
+                "{}/{}",
+                validation.accepted_count, validation.validation_count
+            )
+        }),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "homography_minimum_held_out_feature_inlier_ratio",
+        &format_f64(
+            homography_feature.and_then(|validation| validation.minimum_held_out_inlier_ratio),
+        ),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "homography_maximum_cross_fit_disagreement_px",
+        &format_f64(
+            homography_feature.and_then(|validation| validation.maximum_cross_fit_disagreement_px),
+        ),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "homography_spatial_validation_accepted",
+        &homography_spatial
+            .and_then(|validation| validation.accepted)
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "homography_spatial_validations",
+        &homography_spatial.map(|validation| {
+            format!(
+                "{}/{}",
+                validation.accepted_count, validation.validation_count
+            )
+        }),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "homography_minimum_split_ncc_improvement",
+        &format_f64(
+            homography_spatial.and_then(|validation| validation.minimum_split_ncc_improvement),
+        ),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "homography_minimum_mean_ncc_improvement",
+        &format_f64(
+            homography_spatial.and_then(|validation| validation.minimum_mean_ncc_improvement),
+        ),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "homography_minimum_mean_registration_error_reduction",
+        &format_f64(
+            homography_spatial
+                .and_then(|validation| validation.minimum_mean_registration_error_reduction),
+        ),
+    );
+    push_row(
+        &mut out,
+        "white_balance",
+        "technical_status",
+        &summary.white_balance.technical_status,
+    );
+    push_row(
+        &mut out,
+        "white_balance",
+        "technical_applied",
+        &summary
+            .white_balance
+            .technical_applied
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "white_balance",
+        "technical_source_cct_kelvin",
+        &format_f64(summary.white_balance.technical_estimated_source_cct_kelvin),
+    );
+    push_row(
+        &mut out,
+        "white_balance",
+        "creative_temperature",
+        &format_f64(summary.white_balance.creative_temperature),
+    );
+    push_row(
+        &mut out,
+        "white_balance",
+        "creative_tint",
+        &format_f64(summary.white_balance.creative_tint),
+    );
     let seam_exposure = summary.stitch.seam_exposure_correction.as_ref();
     push_row(
         &mut out,
@@ -5322,8 +8838,75 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
     push_row(
         &mut out,
         "stitch",
+        "seam_exposure_model",
+        &seam_exposure.and_then(|correction| correction.model.clone()),
+    );
+    push_row(
+        &mut out,
+        "stitch",
         "seam_exposure_gain_rgb",
         &seam_exposure.and_then(|correction| format_f64_vec(&correction.gain_rgb)),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_spatial_gain_log_slope_x_rgb",
+        &seam_exposure
+            .and_then(|correction| format_f64_vec(&correction.spatial_gain_log_slope_x_rgb)),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_spatial_gain_log_slope_y_rgb",
+        &seam_exposure
+            .and_then(|correction| format_f64_vec(&correction.spatial_gain_log_slope_y_rgb)),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_spatial_gain_top_rgb",
+        &seam_exposure.and_then(|correction| format_f64_vec(&correction.spatial_gain_top_rgb)),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_spatial_gain_bottom_rgb",
+        &seam_exposure.and_then(|correction| format_f64_vec(&correction.spatial_gain_bottom_rgb)),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_spatial_offset_slope_x_rgb",
+        &seam_exposure
+            .and_then(|correction| format_f64_vec(&correction.spatial_offset_slope_x_rgb)),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_spatial_offset_slope_y_rgb",
+        &seam_exposure
+            .and_then(|correction| format_f64_vec(&correction.spatial_offset_slope_y_rgb)),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_spatial_offset_top_rgb_normalized",
+        &seam_exposure
+            .and_then(|correction| format_f64_vec(&correction.spatial_offset_top_rgb_normalized)),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_spatial_offset_bottom_rgb_normalized",
+        &seam_exposure.and_then(|correction| {
+            format_f64_vec(&correction.spatial_offset_bottom_rgb_normalized)
+        }),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_offset_rgb",
+        &seam_exposure.and_then(|correction| format_f64_vec(&correction.offset_rgb)),
     );
     push_row(
         &mut out,
@@ -5336,6 +8919,164 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
         "stitch",
         "seam_score_after",
         &format_f64(seam_exposure.and_then(|correction| correction.seam_score_after)),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_held_out_validation_passed",
+        &seam_exposure
+            .and_then(|correction| correction.held_out_validation_passed)
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_held_out_selected_score",
+        &format_f64(seam_exposure.and_then(|correction| correction.held_out_selected_seam_score)),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_held_out_spatial_gain_score",
+        &format_f64(
+            seam_exposure.and_then(|correction| correction.held_out_spatial_gain_seam_score),
+        ),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_spatial_slope_agreement_ratio",
+        &format_f64(seam_exposure.and_then(|correction| correction.spatial_slope_agreement_ratio)),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_held_out_spatial_gain_offset_score",
+        &format_f64(
+            seam_exposure.and_then(|correction| correction.held_out_spatial_gain_offset_seam_score),
+        ),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_spatial_affine_slope_agreement_ratio",
+        &format_f64(
+            seam_exposure.and_then(|correction| correction.spatial_affine_slope_agreement_ratio),
+        ),
+    );
+    let spatial_2d = seam_exposure.and_then(|correction| correction.spatial_2d_validation.as_ref());
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_spatial_2d_gain_accepted",
+        &spatial_2d
+            .and_then(|validation| validation.gain_accepted)
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_spatial_2d_gain_offset_accepted",
+        &spatial_2d
+            .and_then(|validation| validation.gain_offset_accepted)
+            .map(|value| value.to_string()),
+    );
+    let spatial_quadratic = spatial_2d.and_then(|validation| validation.quadratic.as_ref());
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_spatial_quadratic_gain_accepted",
+        &spatial_quadratic
+            .and_then(|validation| validation.gain_accepted)
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_spatial_quadratic_gain_offset_accepted",
+        &spatial_quadratic
+            .and_then(|validation| validation.gain_offset_accepted)
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_spatial_2d_horizontal_slope_agreement_ratio",
+        &format_f64(spatial_2d.and_then(|validation| {
+            if validation.gain_offset_accepted == Some(true) {
+                validation.gain_offset_horizontal_slope_agreement_ratio
+            } else {
+                validation.gain_horizontal_slope_agreement_ratio
+            }
+        })),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_exposure_spatial_2d_held_out_score",
+        &format_f64(spatial_2d.and_then(|validation| {
+            if validation.gain_offset_accepted == Some(true) {
+                validation.held_out_gain_offset_seam_score
+            } else {
+                validation.held_out_gain_seam_score
+            }
+        })),
+    );
+    let seam_blend = summary.stitch.seam_blend.as_ref();
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_blend_mode",
+        &seam_blend.and_then(|blend| blend.mode.clone()),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_blend_applied_merges",
+        &seam_blend.map(|blend| format!("{}/{}", blend.applied_merge_count, blend.merge_count)),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_blend_review_required",
+        &seam_blend
+            .and_then(|blend| blend.review_required)
+            .map(|value| value.to_string()),
+    );
+    let seam_detail = seam_blend.and_then(|blend| blend.detail_consistency.as_ref());
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_detail_review_required",
+        &seam_detail
+            .and_then(|detail| detail.review_required)
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_detail_supported_scales_min",
+        &seam_detail
+            .and_then(|detail| detail.minimum_supported_scale_count)
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_detail_max_symmetric_energy_ratio",
+        &format_f64(seam_detail.and_then(|detail| detail.maximum_symmetric_energy_ratio)),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_overlap_p95_abs_difference",
+        &format_f64(seam_blend.and_then(|blend| blend.overlap_p95_abs_difference)),
+    );
+    push_row(
+        &mut out,
+        "stitch",
+        "seam_output_to_source_gradient_ratio",
+        &format_f64(seam_blend.and_then(|blend| blend.output_to_source_seam_gradient_ratio)),
     );
     push_row(
         &mut out,
@@ -5363,6 +9104,55 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
     );
     push_row(
         &mut out,
+        "negative_reconstruction",
+        "response_model",
+        &summary.negative_reconstruction.response_model,
+    );
+    push_row(
+        &mut out,
+        "negative_reconstruction",
+        "measured_model_id",
+        &summary.negative_reconstruction.measured_model_id,
+    );
+    push_row(
+        &mut out,
+        "negative_reconstruction",
+        "held_out_delta_e00_rms",
+        &format_f64(summary.negative_reconstruction.held_out_delta_e00_rms),
+    );
+    push_row(
+        &mut out,
+        "negative_reconstruction",
+        "held_out_improvement_over_unit_slope",
+        &format_f64(
+            summary
+                .negative_reconstruction
+                .held_out_improvement_over_unit_slope,
+        ),
+    );
+    push_row(
+        &mut out,
+        "negative_reconstruction",
+        "maximum_density_noise_gain",
+        &format_f64(summary.negative_reconstruction.maximum_density_noise_gain),
+    );
+    push_row(
+        &mut out,
+        "negative_reconstruction",
+        "curve_extrapolated_any_ratio",
+        &format_f64(summary.negative_reconstruction.curve_extrapolated_any_ratio),
+    );
+    push_row(
+        &mut out,
+        "negative_reconstruction",
+        "review_required",
+        &summary
+            .negative_reconstruction
+            .reconstruction_review_required
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
         "colorspace",
         "render_input_source",
         &summary.colorspace.render_input_source,
@@ -5370,7 +9160,7 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
     push_row(
         &mut out,
         "colorspace",
-        "calibration_status",
+        "calibration_record_status",
         &summary.colorspace.calibration_status,
     );
     push_row(
@@ -5378,6 +9168,60 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
         "colorspace",
         "calibration_source",
         &summary.colorspace.calibration_source,
+    );
+    let calibration_color_mapping = summary
+        .colorspace
+        .calibration_color_mapping_application
+        .as_ref();
+    push_row(
+        &mut out,
+        "colorspace",
+        "calibration_color_mapping_evaluated",
+        &calibration_color_mapping
+            .and_then(|application| application.evaluated)
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "colorspace",
+        "calibration_color_mapping_applied",
+        &calibration_color_mapping
+            .and_then(|application| application.applied)
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "colorspace",
+        "calibration_color_mapping_status",
+        &calibration_color_mapping.and_then(|application| application.selection_status.clone()),
+    );
+    push_row(
+        &mut out,
+        "colorspace",
+        "calibration_color_mapping_selected_candidate",
+        &calibration_color_mapping.and_then(|application| application.selected_candidate.clone()),
+    );
+    push_row(
+        &mut out,
+        "colorspace",
+        "calibration_color_mapping_preferred_candidate",
+        &calibration_color_mapping.and_then(|application| application.preferred_candidate.clone()),
+    );
+    push_row(
+        &mut out,
+        "colorspace",
+        "calibration_color_mapping_reason",
+        &calibration_color_mapping.and_then(|application| application.reason.clone()),
+    );
+    push_row(
+        &mut out,
+        "colorspace",
+        "calibration_color_mapping_consistency_issues",
+        &Some(if summary.diagnostic_consistency_issues.is_empty() {
+            "none".to_string()
+        } else {
+            summary.diagnostic_consistency_issues.join(",")
+        }),
     );
     push_row(
         &mut out,
@@ -5505,6 +9349,51 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
         "colorspace",
         "tone_color_trust_state",
         &summary.colorspace.tone_color_trust_state,
+    );
+    push_row(
+        &mut out,
+        "colorspace",
+        "neutral_safety_rescue_applied",
+        &summary
+            .colorspace
+            .neutral_safety_rescue
+            .as_ref()
+            .and_then(|rescue| rescue.applied)
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "colorspace",
+        "neutral_safety_rescue_preserved_ratio_gain",
+        &format_f64(
+            summary
+                .colorspace
+                .neutral_safety_rescue
+                .as_ref()
+                .and_then(|rescue| rescue.preserved_ratio_gain),
+        ),
+    );
+    push_row(
+        &mut out,
+        "colorspace",
+        "neutral_safety_rescue_midtone_saturation_p95_reduction",
+        &format_f64(
+            summary
+                .colorspace
+                .neutral_safety_rescue
+                .as_ref()
+                .and_then(|rescue| rescue.midtone_saturation_p95_reduction),
+        ),
+    );
+    push_row(
+        &mut out,
+        "colorspace",
+        "neutral_safety_rescue_reason",
+        &summary
+            .colorspace
+            .neutral_safety_rescue
+            .as_ref()
+            .and_then(|rescue| rescue.reason.clone()),
     );
     push_row(
         &mut out,
@@ -5701,6 +9590,63 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
     push_row(
         &mut out,
         "tone",
+        "tone_confidence_status",
+        &summary.tone.tone_confidence_status,
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "tone_output_confidence_status",
+        &summary.tone.tone_output_confidence_status,
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "tone_output_evidence_confidence",
+        &format_f64(summary.tone.tone_output_evidence_confidence),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "tone_output_review_required",
+        &summary
+            .tone
+            .tone_output_review_required
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "input_luminance_range_p05_p95",
+        &format_f64(summary.tone.input_luminance_range_p05_p95),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "mapped_luminance_range_p05_p95",
+        &format_f64(summary.tone.mapped_luminance_range_p05_p95),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "render_to_mapped_luminance_range_ratio",
+        &format_f64(summary.tone.render_to_mapped_luminance_range_ratio),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "maximum_post_tone_high_clip_ratio",
+        &format_f64(summary.tone.maximum_post_tone_high_clip_ratio),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "maximum_post_tone_low_clip_ratio",
+        &format_f64(summary.tone.maximum_post_tone_low_clip_ratio),
+    );
+    push_row(
+        &mut out,
+        "tone",
         "highlight_chroma_compressed_ratio",
         &format_f64(summary.tone.highlight_chroma_compressed_ratio),
     );
@@ -5727,6 +9673,105 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
         "tone",
         "color_protection_reason",
         &summary.tone.color_protection_reason,
+    );
+    let skin_memory = summary
+        .tone
+        .adaptive_vibrance_skin_memory_protection
+        .as_ref();
+    push_row(
+        &mut out,
+        "tone",
+        "adaptive_vibrance_skin_memory_protection_enabled",
+        &skin_memory
+            .and_then(|protection| protection.enabled)
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "adaptive_vibrance_skin_memory_working_space",
+        &skin_memory.and_then(|protection| protection.working_space.clone()),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "adaptive_vibrance_skin_memory_protected_ratio",
+        &format_f64(skin_memory.and_then(|protection| protection.protected_pixel_ratio)),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "adaptive_vibrance_skin_memory_mean_protection",
+        &format_f64(skin_memory.and_then(|protection| protection.mean_protection_weight)),
+    );
+    let preferred_memory = summary
+        .tone
+        .adaptive_vibrance_preferred_memory_color_guard
+        .as_ref();
+    push_row(
+        &mut out,
+        "tone",
+        "adaptive_vibrance_preferred_memory_color_guard_enabled",
+        &preferred_memory
+            .and_then(|guard| guard.enabled)
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "adaptive_vibrance_preferred_memory_color_working_space",
+        &preferred_memory.and_then(|guard| guard.working_space.clone()),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "adaptive_vibrance_preferred_memory_color_matched_ratio",
+        &format_f64(preferred_memory.and_then(|guard| guard.matched_pixel_ratio)),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "adaptive_vibrance_preferred_memory_color_limited_ratio",
+        &format_f64(preferred_memory.and_then(|guard| guard.limited_pixel_ratio)),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "adaptive_vibrance_preferred_memory_color_mean_scale_reduction",
+        &format_f64(preferred_memory.and_then(|guard| guard.mean_scale_reduction)),
+    );
+    let preferred_skin = summary.tone.preferred_skin_rendering.as_ref();
+    push_row(
+        &mut out,
+        "tone",
+        "preferred_skin_rendering_enabled",
+        &preferred_skin
+            .and_then(|rendering| rendering.enabled)
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "preferred_skin_rendering_working_space",
+        &preferred_skin.and_then(|rendering| rendering.working_space.clone()),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "preferred_skin_rendering_matched_ratio",
+        &format_f64(preferred_skin.and_then(|rendering| rendering.matched_pixel_ratio)),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "preferred_skin_rendering_adjusted_ratio",
+        &format_f64(preferred_skin.and_then(|rendering| rendering.adjusted_pixel_ratio)),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "preferred_skin_rendering_mean_delta_e_ab",
+        &format_f64(preferred_skin.and_then(|rendering| rendering.mean_delta_e_ab)),
     );
     push_row(
         &mut out,
@@ -5818,6 +9863,45 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
         "bright_saturated_saturation_p95",
         &format_f64(summary.tone.bright_saturated_saturation_p95),
     );
+    push_row(
+        &mut out,
+        "tone",
+        "noise_reduction_enabled",
+        &summary
+            .tone
+            .noise_reduction_enabled
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "noise_reduction_applied_ratio",
+        &format_f64(summary.tone.noise_reduction_applied_ratio),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "noise_reduction_structure_gate_start",
+        &format_f64(summary.tone.noise_reduction_structure_gate_start),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "noise_reduction_structure_gate_end",
+        &format_f64(summary.tone.noise_reduction_structure_gate_end),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "noise_reduction_structure_excluded_ratio",
+        &format_f64(summary.tone.noise_reduction_structure_excluded_ratio),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "noise_reduction_saturation_limited_ratio",
+        &format_f64(summary.tone.noise_reduction_saturation_limited_ratio),
+    );
     let grain = summary.tone.high_frequency_grain.as_ref();
     push_row(
         &mut out,
@@ -5848,6 +9932,35 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
         "tone",
         "high_frequency_flat_chroma_residual_p95",
         &format_f64(grain.and_then(|grain| grain.flat_chroma_residual_p95)),
+    );
+    let grain_detail = summary.tone.grain_detail_retention.as_ref();
+    push_row(
+        &mut out,
+        "tone",
+        "grain_detail_review_required",
+        &grain_detail
+            .and_then(|detail| detail.review_required)
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "grain_detail_decision_supported",
+        &grain_detail
+            .and_then(|detail| detail.decision_supported)
+            .map(|value| value.to_string()),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "grain_detail_luminance_p10_retention",
+        &format_f64(grain_detail.and_then(|detail| detail.luminance_p10_retention)),
+    );
+    push_row(
+        &mut out,
+        "tone",
+        "grain_detail_chroma_p10_retention",
+        &format_f64(grain_detail.and_then(|detail| detail.chroma_p10_retention)),
     );
     if let Some(comparison) = &summary.summary_baseline_comparison {
         push_row(
@@ -6182,6 +10295,34 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
             "chroma_residual_p95_ratio",
             &format_f64(comparison.chroma_residual_p95_ratio),
         );
+        push_row(
+            &mut out,
+            "summary_baseline",
+            "grain_detail_review_required_changed",
+            &Some(comparison.grain_detail_review_required_changed.to_string()),
+        );
+        push_row(
+            &mut out,
+            "summary_baseline",
+            "grain_detail_decision_supported_changed",
+            &Some(
+                comparison
+                    .grain_detail_decision_supported_changed
+                    .to_string(),
+            ),
+        );
+        push_row(
+            &mut out,
+            "summary_baseline",
+            "grain_detail_luminance_p10_retention_delta",
+            &format_f64(comparison.grain_detail_luminance_p10_retention_delta),
+        );
+        push_row(
+            &mut out,
+            "summary_baseline",
+            "grain_detail_chroma_p10_retention_delta",
+            &format_f64(comparison.grain_detail_chroma_p10_retention_delta),
+        );
     }
     if let Some(comparison) = &summary.comparison {
         push_row(
@@ -6272,10 +10413,373 @@ pub fn summary_to_markdown(summary: &ValidationSummary) -> String {
     out
 }
 
+fn summarize_input_orientation(phase: Option<&PhaseReport>) -> InputOrientationValidationSummary {
+    let input_count = phase.and_then(|phase| usize_metric(phase, "input_count"));
+    let components = phase
+        .and_then(|phase| phase.metrics.get("components"))
+        .and_then(serde_json::Value::as_array)
+        .map(|components| {
+            components
+                .iter()
+                .map(|component| {
+                    let decode = component.get("decode");
+                    let orientation = component
+                        .get("decode")
+                        .and_then(|decode| decode.get("orientation"));
+                    let correction = decode.and_then(|decode| decode.get("orientation_correction"));
+                    InputOrientationComponentValidationSummary {
+                        index: usize_value(component.get("index")),
+                        decoded_pixel_sha256: component
+                            .get("decode")
+                            .and_then(|decode| string_value(decode.get("decoded_pixel_sha256"))),
+                        source_orientation_materialized_decoded_pixel_sha256: decode.and_then(
+                            |decode| {
+                                string_value(
+                                    decode.get(
+                                        "source_orientation_materialized_decoded_pixel_sha256",
+                                    ),
+                                )
+                            },
+                        ),
+                        tag_value: orientation
+                            .and_then(|orientation| usize_value(orientation.get("tag_value")))
+                            .and_then(|value| u16::try_from(value).ok()),
+                        metadata_transform: orientation
+                            .and_then(|orientation| string_value(orientation.get("transform"))),
+                        metadata_applied: orientation
+                            .and_then(|orientation| orientation.get("applied"))
+                            .and_then(serde_json::Value::as_bool),
+                        orientation_correction_requested: correction
+                            .and_then(|value| string_value(value.get("requested"))),
+                        orientation_correction_transform: correction
+                            .and_then(|value| string_value(value.get("transform"))),
+                        orientation_correction_applied: correction
+                            .and_then(|value| value.get("applied"))
+                            .and_then(serde_json::Value::as_bool),
+                        effective_tag_value: correction
+                            .and_then(|value| usize_value(value.get("effective_tag_value")))
+                            .and_then(|value| u16::try_from(value).ok()),
+                        transform: correction
+                            .and_then(|value| string_value(value.get("effective_transform")))
+                            .or_else(|| {
+                                orientation.and_then(|orientation| {
+                                    string_value(orientation.get("transform"))
+                                })
+                            }),
+                        applied: match (
+                            orientation
+                                .and_then(|orientation| orientation.get("applied"))
+                                .and_then(serde_json::Value::as_bool),
+                            correction
+                                .and_then(|value| value.get("applied"))
+                                .and_then(serde_json::Value::as_bool),
+                        ) {
+                            (Some(metadata), Some(correction)) => Some(metadata || correction),
+                            (metadata, correction) => metadata.or(correction),
+                        },
+                        source_width: orientation
+                            .and_then(|orientation| usize_value(orientation.get("source_width"))),
+                        source_height: orientation
+                            .and_then(|orientation| usize_value(orientation.get("source_height"))),
+                        output_width: correction
+                            .and_then(|value| usize_value(value.get("output_width")))
+                            .or_else(|| {
+                                orientation.and_then(|orientation| {
+                                    usize_value(orientation.get("output_width"))
+                                })
+                            }),
+                        output_height: correction
+                            .and_then(|value| usize_value(value.get("output_height")))
+                            .or_else(|| {
+                                orientation.and_then(|orientation| {
+                                    usize_value(orientation.get("output_height"))
+                                })
+                            }),
+                    }
+                })
+                .collect::<Vec<InputOrientationComponentValidationSummary>>()
+        })
+        .unwrap_or_default();
+    let component_count = components.len();
+    InputOrientationValidationSummary {
+        input_count,
+        component_count,
+        all_components_reported: input_count.map(|count| count == component_count),
+        components,
+    }
+}
+
+fn summarize_deskew(phase: Option<&PhaseReport>) -> DeskewValidationSummary {
+    let input_count = phase.and_then(|phase| usize_metric(phase, "input_count"));
+    let components = phase
+        .and_then(|phase| phase.metrics.get("components"))
+        .and_then(serde_json::Value::as_array);
+    let component_count = components.map_or(0, Vec::len);
+    let applied_component_count =
+        phase.and_then(|phase| usize_metric(phase, "applied_component_count"));
+    let minimum_component_retained_area_ratio = components.and_then(|components| {
+        components
+            .iter()
+            .filter_map(|component| {
+                component
+                    .get("diagnostics")
+                    .and_then(|diagnostics| f64_value(diagnostics.get("retained_area_ratio")))
+            })
+            .reduce(f64::min)
+    });
+    DeskewValidationSummary {
+        requested_mode: phase.and_then(|phase| string_metric(phase, "requested_mode")),
+        status: phase.and_then(|phase| string_metric(phase, "status")),
+        applied: phase
+            .and_then(|phase| phase.metrics.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        applied_component_count,
+        input_count,
+        component_count,
+        all_components_reported: input_count.map(|count| count == component_count),
+        all_components_applied: input_count
+            .zip(applied_component_count)
+            .map(|(input_count, applied_count)| input_count > 0 && applied_count == input_count),
+        minimum_component_retained_area_ratio,
+        detected_source_skew_degrees: phase
+            .and_then(|phase| f64_metric(phase, "detected_source_skew_degrees")),
+        correction_degrees: phase.and_then(|phase| f64_metric(phase, "correction_degrees")),
+        confidence: phase.map(|phase| phase.confidence),
+        review_required: phase
+            .and_then(|phase| phase.metrics.get("review_required"))
+            .and_then(serde_json::Value::as_bool),
+        review_reason: phase.and_then(|phase| string_metric(phase, "review_reason")),
+        retained_area_ratio: phase.and_then(|phase| f64_metric(phase, "retained_area_ratio")),
+        proposed_retained_area_ratio: phase
+            .and_then(|phase| f64_metric(phase, "proposed_retained_area_ratio")),
+        supporting_side_count: phase.and_then(|phase| usize_metric(phase, "supporting_side_count")),
+        horizontal_side_count: phase.and_then(|phase| usize_metric(phase, "horizontal_side_count")),
+        vertical_side_count: phase.and_then(|phase| usize_metric(phase, "vertical_side_count")),
+        side_angle_spread_degrees: phase
+            .and_then(|phase| f64_metric(phase, "side_angle_spread_degrees")),
+        interpolation: phase.and_then(|phase| string_metric(phase, "interpolation")),
+        reason: phase.and_then(|phase| string_metric(phase, "reason")),
+    }
+}
+
+fn summarize_border_crop(phase: Option<&PhaseReport>) -> BorderCropValidationSummary {
+    let input_count = phase.and_then(|phase| usize_metric(phase, "input_count"));
+    let components = phase
+        .and_then(|phase| phase.metrics.get("components"))
+        .and_then(serde_json::Value::as_array)
+        .map(|components| {
+            components
+                .iter()
+                .map(|component| {
+                    let crop = component.get("crop");
+                    let top_removed = crop.and_then(|crop| usize_value(crop.get("top_removed")));
+                    let bottom_removed =
+                        crop.and_then(|crop| usize_value(crop.get("bottom_removed")));
+                    let left_removed = crop.and_then(|crop| usize_value(crop.get("left_removed")));
+                    let right_removed =
+                        crop.and_then(|crop| usize_value(crop.get("right_removed")));
+                    let edges = [top_removed, bottom_removed, left_removed, right_removed];
+                    let removed_edge_count = edges
+                        .iter()
+                        .copied()
+                        .collect::<Option<Vec<_>>>()
+                        .map(|edges| edges.into_iter().filter(|removed| *removed > 0).count());
+                    let output_shape = component
+                        .get("output_shape")
+                        .and_then(serde_json::Value::as_array);
+                    let output_height = output_shape
+                        .and_then(|shape| shape.first())
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok());
+                    let output_width = output_shape
+                        .and_then(|shape| shape.get(1))
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok());
+                    let input_height = output_height.zip(top_removed).zip(bottom_removed).and_then(
+                        |((height, top), bottom)| height.checked_add(top)?.checked_add(bottom),
+                    );
+                    let input_width = output_width.zip(left_removed).zip(right_removed).and_then(
+                        |((width, left), right)| width.checked_add(left)?.checked_add(right),
+                    );
+                    let retained_area_ratio = output_width
+                        .zip(output_height)
+                        .zip(input_width.zip(input_height))
+                        .and_then(
+                            |((output_width, output_height), (input_width, input_height))| {
+                                let input_area = input_width.checked_mul(input_height)?;
+                                let output_area = output_width.checked_mul(output_height)?;
+                                (input_area > 0).then_some(output_area as f64 / input_area as f64)
+                            },
+                        );
+                    BorderCropComponentValidationSummary {
+                        index: usize_value(component.get("index")),
+                        top_removed,
+                        bottom_removed,
+                        left_removed,
+                        right_removed,
+                        removed_edge_count,
+                        dead_zone_detected: crop
+                            .and_then(|crop| crop.get("dead_zone_detected"))
+                            .and_then(serde_json::Value::as_bool),
+                        input_width,
+                        input_height,
+                        output_width,
+                        output_height,
+                        retained_area_ratio,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let component_count = components.len();
+    let cropped_component_count = components
+        .iter()
+        .filter(|component| component.dead_zone_detected == Some(true))
+        .count();
+    let total_removed_edge_count = components
+        .iter()
+        .filter_map(|component| component.removed_edge_count)
+        .sum();
+    let minimum_removed_edge_count_per_component = components
+        .iter()
+        .filter_map(|component| component.removed_edge_count)
+        .min();
+    let minimum_retained_area_ratio = components
+        .iter()
+        .filter_map(|component| component.retained_area_ratio)
+        .reduce(f64::min);
+    let maximum_retained_area_ratio = components
+        .iter()
+        .filter_map(|component| component.retained_area_ratio)
+        .reduce(f64::max);
+    let rejected_crop_warning_count = phase.map_or(0, |phase| {
+        phase
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains("crop rejected"))
+            .count()
+    });
+    BorderCropValidationSummary {
+        input_count,
+        component_count,
+        all_components_reported: input_count.map(|count| count == component_count),
+        cropped_component_count,
+        all_components_cropped: input_count
+            .map(|count| count > 0 && count == component_count && cropped_component_count == count),
+        total_removed_edge_count,
+        minimum_removed_edge_count_per_component,
+        minimum_retained_area_ratio,
+        maximum_retained_area_ratio,
+        rejected_crop_warning_count,
+        components,
+    }
+}
+
+fn summarize_negative_reconstruction(
+    density_phase: Option<&PhaseReport>,
+    colorspace_phase: Option<&PhaseReport>,
+) -> NegativeReconstructionValidationSummary {
+    let response =
+        density_phase.and_then(|phase| phase.metrics.get("direct_density_response_model"));
+    let reconstruction =
+        colorspace_phase.and_then(|phase| phase.metrics.get("negative_response_reconstruction"));
+    let held_out_delta_e00_rms =
+        response.and_then(|response| f64_value(response.get("held_out_delta_e00_rms")));
+    let unit_slope_delta_e00_rms =
+        response.and_then(|response| f64_value(response.get("unit_slope_delta_e00_rms")));
+    NegativeReconstructionValidationSummary {
+        input_mode: density_phase.and_then(|phase| string_metric(phase, "input_mode")),
+        density_inversion_skipped: density_phase
+            .and_then(|phase| phase.metrics.get("skipped"))
+            .and_then(serde_json::Value::as_bool),
+        density_confidence: density_phase.map(|phase| phase.confidence),
+        response_model: response.and_then(|response| string_value(response.get("model"))),
+        response_source: response.and_then(|response| string_value(response.get("source"))),
+        response_accepted: response
+            .and_then(|response| response.get("accepted"))
+            .and_then(serde_json::Value::as_bool),
+        response_model_review_required: response
+            .and_then(|response| response.get("review_required"))
+            .and_then(serde_json::Value::as_bool),
+        crosstalk_model: response
+            .and_then(|response| string_value(response.get("crosstalk_model"))),
+        characteristic_curve_model: response
+            .and_then(|response| string_value(response.get("characteristic_curve_model"))),
+        measured_model_id: response
+            .and_then(|response| string_value(response.get("measured_model_id"))),
+        measured_confidence: response
+            .and_then(|response| f64_value(response.get("measured_confidence"))),
+        held_out_delta_e00_rms,
+        held_out_delta_e00_max: response
+            .and_then(|response| f64_value(response.get("held_out_delta_e00_max"))),
+        unit_slope_delta_e00_rms,
+        held_out_improvement_over_unit_slope: unit_slope_delta_e00_rms
+            .zip(held_out_delta_e00_rms)
+            .map(|(baseline, measured)| baseline - measured),
+        maximum_density_noise_gain: response
+            .and_then(|response| f64_value(response.get("maximum_density_noise_gain"))),
+        reconstruction_review_required: colorspace_phase
+            .and_then(|phase| phase.metrics.get("negative_response_review_required"))
+            .and_then(serde_json::Value::as_bool),
+        signed_headroom_preserved: reconstruction
+            .and_then(|reconstruction| reconstruction.get("signed_headroom_preserved"))
+            .and_then(serde_json::Value::as_bool),
+        curve_extrapolated_any_ratio: reconstruction.and_then(|reconstruction| {
+            f64_value(reconstruction.get("curve_extrapolated_any_ratio"))
+        }),
+        curve_interpolation: reconstruction
+            .and_then(|reconstruction| string_value(reconstruction.get("curve_interpolation"))),
+    }
+}
+
+fn summarize_white_balance(
+    phase: Option<&PhaseReport>,
+    tone_phase: Option<&PhaseReport>,
+) -> WhiteBalanceValidationSummary {
+    let technical = phase.and_then(|phase| phase.metrics.get("technical"));
+    let creative = tone_phase.and_then(|phase| phase.metrics.get("creative_white_balance"));
+    WhiteBalanceValidationSummary {
+        technical_requested_mode: technical
+            .and_then(|value| string_value(value.get("requested_mode"))),
+        technical_status: technical.and_then(|value| string_value(value.get("status"))),
+        technical_source: technical.and_then(|value| string_value(value.get("source"))),
+        technical_reason: technical.and_then(|value| string_value(value.get("reason"))),
+        technical_applied: technical
+            .and_then(|value| value.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        technical_confidence: technical.and_then(|value| f64_value(value.get("confidence"))),
+        technical_review_required: technical
+            .and_then(|value| value.get("review_required"))
+            .and_then(serde_json::Value::as_bool),
+        technical_sample_count: technical.and_then(|value| usize_value(value.get("sample_count"))),
+        technical_occupied_spatial_bin_count: technical
+            .and_then(|value| usize_value(value.get("occupied_spatial_bin_count"))),
+        technical_populated_luminance_band_count: technical
+            .and_then(|value| usize_value(value.get("populated_luminance_band_count"))),
+        technical_estimated_source_cct_kelvin: technical
+            .and_then(|value| f64_value(value.get("estimated_source_cct_kelvin"))),
+        technical_pre_neutral_log_chroma: technical
+            .and_then(|value| f64_value(value.get("pre_adaptation_neutral_log_chroma"))),
+        technical_post_neutral_log_chroma: technical
+            .and_then(|value| f64_value(value.get("post_adaptation_neutral_log_chroma"))),
+        creative_applied: creative
+            .and_then(|value| value.get("applied"))
+            .and_then(serde_json::Value::as_bool),
+        creative_temperature: creative.and_then(|value| f64_value(value.get("temperature"))),
+        creative_tint: creative.and_then(|value| f64_value(value.get("tint"))),
+        creative_target_temperature_kelvin: creative
+            .and_then(|value| f64_value(value.get("target_temperature_kelvin"))),
+        creative_separated_from_technical_master: creative
+            .and_then(|value| value.get("separated_from_technical_master"))
+            .and_then(serde_json::Value::as_bool),
+    }
+}
+
 fn summarize_stitch(phase: Option<&PhaseReport>) -> StitchValidationSummary {
     let Some(phase) = phase else {
         return StitchValidationSummary {
             decision: None,
+            inferred_order: Vec::new(),
             confidence: None,
             chosen_hypothesis: None,
             rejection_reason: None,
@@ -6289,7 +10793,10 @@ fn summarize_stitch(phase: Option<&PhaseReport>) -> StitchValidationSummary {
             vertical_offset_plausibility_score: None,
             local_consistency_score: None,
             plausibility_score: None,
+            homography_feature_validation: None,
+            homography_spatial_validation: None,
             seam_exposure_correction: None,
+            seam_blend: None,
         };
     };
 
@@ -6317,6 +10824,20 @@ fn summarize_stitch(phase: Option<&PhaseReport>) -> StitchValidationSummary {
 
     StitchValidationSummary {
         decision: string_metric(phase, "decision"),
+        inferred_order: phase
+            .metrics
+            .get("ordering")
+            .and_then(|ordering| ordering.get("inferred_order"))
+            .or_else(|| phase.metrics.get("inferred_order"))
+            .and_then(serde_json::Value::as_array)
+            .map(|order| {
+                order
+                    .iter()
+                    .filter_map(|value| value.as_u64())
+                    .filter_map(|value| usize::try_from(value).ok())
+                    .collect()
+            })
+            .unwrap_or_default(),
         confidence: Some(phase.confidence),
         chosen_hypothesis: string_metric(phase, "chosen_hypothesis"),
         rejection_reason: string_metric(phase, "rejection_reason"),
@@ -6339,28 +10860,977 @@ fn summarize_stitch(phase: Option<&PhaseReport>) -> StitchValidationSummary {
             .and_then(|v| f64_value(v.get("local_consistency_score"))),
         plausibility_score: selected_validation
             .and_then(|v| f64_value(v.get("plausibility_score"))),
-        seam_exposure_correction: phase
-            .metrics
-            .get("seam_exposure_correction")
-            .map(summarize_seam_exposure_correction),
+        homography_feature_validation: summarize_homography_feature_validations(phase),
+        homography_spatial_validation: summarize_homography_spatial_validations(phase),
+        seam_exposure_correction: summarize_stitch_seam_exposure_corrections(phase),
+        seam_blend: summarize_stitch_seam_blends(phase),
+    }
+}
+
+fn append_homography_feature_validations<'a>(
+    metrics: &'a serde_json::Value,
+    values: &mut Vec<&'a serde_json::Value>,
+) {
+    if let Some(value) = metrics
+        .get("homography_feature_validation")
+        .filter(|value| value.is_object())
+    {
+        values.push(value);
+        return;
+    }
+    if let Some(hypotheses) = metrics.get("hypotheses").and_then(|value| value.as_array()) {
+        values.extend(hypotheses.iter().filter_map(|hypothesis| {
+            hypothesis
+                .get("validation")
+                .and_then(|validation| validation.get("homography_feature_validation"))
+                .filter(|value| value.is_object())
+        }));
+    }
+}
+
+fn summarize_homography_feature_validations(
+    phase: &PhaseReport,
+) -> Option<HomographyFeatureValidationSummary> {
+    let mut values = Vec::<&serde_json::Value>::new();
+    append_homography_feature_validations(&phase.metrics, &mut values);
+    if let Some(merges) = phase
+        .metrics
+        .get("pair_merges")
+        .and_then(|value| value.as_array())
+    {
+        for merge in merges {
+            if let Some(metrics) = merge
+                .get("pair_report")
+                .and_then(|report| report.get("metrics"))
+            {
+                append_homography_feature_validations(metrics, &mut values);
+            }
+        }
+    }
+    if values.is_empty() {
+        return None;
+    }
+
+    let acceptance = values
+        .iter()
+        .filter_map(|value| value.get("accepted").and_then(serde_json::Value::as_bool))
+        .collect::<Vec<_>>();
+    let accepted_count = acceptance.iter().filter(|accepted| **accepted).count();
+    let common_string = |key: &str| {
+        let strings = values
+            .iter()
+            .filter_map(|value| string_value(value.get(key)))
+            .collect::<Vec<_>>();
+        strings.first().cloned().map(|first| {
+            if strings.iter().all(|value| value == &first) {
+                first
+            } else {
+                "sequence_mixed".to_string()
+            }
+        })
+    };
+    let minimum_usize = |key: &str| {
+        values
+            .iter()
+            .filter_map(|value| usize_value(value.get(key)))
+            .min()
+    };
+    let minimum_f64 = |key: &str| {
+        values
+            .iter()
+            .filter_map(|value| f64_value(value.get(key)))
+            .filter(|value| value.is_finite())
+            .min_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+    };
+    let maximum_f64 = |key: &str| {
+        values
+            .iter()
+            .filter_map(|value| f64_value(value.get(key)))
+            .filter(|value| value.is_finite())
+            .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+    };
+    let mut reasons = values
+        .iter()
+        .filter_map(|value| string_value(value.get("reason")))
+        .collect::<Vec<_>>();
+    reasons.sort();
+    reasons.dedup();
+
+    Some(HomographyFeatureValidationSummary {
+        accepted: (acceptance.len() == values.len()).then_some(accepted_count == values.len()),
+        validation_count: values.len(),
+        accepted_count,
+        partition_method: common_string("partition_method"),
+        minimum_training_match_count: minimum_usize("training_match_count"),
+        minimum_held_out_match_count: minimum_usize("held_out_match_count"),
+        minimum_training_spatial_cell_count: minimum_usize("training_spatial_cell_count"),
+        minimum_held_out_spatial_cell_count: minimum_usize("held_out_spatial_cell_count"),
+        minimum_training_inlier_ratio: minimum_f64("training_inlier_ratio"),
+        minimum_held_out_inlier_ratio: minimum_f64("held_out_inlier_ratio"),
+        minimum_reverse_validation_inlier_ratio: minimum_f64("reverse_validation_inlier_ratio"),
+        maximum_held_out_p95_error_px: maximum_f64("held_out_p95_error_px"),
+        maximum_reverse_validation_p95_error_px: maximum_f64("reverse_validation_p95_error_px"),
+        maximum_cross_fit_disagreement_px: maximum_f64("cross_fit_max_disagreement_px"),
+        reasons,
+    })
+}
+
+fn summarize_homography_spatial_validations(
+    phase: &PhaseReport,
+) -> Option<HomographySpatialValidationSummary> {
+    let mut values = Vec::<&serde_json::Value>::new();
+    if let Some(value) = phase
+        .metrics
+        .get("homography_spatial_validation")
+        .filter(|value| value.is_object())
+    {
+        values.push(value);
+    }
+    if let Some(merges) = phase
+        .metrics
+        .get("pair_merges")
+        .and_then(|value| value.as_array())
+    {
+        for merge in merges {
+            if let Some(value) = merge
+                .get("pair_report")
+                .and_then(|report| report.get("metrics"))
+                .and_then(|metrics| metrics.get("homography_spatial_validation"))
+                .filter(|value| value.is_object())
+            {
+                values.push(value);
+            }
+        }
+    }
+    if values.is_empty() {
+        return None;
+    }
+
+    let common_string = |key: &str| {
+        let strings = values
+            .iter()
+            .filter_map(|value| string_value(value.get(key)))
+            .collect::<Vec<_>>();
+        strings.first().cloned().map(|first| {
+            if strings.iter().all(|value| value == &first) {
+                first
+            } else {
+                "sequence_mixed".to_string()
+            }
+        })
+    };
+    let minimum_scalar_f64 = |key: &str| {
+        values
+            .iter()
+            .filter_map(|value| f64_value(value.get(key)))
+            .filter(|value| value.is_finite())
+            .min_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+    };
+    let minimum_array_f64 = |key: &str| {
+        values
+            .iter()
+            .filter_map(|value| value.get(key).and_then(serde_json::Value::as_array))
+            .flat_map(|array| array.iter())
+            .filter_map(|value| value.as_f64())
+            .filter(|value| value.is_finite())
+            .min_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+    };
+    let minimum_array_usize = |key: &str| {
+        values
+            .iter()
+            .filter_map(|value| value.get(key).and_then(serde_json::Value::as_array))
+            .flat_map(|array| array.iter())
+            .filter_map(|value| value.as_u64())
+            .filter_map(|value| usize::try_from(value).ok())
+            .min()
+    };
+    let acceptance = values
+        .iter()
+        .filter_map(|value| value.get("accepted").and_then(serde_json::Value::as_bool))
+        .collect::<Vec<_>>();
+    let accepted_count = acceptance.iter().filter(|accepted| **accepted).count();
+    let mut reasons = values
+        .iter()
+        .filter_map(|value| string_value(value.get("reason")))
+        .collect::<Vec<_>>();
+    reasons.sort();
+    reasons.dedup();
+
+    Some(HomographySpatialValidationSummary {
+        accepted: (acceptance.len() == values.len()).then_some(accepted_count == values.len()),
+        validation_count: values.len(),
+        accepted_count,
+        method: common_string("method"),
+        minimum_split_ncc_improvement: minimum_array_f64("ncc_improvement"),
+        minimum_mean_ncc_improvement: minimum_scalar_f64("mean_ncc_improvement"),
+        minimum_split_registration_error_reduction: minimum_array_f64(
+            "registration_error_reduction",
+        ),
+        minimum_mean_registration_error_reduction: minimum_scalar_f64(
+            "mean_registration_error_reduction",
+        ),
+        minimum_split_sample_count: minimum_array_usize("sample_count"),
+        minimum_model_deviation_from_translation_px: minimum_scalar_f64(
+            "maximum_deviation_from_translation_px",
+        ),
+        model_selection_limit: common_string("model_selection_limit"),
+        reasons,
+    })
+}
+
+fn summarize_stitch_seam_detail_consistency(
+    blends: &[&serde_json::Value],
+) -> Option<SeamDetailConsistencyValidationSummary> {
+    let values = blends
+        .iter()
+        .filter_map(|blend| blend.get("detail_consistency"))
+        .filter(|value| value.is_object())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
+    let common_string = |key: &str| {
+        let strings = values
+            .iter()
+            .filter_map(|value| string_value(value.get(key)))
+            .collect::<Vec<_>>();
+        strings.first().cloned().map(|first| {
+            if strings.iter().all(|value| value == &first) {
+                first
+            } else {
+                "sequence_mixed".to_string()
+            }
+        })
+    };
+    let min_usize = |key: &str| {
+        values
+            .iter()
+            .filter_map(|value| usize_value(value.get(key)))
+            .min()
+    };
+    let max_usize = |key: &str| {
+        values
+            .iter()
+            .filter_map(|value| usize_value(value.get(key)))
+            .max()
+    };
+    let max_f64 = |key: &str| {
+        values
+            .iter()
+            .filter_map(|value| f64_value(value.get(key)))
+            .filter(|value| value.is_finite())
+            .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+    };
+    let evaluated = values
+        .iter()
+        .filter_map(|value| value.get("evaluated").and_then(serde_json::Value::as_bool))
+        .collect::<Vec<_>>();
+    let evaluated_merge_count = evaluated.iter().filter(|value| **value).count();
+    let decision_support = values
+        .iter()
+        .filter_map(|value| {
+            value
+                .get("decision_supported")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .collect::<Vec<_>>();
+    let decision_supported_merge_count = decision_support.iter().filter(|value| **value).count();
+    let review = values
+        .iter()
+        .filter_map(|value| {
+            value
+                .get("review_required")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .collect::<Vec<_>>();
+    let review_required_merge_count = review.iter().filter(|value| **value).count();
+    let mut reasons = values
+        .iter()
+        .filter_map(|value| string_value(value.get("reason")))
+        .collect::<Vec<_>>();
+    reasons.sort();
+    reasons.dedup();
+    let mut review_reasons = values
+        .iter()
+        .filter_map(|value| string_value(value.get("review_reason")))
+        .collect::<Vec<_>>();
+    review_reasons.sort();
+    review_reasons.dedup();
+    Some(SeamDetailConsistencyValidationSummary {
+        method: common_string("method"),
+        evaluated: (evaluated.len() == values.len())
+            .then_some(evaluated_merge_count == values.len()),
+        merge_count: values.len(),
+        evaluated_merge_count,
+        decision_supported: (decision_support.len() == values.len())
+            .then_some(decision_supported_merge_count == values.len()),
+        decision_supported_merge_count,
+        review_required: (review.len() == values.len()).then_some(review_required_merge_count > 0),
+        review_required_merge_count,
+        minimum_supported_scale_count: min_usize("supported_scale_count"),
+        maximum_imbalanced_scale_count: max_usize("imbalanced_scale_count"),
+        maximum_symmetric_energy_ratio: max_f64("maximum_symmetric_energy_ratio"),
+        review_ratio_threshold: max_f64("review_ratio_threshold"),
+        minimum_direction_consistency: max_f64("minimum_direction_consistency"),
+        maximum_cross_split_ratio: max_f64("maximum_cross_split_ratio"),
+        minimum_repeated_scale_count: max_usize("minimum_repeated_scale_count"),
+        reasons,
+        review_reasons,
+    })
+}
+
+fn summarize_stitch_seam_exposure_corrections(
+    phase: &PhaseReport,
+) -> Option<SeamExposureCorrectionSummary> {
+    let mut values = Vec::<&serde_json::Value>::new();
+    if let Some(value) = phase
+        .metrics
+        .get("seam_exposure_correction")
+        .filter(|value| value.is_object())
+    {
+        values.push(value);
+    }
+    if let Some(merges) = phase
+        .metrics
+        .get("pair_merges")
+        .and_then(|value| value.as_array())
+    {
+        for merge in merges {
+            if let Some(value) = merge
+                .get("pair_report")
+                .and_then(|report| report.get("metrics"))
+                .and_then(|metrics| metrics.get("seam_exposure_correction"))
+                .filter(|value| value.is_object())
+            {
+                values.push(value);
+            }
+        }
+    }
+    let first = *values.first()?;
+    if values.len() == 1 {
+        return Some(summarize_seam_exposure_correction(first));
+    }
+
+    let common_string = |key: &str| {
+        let strings = values
+            .iter()
+            .filter_map(|value| string_value(value.get(key)))
+            .collect::<Vec<_>>();
+        strings.first().cloned().map(|first| {
+            if strings.len() == values.len() && strings.iter().all(|value| value == &first) {
+                first
+            } else {
+                "sequence_mixed".to_string()
+            }
+        })
+    };
+    let min_f64 = |key: &str| {
+        let measured = values
+            .iter()
+            .filter_map(|value| f64_value(value.get(key)))
+            .filter(|value| value.is_finite())
+            .collect::<Vec<_>>();
+        (measured.len() == values.len()).then(|| {
+            measured
+                .into_iter()
+                .min_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+                .expect("sequence exposure aggregate is non-empty")
+        })
+    };
+    let max_f64 = |key: &str| {
+        let measured = values
+            .iter()
+            .filter_map(|value| f64_value(value.get(key)))
+            .filter(|value| value.is_finite())
+            .collect::<Vec<_>>();
+        (measured.len() == values.len()).then(|| {
+            measured
+                .into_iter()
+                .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+                .expect("sequence exposure aggregate is non-empty")
+        })
+    };
+    let max_abs_f64 = |key: &str| {
+        let measured = values
+            .iter()
+            .filter_map(|value| f64_value(value.get(key)))
+            .filter(|value| value.is_finite())
+            .map(f64::abs)
+            .collect::<Vec<_>>();
+        (measured.len() == values.len()).then(|| {
+            measured
+                .into_iter()
+                .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+                .expect("sequence exposure aggregate is non-empty")
+        })
+    };
+    let min_usize = |key: &str| {
+        let measured = values
+            .iter()
+            .filter_map(|value| usize_value(value.get(key)))
+            .collect::<Vec<_>>();
+        (measured.len() == values.len()).then(|| {
+            measured
+                .into_iter()
+                .min()
+                .expect("sequence exposure aggregate is non-empty")
+        })
+    };
+    let sum_usize = |key: &str| {
+        let counts = values
+            .iter()
+            .filter_map(|value| usize_value(value.get(key)))
+            .collect::<Vec<_>>();
+        (counts.len() == values.len()).then(|| counts.into_iter().sum())
+    };
+    let max_abs_vec = |key: &str| {
+        let vectors = values
+            .iter()
+            .filter_map(|value| value.get(key).and_then(f64_vec_value))
+            .collect::<Vec<_>>();
+        if vectors.len() != values.len() {
+            return None;
+        }
+        let width = vectors.first()?.len();
+        if width == 0 || vectors.iter().any(|vector| vector.len() != width) {
+            return None;
+        }
+        let mut maxima = vec![0.0_f64; width];
+        for vector in vectors {
+            for (index, value) in vector.into_iter().enumerate() {
+                maxima[index] = maxima[index].max(value.abs());
+            }
+        }
+        Some(maxima)
+    };
+
+    let models = values
+        .iter()
+        .filter_map(|value| value.get("model").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>();
+    let held_out_flags = values
+        .iter()
+        .filter_map(|value| {
+            value
+                .get("held_out_validation_passed")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .collect::<Vec<_>>();
+    let model_appropriate_held_out =
+        (models.len() == values.len() && held_out_flags.len() == values.len()).then(|| {
+            let any_non_identity = models.iter().any(|model| *model != "identity");
+            if !any_non_identity {
+                false
+            } else {
+                models
+                    .iter()
+                    .zip(held_out_flags.iter())
+                    .all(|(model, passed)| *model == "identity" || *passed)
+            }
+        });
+    let applied = values
+        .iter()
+        .filter_map(|value| value.get("applied").and_then(serde_json::Value::as_bool))
+        .collect::<Vec<_>>();
+
+    Some(SeamExposureCorrectionSummary {
+        mode: common_string("mode"),
+        model: common_string("model"),
+        applied: (applied.len() == values.len()).then(|| applied.iter().any(|value| *value)),
+        reason: Some(format!(
+            "worst-case aggregate across {} accepted sequence merges",
+            values.len()
+        )),
+        sample_count: sum_usize("sample_count"),
+        valid_sample_ratio: min_f64("valid_sample_ratio"),
+        spatial_gain_log_slope_x_rgb: max_abs_vec("spatial_gain_log_slope_x_rgb"),
+        spatial_gain_log_slope_x_luma: max_abs_f64("spatial_gain_log_slope_x_luma"),
+        spatial_gain_log_slope_y_rgb: max_abs_vec("spatial_gain_log_slope_y_rgb"),
+        spatial_gain_log_slope_y_luma: max_abs_f64("spatial_gain_log_slope_y_luma"),
+        spatial_offset_slope_x_rgb_normalized: max_abs_vec("spatial_offset_slope_x_rgb_normalized"),
+        spatial_offset_slope_y_rgb_normalized: max_abs_vec("spatial_offset_slope_y_rgb_normalized"),
+        spatial_offset_top_rgb_normalized: max_abs_vec("spatial_offset_top_rgb_normalized"),
+        spatial_offset_bottom_rgb_normalized: max_abs_vec("spatial_offset_bottom_rgb_normalized"),
+        offset_rgb: max_abs_vec("offset_rgb"),
+        offset_rgb_normalized: max_abs_vec("offset_rgb_normalized"),
+        seam_score_before: max_f64("seam_score_before"),
+        seam_score_after: max_f64("seam_score_after"),
+        clipped_high_before: max_abs_vec("clipped_high_before"),
+        clipped_high_after: max_abs_vec("clipped_high_after"),
+        clipped_low_before: max_abs_vec("clipped_low_before"),
+        clipped_low_after: max_abs_vec("clipped_low_after"),
+        training_window_count: sum_usize("training_window_count"),
+        held_out_window_count: sum_usize("held_out_window_count"),
+        training_sample_count: sum_usize("training_sample_count"),
+        held_out_sample_count: sum_usize("held_out_sample_count"),
+        gain_offset_training_window_count: sum_usize("gain_offset_training_window_count"),
+        gain_offset_held_out_window_count: sum_usize("gain_offset_held_out_window_count"),
+        gain_offset_consistent_window_ratio: min_f64("gain_offset_consistent_window_ratio"),
+        spatial_training_window_count: min_usize("spatial_training_window_count"),
+        spatial_held_out_window_count: min_usize("spatial_held_out_window_count"),
+        spatial_distinct_training_rows: min_usize("spatial_distinct_training_rows"),
+        spatial_distinct_held_out_rows: min_usize("spatial_distinct_held_out_rows"),
+        spatial_consistent_window_ratio: min_f64("spatial_consistent_window_ratio"),
+        spatial_slope_agreement_ratio: min_f64("spatial_slope_agreement_ratio"),
+        spatial_affine_training_window_count: min_usize("spatial_affine_training_window_count"),
+        spatial_affine_held_out_window_count: min_usize("spatial_affine_held_out_window_count"),
+        spatial_affine_distinct_training_rows: min_usize("spatial_affine_distinct_training_rows"),
+        spatial_affine_distinct_held_out_rows: min_usize("spatial_affine_distinct_held_out_rows"),
+        spatial_affine_consistent_window_ratio: min_f64("spatial_affine_consistent_window_ratio"),
+        spatial_affine_slope_agreement_ratio: min_f64("spatial_affine_slope_agreement_ratio"),
+        spatial_affine_center_offset_delta_normalized: max_f64(
+            "spatial_affine_center_offset_delta_normalized",
+        ),
+        held_out_identity_seam_score: max_f64("held_out_identity_seam_score"),
+        held_out_gain_seam_score: max_f64("held_out_gain_seam_score"),
+        held_out_gain_offset_seam_score: max_f64("held_out_gain_offset_seam_score"),
+        held_out_spatial_gain_seam_score: max_f64("held_out_spatial_gain_seam_score"),
+        held_out_spatial_gain_offset_seam_score: max_f64("held_out_spatial_gain_offset_seam_score"),
+        held_out_selected_seam_score: max_f64("held_out_selected_seam_score"),
+        held_out_improvement_over_identity: min_f64("held_out_improvement_over_identity"),
+        held_out_improvement_over_gain: min_f64("held_out_improvement_over_gain"),
+        held_out_spatial_improvement_over_best_constant: min_f64(
+            "held_out_spatial_improvement_over_best_constant",
+        ),
+        held_out_spatial_gain_offset_improvement_over_best_simpler: min_f64(
+            "held_out_spatial_gain_offset_improvement_over_best_simpler",
+        ),
+        held_out_validation_passed: model_appropriate_held_out,
+        ..SeamExposureCorrectionSummary::default()
+    })
+}
+
+fn summarize_stitch_seam_blends(phase: &PhaseReport) -> Option<SeamBlendValidationSummary> {
+    let mut values = Vec::<&serde_json::Value>::new();
+    if let Some(value) = phase
+        .metrics
+        .get("seam_blend")
+        .filter(|value| value.is_object())
+    {
+        values.push(value);
+    }
+    if let Some(merges) = phase
+        .metrics
+        .get("pair_merges")
+        .and_then(|value| value.as_array())
+    {
+        for merge in merges {
+            if let Some(value) = merge
+                .get("pair_report")
+                .and_then(|report| report.get("metrics"))
+                .and_then(|metrics| metrics.get("seam_blend"))
+                .filter(|value| value.is_object())
+            {
+                values.push(value);
+            }
+        }
+    }
+    if values.is_empty() {
+        return None;
+    }
+
+    let modes = values
+        .iter()
+        .filter_map(|value| string_value(value.get("mode")))
+        .collect::<Vec<_>>();
+    let mode = modes.first().cloned().map(|first| {
+        if modes.iter().all(|value| value == &first) {
+            first
+        } else {
+            "sequence_mixed".to_string()
+        }
+    });
+    let applied_merge_count = values
+        .iter()
+        .filter(|value| value.get("applied").and_then(serde_json::Value::as_bool) == Some(true))
+        .count();
+    let review = values
+        .iter()
+        .filter_map(|value| {
+            value
+                .get("review_required")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .collect::<Vec<_>>();
+    let review_required_merge_count = review.iter().filter(|value| **value).count();
+    let mut review_reasons = values
+        .iter()
+        .filter_map(|value| string_value(value.get("review_reason")))
+        .collect::<Vec<_>>();
+    review_reasons.sort();
+    review_reasons.dedup();
+    let max_usize = |key: &str| {
+        values
+            .iter()
+            .filter_map(|value| usize_value(value.get(key)))
+            .max()
+    };
+    let max_f64 = |key: &str| {
+        values
+            .iter()
+            .filter_map(|value| f64_value(value.get(key)))
+            .filter(|value| value.is_finite())
+            .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+    };
+    let detail_consistency = summarize_stitch_seam_detail_consistency(&values);
+
+    Some(SeamBlendValidationSummary {
+        mode,
+        applied: Some(applied_merge_count == values.len()),
+        reason: (values.len() == 1)
+            .then(|| string_value(values[0].get("reason")))
+            .flatten(),
+        review_required: (review.len() == values.len()).then_some(review_required_merge_count > 0),
+        review_required_merge_count,
+        review_reasons,
+        merge_count: values.len(),
+        applied_merge_count,
+        overlap_width_px: max_usize("overlap_width_px"),
+        overlap_height_px: max_usize("overlap_height_px"),
+        transition_width_px: max_usize("transition_width_px"),
+        pyramid_levels: max_usize("pyramid_levels"),
+        seam_path_mean_normalized_cost: max_f64("seam_path_mean_normalized_cost"),
+        seam_path_p95_normalized_cost: max_f64("seam_path_p95_normalized_cost"),
+        overlap_mean_abs_difference: max_f64("overlap_mean_abs_difference"),
+        overlap_p95_abs_difference: max_f64("overlap_p95_abs_difference"),
+        output_seam_gradient_p95: max_f64("output_seam_gradient_p95"),
+        source_seam_gradient_p95: max_f64("source_seam_gradient_p95"),
+        output_to_source_seam_gradient_ratio: max_f64("output_to_source_seam_gradient_ratio"),
+        detail_consistency,
+    })
+}
+
+fn summarize_spatial_photometric_quadratic(
+    value: &serde_json::Value,
+) -> SpatialPhotometricQuadraticSummary {
+    SpatialPhotometricQuadraticSummary {
+        basis: value
+            .get("basis")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect()
+            }),
+        evaluation_grid_size: usize_value(value.get("evaluation_grid_size")),
+        regularization_lambda: f64_value(value.get("regularization_lambda")),
+        minimum_windows_per_split: usize_value(value.get("minimum_windows_per_split")),
+        minimum_rows_per_split: usize_value(value.get("minimum_rows_per_split")),
+        minimum_columns_per_split: usize_value(value.get("minimum_columns_per_split")),
+        training_window_count: usize_value(value.get("training_window_count")),
+        held_out_window_count: usize_value(value.get("held_out_window_count")),
+        distinct_training_rows: usize_value(value.get("distinct_training_rows")),
+        distinct_held_out_rows: usize_value(value.get("distinct_held_out_rows")),
+        distinct_training_columns: usize_value(value.get("distinct_training_columns")),
+        distinct_held_out_columns: usize_value(value.get("distinct_held_out_columns")),
+        gain_design_condition_number: f64_value(value.get("gain_design_condition_number")),
+        held_out_gain_design_condition_number: f64_value(
+            value.get("held_out_gain_design_condition_number"),
+        ),
+        gain_consistent_window_ratio: f64_value(value.get("gain_consistent_window_ratio")),
+        gain_curvature_coefficient_agreement_ratio: f64_value(
+            value.get("gain_curvature_coefficient_agreement_ratio"),
+        ),
+        gain_max_validation_field_log_delta: f64_value(
+            value.get("gain_max_validation_field_log_delta"),
+        ),
+        gain_curvature_signal: f64_value(value.get("gain_curvature_signal")),
+        estimated_gain_log_quadratic_xx_rgb: value
+            .get("estimated_gain_log_quadratic_xx_rgb")
+            .and_then(f64_vec_value),
+        estimated_gain_log_quadratic_xy_rgb: value
+            .get("estimated_gain_log_quadratic_xy_rgb")
+            .and_then(f64_vec_value),
+        estimated_gain_log_quadratic_yy_rgb: value
+            .get("estimated_gain_log_quadratic_yy_rgb")
+            .and_then(f64_vec_value),
+        gain_grid_min_rgb: value.get("gain_grid_min_rgb").and_then(f64_vec_value),
+        gain_grid_max_rgb: value.get("gain_grid_max_rgb").and_then(f64_vec_value),
+        gain_offset_design_condition_number: f64_value(
+            value.get("gain_offset_design_condition_number"),
+        ),
+        held_out_gain_offset_design_condition_number: f64_value(
+            value.get("held_out_gain_offset_design_condition_number"),
+        ),
+        gain_offset_consistent_window_ratio: f64_value(
+            value.get("gain_offset_consistent_window_ratio"),
+        ),
+        gain_offset_curvature_coefficient_agreement_ratio: f64_value(
+            value.get("gain_offset_curvature_coefficient_agreement_ratio"),
+        ),
+        gain_offset_max_validation_gain_field_log_delta: f64_value(
+            value.get("gain_offset_max_validation_gain_field_log_delta"),
+        ),
+        gain_offset_max_validation_offset_field_delta_normalized: f64_value(
+            value.get("gain_offset_max_validation_offset_field_delta_normalized"),
+        ),
+        gain_offset_curvature_signal: f64_value(value.get("gain_offset_curvature_signal")),
+        estimated_gain_offset_log_quadratic_xx_rgb: value
+            .get("estimated_gain_offset_log_quadratic_xx_rgb")
+            .and_then(f64_vec_value),
+        estimated_gain_offset_log_quadratic_xy_rgb: value
+            .get("estimated_gain_offset_log_quadratic_xy_rgb")
+            .and_then(f64_vec_value),
+        estimated_gain_offset_log_quadratic_yy_rgb: value
+            .get("estimated_gain_offset_log_quadratic_yy_rgb")
+            .and_then(f64_vec_value),
+        estimated_gain_offset_quadratic_xx_rgb: value
+            .get("estimated_gain_offset_quadratic_xx_rgb")
+            .and_then(f64_vec_value),
+        estimated_gain_offset_quadratic_xy_rgb: value
+            .get("estimated_gain_offset_quadratic_xy_rgb")
+            .and_then(f64_vec_value),
+        estimated_gain_offset_quadratic_yy_rgb: value
+            .get("estimated_gain_offset_quadratic_yy_rgb")
+            .and_then(f64_vec_value),
+        gain_offset_grid_gain_min_rgb: value
+            .get("gain_offset_grid_gain_min_rgb")
+            .and_then(f64_vec_value),
+        gain_offset_grid_gain_max_rgb: value
+            .get("gain_offset_grid_gain_max_rgb")
+            .and_then(f64_vec_value),
+        gain_offset_grid_offset_abs_max_normalized: f64_value(
+            value.get("gain_offset_grid_offset_abs_max_normalized"),
+        ),
+        held_out_gain_seam_score: f64_value(value.get("held_out_gain_seam_score")),
+        held_out_gain_offset_seam_score: f64_value(value.get("held_out_gain_offset_seam_score")),
+        gain_best_simpler_model: string_value(value.get("gain_best_simpler_model")),
+        gain_improvement_over_best_simpler: f64_value(
+            value.get("gain_improvement_over_best_simpler"),
+        ),
+        gain_offset_best_simpler_model: string_value(value.get("gain_offset_best_simpler_model")),
+        gain_offset_improvement_over_best_simpler: f64_value(
+            value.get("gain_offset_improvement_over_best_simpler"),
+        ),
+        gain_accepted: value
+            .get("gain_accepted")
+            .and_then(serde_json::Value::as_bool),
+        gain_offset_accepted: value
+            .get("gain_offset_accepted")
+            .and_then(serde_json::Value::as_bool),
+        gain_rejection_reason: string_value(value.get("gain_rejection_reason")),
+        gain_offset_rejection_reason: string_value(value.get("gain_offset_rejection_reason")),
+    }
+}
+
+fn summarize_spatial_photometric_2d(value: &serde_json::Value) -> SpatialPhotometric2dSummary {
+    SpatialPhotometric2dSummary {
+        coordinate_system: string_value(value.get("coordinate_system")),
+        training_window_count: usize_value(value.get("training_window_count")),
+        held_out_window_count: usize_value(value.get("held_out_window_count")),
+        distinct_training_rows: usize_value(value.get("distinct_training_rows")),
+        distinct_held_out_rows: usize_value(value.get("distinct_held_out_rows")),
+        distinct_training_columns: usize_value(value.get("distinct_training_columns")),
+        distinct_held_out_columns: usize_value(value.get("distinct_held_out_columns")),
+        gain_consistent_window_ratio: f64_value(value.get("gain_consistent_window_ratio")),
+        gain_slope_agreement_ratio: f64_value(value.get("gain_slope_agreement_ratio")),
+        gain_horizontal_slope_agreement_ratio: f64_value(
+            value.get("gain_horizontal_slope_agreement_ratio"),
+        ),
+        gain_center_log_delta: f64_value(value.get("gain_center_log_delta")),
+        gain_offset_consistent_window_ratio: f64_value(
+            value.get("gain_offset_consistent_window_ratio"),
+        ),
+        gain_offset_slope_agreement_ratio: f64_value(
+            value.get("gain_offset_slope_agreement_ratio"),
+        ),
+        gain_offset_horizontal_slope_agreement_ratio: f64_value(
+            value.get("gain_offset_horizontal_slope_agreement_ratio"),
+        ),
+        gain_offset_center_gain_log_delta: f64_value(
+            value.get("gain_offset_center_gain_log_delta"),
+        ),
+        gain_offset_center_offset_delta_normalized: f64_value(
+            value.get("gain_offset_center_offset_delta_normalized"),
+        ),
+        held_out_gain_seam_score: f64_value(value.get("held_out_gain_seam_score")),
+        held_out_gain_offset_seam_score: f64_value(value.get("held_out_gain_offset_seam_score")),
+        gain_best_simpler_model: string_value(value.get("gain_best_simpler_model")),
+        gain_improvement_over_best_simpler: f64_value(
+            value.get("gain_improvement_over_best_simpler"),
+        ),
+        gain_offset_best_simpler_model: string_value(value.get("gain_offset_best_simpler_model")),
+        gain_offset_improvement_over_best_simpler: f64_value(
+            value.get("gain_offset_improvement_over_best_simpler"),
+        ),
+        gain_accepted: value
+            .get("gain_accepted")
+            .and_then(serde_json::Value::as_bool),
+        gain_offset_accepted: value
+            .get("gain_offset_accepted")
+            .and_then(serde_json::Value::as_bool),
+        gain_rejection_reason: string_value(value.get("gain_rejection_reason")),
+        gain_offset_rejection_reason: string_value(value.get("gain_offset_rejection_reason")),
+        quadratic: value
+            .get("quadratic")
+            .filter(|value| value.is_object())
+            .map(summarize_spatial_photometric_quadratic),
     }
 }
 
 fn summarize_seam_exposure_correction(value: &serde_json::Value) -> SeamExposureCorrectionSummary {
     SeamExposureCorrectionSummary {
         mode: string_value(value.get("mode")),
+        model: string_value(value.get("model")),
         applied: value.get("applied").and_then(serde_json::Value::as_bool),
         reason: string_value(value.get("reason")),
         sample_count: usize_value(value.get("sample_count")),
         valid_sample_ratio: f64_value(value.get("valid_sample_ratio")),
         gain_rgb: value.get("gain_rgb").and_then(f64_vec_value),
         gain_luma: f64_value(value.get("gain_luma")),
+        spatial_gain_log_slope_x_rgb: value
+            .get("spatial_gain_log_slope_x_rgb")
+            .and_then(f64_vec_value),
+        spatial_gain_log_slope_x_luma: f64_value(value.get("spatial_gain_log_slope_x_luma")),
+        spatial_gain_log_slope_y_rgb: value
+            .get("spatial_gain_log_slope_y_rgb")
+            .and_then(f64_vec_value),
+        spatial_gain_log_slope_y_luma: f64_value(value.get("spatial_gain_log_slope_y_luma")),
+        spatial_gain_log_quadratic_xx_rgb: value
+            .get("spatial_gain_log_quadratic_xx_rgb")
+            .and_then(f64_vec_value),
+        spatial_gain_log_quadratic_xx_luma: f64_value(
+            value.get("spatial_gain_log_quadratic_xx_luma"),
+        ),
+        spatial_gain_log_quadratic_xy_rgb: value
+            .get("spatial_gain_log_quadratic_xy_rgb")
+            .and_then(f64_vec_value),
+        spatial_gain_log_quadratic_xy_luma: f64_value(
+            value.get("spatial_gain_log_quadratic_xy_luma"),
+        ),
+        spatial_gain_log_quadratic_yy_rgb: value
+            .get("spatial_gain_log_quadratic_yy_rgb")
+            .and_then(f64_vec_value),
+        spatial_gain_log_quadratic_yy_luma: f64_value(
+            value.get("spatial_gain_log_quadratic_yy_luma"),
+        ),
+        spatial_gain_top_rgb: value.get("spatial_gain_top_rgb").and_then(f64_vec_value),
+        spatial_gain_bottom_rgb: value.get("spatial_gain_bottom_rgb").and_then(f64_vec_value),
+        spatial_offset_slope_x_rgb: value
+            .get("spatial_offset_slope_x_rgb")
+            .and_then(f64_vec_value),
+        spatial_offset_slope_x_luma: f64_value(value.get("spatial_offset_slope_x_luma")),
+        spatial_offset_slope_x_rgb_normalized: value
+            .get("spatial_offset_slope_x_rgb_normalized")
+            .and_then(f64_vec_value),
+        spatial_offset_slope_y_rgb: value
+            .get("spatial_offset_slope_y_rgb")
+            .and_then(f64_vec_value),
+        spatial_offset_slope_y_luma: f64_value(value.get("spatial_offset_slope_y_luma")),
+        spatial_offset_slope_y_rgb_normalized: value
+            .get("spatial_offset_slope_y_rgb_normalized")
+            .and_then(f64_vec_value),
+        spatial_offset_quadratic_xx_rgb: value
+            .get("spatial_offset_quadratic_xx_rgb")
+            .and_then(f64_vec_value),
+        spatial_offset_quadratic_xx_luma: f64_value(value.get("spatial_offset_quadratic_xx_luma")),
+        spatial_offset_quadratic_xx_rgb_normalized: value
+            .get("spatial_offset_quadratic_xx_rgb_normalized")
+            .and_then(f64_vec_value),
+        spatial_offset_quadratic_xy_rgb: value
+            .get("spatial_offset_quadratic_xy_rgb")
+            .and_then(f64_vec_value),
+        spatial_offset_quadratic_xy_luma: f64_value(value.get("spatial_offset_quadratic_xy_luma")),
+        spatial_offset_quadratic_xy_rgb_normalized: value
+            .get("spatial_offset_quadratic_xy_rgb_normalized")
+            .and_then(f64_vec_value),
+        spatial_offset_quadratic_yy_rgb: value
+            .get("spatial_offset_quadratic_yy_rgb")
+            .and_then(f64_vec_value),
+        spatial_offset_quadratic_yy_luma: f64_value(value.get("spatial_offset_quadratic_yy_luma")),
+        spatial_offset_quadratic_yy_rgb_normalized: value
+            .get("spatial_offset_quadratic_yy_rgb_normalized")
+            .and_then(f64_vec_value),
+        spatial_offset_top_rgb: value.get("spatial_offset_top_rgb").and_then(f64_vec_value),
+        spatial_offset_bottom_rgb: value
+            .get("spatial_offset_bottom_rgb")
+            .and_then(f64_vec_value),
+        spatial_offset_top_rgb_normalized: value
+            .get("spatial_offset_top_rgb_normalized")
+            .and_then(f64_vec_value),
+        spatial_offset_bottom_rgb_normalized: value
+            .get("spatial_offset_bottom_rgb_normalized")
+            .and_then(f64_vec_value),
+        offset_rgb: value.get("offset_rgb").and_then(f64_vec_value),
+        offset_luma: f64_value(value.get("offset_luma")),
+        offset_rgb_normalized: value.get("offset_rgb_normalized").and_then(f64_vec_value),
         seam_score_before: f64_value(value.get("seam_score_before")),
         seam_score_after: f64_value(value.get("seam_score_after")),
         clipped_high_before: value.get("clipped_high_before").and_then(f64_vec_value),
         clipped_high_after: value.get("clipped_high_after").and_then(f64_vec_value),
         clipped_low_before: value.get("clipped_low_before").and_then(f64_vec_value),
         clipped_low_after: value.get("clipped_low_after").and_then(f64_vec_value),
+        training_window_count: usize_value(value.get("training_window_count")),
+        held_out_window_count: usize_value(value.get("held_out_window_count")),
+        training_sample_count: usize_value(value.get("training_sample_count")),
+        held_out_sample_count: usize_value(value.get("held_out_sample_count")),
+        gain_offset_training_window_count: usize_value(
+            value.get("gain_offset_training_window_count"),
+        ),
+        gain_offset_held_out_window_count: usize_value(
+            value.get("gain_offset_held_out_window_count"),
+        ),
+        gain_offset_consistent_window_ratio: f64_value(
+            value.get("gain_offset_consistent_window_ratio"),
+        ),
+        spatial_training_window_count: usize_value(value.get("spatial_training_window_count")),
+        spatial_held_out_window_count: usize_value(value.get("spatial_held_out_window_count")),
+        spatial_distinct_training_rows: usize_value(value.get("spatial_distinct_training_rows")),
+        spatial_distinct_held_out_rows: usize_value(value.get("spatial_distinct_held_out_rows")),
+        spatial_consistent_window_ratio: f64_value(value.get("spatial_consistent_window_ratio")),
+        spatial_slope_agreement_ratio: f64_value(value.get("spatial_slope_agreement_ratio")),
+        spatial_affine_training_window_count: usize_value(
+            value.get("spatial_affine_training_window_count"),
+        ),
+        spatial_affine_held_out_window_count: usize_value(
+            value.get("spatial_affine_held_out_window_count"),
+        ),
+        spatial_affine_distinct_training_rows: usize_value(
+            value.get("spatial_affine_distinct_training_rows"),
+        ),
+        spatial_affine_distinct_held_out_rows: usize_value(
+            value.get("spatial_affine_distinct_held_out_rows"),
+        ),
+        spatial_affine_consistent_window_ratio: f64_value(
+            value.get("spatial_affine_consistent_window_ratio"),
+        ),
+        spatial_affine_slope_agreement_ratio: f64_value(
+            value.get("spatial_affine_slope_agreement_ratio"),
+        ),
+        spatial_affine_center_offset_delta_normalized: f64_value(
+            value.get("spatial_affine_center_offset_delta_normalized"),
+        ),
+        held_out_identity_seam_score: f64_value(value.get("held_out_identity_seam_score")),
+        held_out_gain_seam_score: f64_value(value.get("held_out_gain_seam_score")),
+        held_out_gain_offset_seam_score: f64_value(value.get("held_out_gain_offset_seam_score")),
+        held_out_spatial_gain_seam_score: f64_value(value.get("held_out_spatial_gain_seam_score")),
+        held_out_spatial_gain_offset_seam_score: f64_value(
+            value.get("held_out_spatial_gain_offset_seam_score"),
+        ),
+        held_out_selected_seam_score: f64_value(value.get("held_out_selected_seam_score")),
+        held_out_improvement_over_identity: f64_value(
+            value.get("held_out_improvement_over_identity"),
+        ),
+        held_out_improvement_over_gain: f64_value(value.get("held_out_improvement_over_gain")),
+        held_out_spatial_improvement_over_best_constant: f64_value(
+            value.get("held_out_spatial_improvement_over_best_constant"),
+        ),
+        held_out_spatial_gain_offset_improvement_over_best_simpler: f64_value(
+            value.get("held_out_spatial_gain_offset_improvement_over_best_simpler"),
+        ),
+        held_out_validation_passed: value
+            .get("held_out_validation_passed")
+            .and_then(serde_json::Value::as_bool),
+        gain_offset_rejection_reason: string_value(value.get("gain_offset_rejection_reason")),
+        spatial_rejection_reason: string_value(value.get("spatial_rejection_reason")),
+        spatial_gain_offset_rejection_reason: string_value(
+            value.get("spatial_gain_offset_rejection_reason"),
+        ),
+        spatial_2d_validation: value
+            .get("spatial_2d_validation")
+            .filter(|value| value.is_object())
+            .map(summarize_spatial_photometric_2d),
     }
 }
 
@@ -6387,6 +11857,9 @@ fn summarize_colorspace(
     identity: &ReportIdentitySummary,
 ) -> ColorspaceValidationSummary {
     let calibration = phase.metrics.get("calibration");
+    let calibration_color_mapping_application = calibration
+        .and_then(|value| value.get("color_mapping_application"))
+        .filter(|value| value.is_object());
     let external_profile = calibration.and_then(|value| value.get("external_profile"));
     let scanner_profile = calibration.and_then(|value| value.get("scanner_profile"));
     let roll_profile = calibration.and_then(|value| value.get("roll_profile"));
@@ -6418,6 +11891,8 @@ fn summarize_colorspace(
     ColorspaceValidationSummary {
         calibration_status: calibration.and_then(|value| string_value(value.get("status"))),
         calibration_source: calibration.and_then(|value| string_value(value.get("source"))),
+        calibration_color_mapping_application: calibration_color_mapping_application
+            .map(summarize_calibration_color_mapping_application),
         calibration_scanner_profile_status: scanner_profile
             .and_then(|value| string_value(value.get("status"))),
         calibration_scanner_profile_id: scanner_profile
@@ -6519,6 +11994,10 @@ fn summarize_colorspace(
             .metrics
             .get("calibration_acceptance")
             .map(summarize_calibration_acceptance),
+        neutral_safety_rescue: phase
+            .metrics
+            .get("neutral_safety_rescue")
+            .map(summarize_neutral_safety_rescue),
         selection_rejections: string_vec_metric(phase, "selection_rejections").unwrap_or_default(),
         regularization_lambda: f64_metric(phase, "regularization_lambda"),
         neutral_sample_bands: usize_vec_metric(phase, "neutral_sample_bands"),
@@ -6902,8 +12381,233 @@ fn summarize_calibration_acceptance(value: &serde_json::Value) -> CalibrationAcc
     }
 }
 
+fn summarize_calibration_color_mapping_application(
+    value: &serde_json::Value,
+) -> CalibrationColorMappingApplicationSummary {
+    CalibrationColorMappingApplicationSummary {
+        evaluated: value.get("evaluated").and_then(serde_json::Value::as_bool),
+        applied: value.get("applied").and_then(serde_json::Value::as_bool),
+        selection_status: string_value(value.get("selection_status")),
+        selected_candidate: string_value(value.get("selected_candidate")),
+        preferred_candidate: string_value(value.get("preferred_candidate")),
+        reason: string_value(value.get("reason")),
+        definition: string_value(value.get("definition")),
+    }
+}
+
+fn summarize_neutral_safety_rescue(value: &serde_json::Value) -> NeutralSafetyRescueSummary {
+    NeutralSafetyRescueSummary {
+        evaluated: value.get("evaluated").and_then(serde_json::Value::as_bool),
+        applied: value.get("applied").and_then(serde_json::Value::as_bool),
+        matrix_candidate: string_value(value.get("matrix_candidate")),
+        matrix_candidate_kind: string_value(value.get("matrix_candidate_kind")),
+        matrix_anchor_evidence_supported: value
+            .get("matrix_anchor_evidence_supported")
+            .and_then(serde_json::Value::as_bool),
+        neutral_estimate_supported: value
+            .get("neutral_estimate_supported")
+            .and_then(serde_json::Value::as_bool),
+        neutral_model_evidence_supported: value
+            .get("neutral_model_evidence_supported")
+            .and_then(serde_json::Value::as_bool),
+        matrix_pre_scale_preserved_ratio: f64_value(value.get("matrix_pre_scale_preserved_ratio")),
+        neutral_pre_scale_preserved_ratio: f64_value(
+            value.get("neutral_pre_scale_preserved_ratio"),
+        ),
+        preserved_ratio_gain: f64_value(value.get("preserved_ratio_gain")),
+        minimum_preserved_ratio: f64_value(value.get("minimum_preserved_ratio")),
+        minimum_preserved_ratio_gain: f64_value(value.get("minimum_preserved_ratio_gain")),
+        matrix_midtone_saturation_p95: f64_value(value.get("matrix_midtone_saturation_p95")),
+        neutral_midtone_saturation_p95: f64_value(value.get("neutral_midtone_saturation_p95")),
+        midtone_saturation_p95_reduction: f64_value(value.get("midtone_saturation_p95_reduction")),
+        maximum_midtone_saturation_p95: f64_value(value.get("maximum_midtone_saturation_p95")),
+        minimum_midtone_saturation_p95_reduction: f64_value(
+            value.get("minimum_midtone_saturation_p95_reduction"),
+        ),
+        matrix_memory_color_penalty: f64_value(value.get("matrix_memory_color_penalty")),
+        neutral_memory_color_penalty: f64_value(value.get("neutral_memory_color_penalty")),
+        matrix_spatial_consistency_penalty: f64_value(
+            value.get("matrix_spatial_consistency_penalty"),
+        ),
+        neutral_spatial_consistency_penalty: f64_value(
+            value.get("neutral_spatial_consistency_penalty"),
+        ),
+        neutral_saturation_preservation_sample_count: usize_value(
+            value.get("neutral_saturation_preservation_sample_count"),
+        ),
+        neutral_saturation_preservation_p05_ratio: f64_value(
+            value.get("neutral_saturation_preservation_p05_ratio"),
+        ),
+        neutral_saturation_preservation_median_ratio: f64_value(
+            value.get("neutral_saturation_preservation_median_ratio"),
+        ),
+        neutral_saturation_preservation_p95_ratio: f64_value(
+            value.get("neutral_saturation_preservation_p95_ratio"),
+        ),
+        reason: string_value(value.get("reason")),
+    }
+}
+
+fn summarize_grain_detail_retention(
+    value: &serde_json::Value,
+) -> GrainDetailRetentionValidationSummary {
+    GrainDetailRetentionValidationSummary {
+        method: string_value(value.get("method")),
+        evaluated: value.get("evaluated").and_then(serde_json::Value::as_bool),
+        decision_supported: value
+            .get("decision_supported")
+            .and_then(serde_json::Value::as_bool),
+        sample_stride: usize_value(value.get("sample_stride")),
+        probe_radius: usize_value(value.get("probe_radius")),
+        minimum_probe_count: usize_value(value.get("minimum_probe_count")),
+        luminance_probe_count: usize_value(value.get("luminance_probe_count")),
+        chroma_probe_count: usize_value(value.get("chroma_probe_count")),
+        luminance_decision_supported: value
+            .get("luminance_decision_supported")
+            .and_then(serde_json::Value::as_bool),
+        chroma_decision_supported: value
+            .get("chroma_decision_supported")
+            .and_then(serde_json::Value::as_bool),
+        luminance_median_retention: f64_value(value.get("luminance_median_retention")),
+        luminance_p10_retention: f64_value(value.get("luminance_p10_retention")),
+        chroma_median_retention: f64_value(value.get("chroma_median_retention")),
+        chroma_p10_retention: f64_value(value.get("chroma_p10_retention")),
+        luminance_contrast_threshold: f64_value(value.get("luminance_contrast_threshold")),
+        chroma_contrast_threshold: f64_value(value.get("chroma_contrast_threshold")),
+        coherence_threshold: f64_value(value.get("coherence_threshold")),
+        median_retention_threshold: f64_value(value.get("median_retention_threshold")),
+        p10_retention_threshold: f64_value(value.get("p10_retention_threshold")),
+        review_required: value
+            .get("review_required")
+            .and_then(serde_json::Value::as_bool),
+        reason: string_value(value.get("reason")),
+        review_reason: string_value(value.get("review_reason")),
+    }
+}
+
+fn summarize_adaptive_vibrance_skin_memory_protection(
+    value: &serde_json::Value,
+) -> AdaptiveVibranceSkinMemoryProtectionSummary {
+    AdaptiveVibranceSkinMemoryProtectionSummary {
+        enabled: value.get("enabled").and_then(serde_json::Value::as_bool),
+        method: string_value(value.get("method")),
+        working_space: string_value(value.get("working_space")),
+        reference: string_value(value.get("reference")),
+        core_lightness: value.get("core_lightness").and_then(f64_vec_value),
+        support_lightness: value.get("support_lightness").and_then(f64_vec_value),
+        core_chroma: value.get("core_chroma").and_then(f64_vec_value),
+        support_chroma: value.get("support_chroma").and_then(f64_vec_value),
+        core_hue_degrees: value.get("core_hue_degrees").and_then(f64_vec_value),
+        support_hue_degrees: value.get("support_hue_degrees").and_then(f64_vec_value),
+        maximum_vibrance_reduction: f64_value(value.get("maximum_vibrance_reduction")),
+        evaluated_pixel_ratio: f64_value(value.get("evaluated_pixel_ratio")),
+        protected_pixel_ratio: f64_value(value.get("protected_pixel_ratio")),
+        mean_protection_weight: f64_value(value.get("mean_protection_weight")),
+        max_protection_weight: f64_value(value.get("max_protection_weight")),
+    }
+}
+
+fn summarize_adaptive_vibrance_preferred_memory_color_family(
+    value: &serde_json::Value,
+) -> AdaptiveVibrancePreferredMemoryColorFamilySummary {
+    AdaptiveVibrancePreferredMemoryColorFamilySummary {
+        family: string_value(value.get("family")),
+        preferred_center_lab: value.get("preferred_center_lab").and_then(f64_vec_value),
+        preferred_center_lch: value.get("preferred_center_lch").and_then(f64_vec_value),
+        semi_major_axis_ab: f64_value(value.get("semi_major_axis_ab")),
+        semi_minor_axis_ab: f64_value(value.get("semi_minor_axis_ab")),
+        axis_ratio: f64_value(value.get("axis_ratio")),
+        ellipse_rotation_degrees: f64_value(value.get("ellipse_rotation_degrees")),
+        matched_pixel_ratio: f64_value(value.get("matched_pixel_ratio")),
+        limited_pixel_ratio: f64_value(value.get("limited_pixel_ratio")),
+        mean_scale_reduction: f64_value(value.get("mean_scale_reduction")),
+        max_scale_reduction: f64_value(value.get("max_scale_reduction")),
+    }
+}
+
+fn summarize_adaptive_vibrance_preferred_memory_color_guard(
+    value: &serde_json::Value,
+) -> AdaptiveVibrancePreferredMemoryColorGuardSummary {
+    AdaptiveVibrancePreferredMemoryColorGuardSummary {
+        enabled: value.get("enabled").and_then(serde_json::Value::as_bool),
+        method: string_value(value.get("method")),
+        working_space: string_value(value.get("working_space")),
+        reference: string_value(value.get("reference")),
+        interpretation: string_value(value.get("interpretation")),
+        core_normalized_radius: f64_value(value.get("core_normalized_radius")),
+        support_normalized_radius: f64_value(value.get("support_normalized_radius")),
+        evaluated_pixel_ratio: f64_value(value.get("evaluated_pixel_ratio")),
+        matched_pixel_ratio: f64_value(value.get("matched_pixel_ratio")),
+        limited_pixel_ratio: f64_value(value.get("limited_pixel_ratio")),
+        mean_scale_reduction: f64_value(value.get("mean_scale_reduction")),
+        max_scale_reduction: f64_value(value.get("max_scale_reduction")),
+        families: value
+            .get("families")
+            .and_then(serde_json::Value::as_array)
+            .map(|families| {
+                families
+                    .iter()
+                    .filter(|family| family.is_object())
+                    .map(summarize_adaptive_vibrance_preferred_memory_color_family)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn summarize_preferred_skin_rendering(value: &serde_json::Value) -> PreferredSkinRenderingSummary {
+    PreferredSkinRenderingSummary {
+        enabled: value.get("enabled").and_then(serde_json::Value::as_bool),
+        reason: string_value(value.get("reason")),
+        method: string_value(value.get("method")),
+        working_space: string_value(value.get("working_space")),
+        preference_reference: string_value(value.get("preference_reference")),
+        support_reference: string_value(value.get("support_reference")),
+        interpretation: string_value(value.get("interpretation")),
+        preferred_center_lab: value.get("preferred_center_lab").and_then(f64_vec_value),
+        preferred_center_lch: value.get("preferred_center_lch").and_then(f64_vec_value),
+        semi_major_axis_ab: f64_value(value.get("semi_major_axis_ab")),
+        semi_minor_axis_ab: f64_value(value.get("semi_minor_axis_ab")),
+        axis_ratio: f64_value(value.get("axis_ratio")),
+        ellipse_rotation_degrees: f64_value(value.get("ellipse_rotation_degrees")),
+        core_normalized_radius: f64_value(value.get("core_normalized_radius")),
+        radial_excess_reduction: f64_value(value.get("radial_excess_reduction")),
+        maximum_delta_e_ab: f64_value(value.get("maximum_delta_e_ab")),
+        minimum_support_weight: f64_value(value.get("minimum_support_weight")),
+        evaluated_pixel_ratio: f64_value(value.get("evaluated_pixel_ratio")),
+        matched_pixel_ratio: f64_value(value.get("matched_pixel_ratio")),
+        outside_preferred_core_ratio: f64_value(value.get("outside_preferred_core_ratio")),
+        adjusted_pixel_ratio: f64_value(value.get("adjusted_pixel_ratio")),
+        gamut_limited_pixel_ratio: f64_value(value.get("gamut_limited_pixel_ratio")),
+        mean_delta_e_ab: f64_value(value.get("mean_delta_e_ab")),
+        max_delta_e_ab: f64_value(value.get("max_delta_e_ab")),
+        mean_abs_hue_shift_degrees: f64_value(value.get("mean_abs_hue_shift_degrees")),
+        max_abs_hue_shift_degrees: f64_value(value.get("max_abs_hue_shift_degrees")),
+        mean_chroma_delta: f64_value(value.get("mean_chroma_delta")),
+        max_abs_chroma_delta: f64_value(value.get("max_abs_chroma_delta")),
+    }
+}
+
 fn summarize_tone(phase: &PhaseReport) -> ToneValidationSummary {
     ToneValidationSummary {
+        tone_confidence_status: string_metric(phase, "tone_confidence_status"),
+        tone_output_evidence_evaluated: bool_metric(phase, "tone_output_evidence_evaluated"),
+        tone_output_evidence_confidence: f64_metric(phase, "tone_output_evidence_confidence"),
+        tone_output_confidence_status: string_metric(phase, "tone_output_confidence_status"),
+        tone_output_review_required: bool_metric(phase, "tone_output_review_required"),
+        tone_output_review_reason: string_metric(phase, "tone_output_review_reason"),
+        confidence_limited_by_tone_output_evidence: bool_metric(
+            phase,
+            "confidence_limited_by_tone_output_evidence",
+        ),
+        input_luminance_range_p05_p95: f64_metric(phase, "input_luminance_range_p05_p95"),
+        mapped_luminance_range_p05_p95: f64_metric(phase, "mapped_luminance_range_p05_p95"),
+        render_to_mapped_luminance_range_ratio: f64_metric(
+            phase,
+            "render_to_mapped_luminance_range_ratio",
+        ),
+        maximum_post_tone_high_clip_ratio: f64_metric(phase, "maximum_post_tone_high_clip_ratio"),
+        maximum_post_tone_low_clip_ratio: f64_metric(phase, "maximum_post_tone_low_clip_ratio"),
         highlight_chroma_compressed_ratio: f64_metric(phase, "highlight_chroma_compressed_ratio"),
         highlight_neutral_chroma_compressed_ratio: f64_metric(
             phase,
@@ -6969,12 +12673,43 @@ fn summarize_tone(phase: &PhaseReport) -> ToneValidationSummary {
             phase,
             "post_chroma_compression_clipped_low_ratio",
         ),
+        perceptual_gamut_mapping_space: string_metric(phase, "perceptual_gamut_mapping_space"),
+        perceptual_gamut_mapped_ratio: f64_metric(phase, "perceptual_gamut_mapped_ratio"),
+        perceptual_gamut_mean_chroma_scale: f64_metric(phase, "perceptual_gamut_mean_chroma_scale"),
+        perceptual_gamut_min_chroma_scale: f64_metric(phase, "perceptual_gamut_min_chroma_scale"),
+        adaptive_vibrance_skin_memory_protection: phase
+            .metrics
+            .get("adaptive_vibrance_skin_memory_protection")
+            .filter(|value| value.is_object())
+            .map(summarize_adaptive_vibrance_skin_memory_protection),
+        adaptive_vibrance_preferred_memory_color_guard: phase
+            .metrics
+            .get("adaptive_vibrance_preferred_memory_color_guard")
+            .filter(|value| value.is_object())
+            .map(summarize_adaptive_vibrance_preferred_memory_color_guard),
+        preferred_skin_rendering: phase
+            .metrics
+            .get("preferred_skin_rendering")
+            .filter(|value| value.is_object())
+            .map(summarize_preferred_skin_rendering),
         noise_reduction_enabled: bool_metric(phase, "noise_reduction_enabled"),
+        noise_reduction_requested_enabled: bool_metric(phase, "noise_reduction_requested_enabled"),
         noise_reduction_reason: string_metric(phase, "noise_reduction_reason"),
+        noise_reduction_requested_strength: f64_metric(phase, "noise_reduction_requested_strength"),
+        noise_reduction_requested_scale: f64_metric(phase, "noise_reduction_requested_scale"),
         noise_reduction_radius: usize_metric(phase, "noise_reduction_radius"),
         noise_reduction_chroma_amount: f64_metric(phase, "noise_reduction_chroma_amount"),
         noise_reduction_luma_amount: f64_metric(phase, "noise_reduction_luma_amount"),
         noise_reduction_applied_ratio: f64_metric(phase, "noise_reduction_applied_ratio"),
+        noise_reduction_structure_gate_start: f64_metric(
+            phase,
+            "noise_reduction_structure_gate_start",
+        ),
+        noise_reduction_structure_gate_end: f64_metric(phase, "noise_reduction_structure_gate_end"),
+        noise_reduction_structure_excluded_ratio: f64_metric(
+            phase,
+            "noise_reduction_structure_excluded_ratio",
+        ),
         noise_reduction_texture_limited_ratio: f64_metric(
             phase,
             "noise_reduction_texture_limited_ratio",
@@ -6996,6 +12731,20 @@ fn summarize_tone(phase: &PhaseReport) -> ToneValidationSummary {
             "noise_reduction_mean_abs_luma_delta",
         ),
         noise_reduction_max_abs_luma_delta: f64_metric(phase, "noise_reduction_max_abs_luma_delta"),
+        noise_reduction_flat_luma_p95_reduction_ratio: f64_metric(
+            phase,
+            "noise_reduction_flat_luma_p95_reduction_ratio",
+        ),
+        noise_reduction_flat_chroma_p95_reduction_ratio: f64_metric(
+            phase,
+            "noise_reduction_flat_chroma_p95_reduction_ratio",
+        ),
+        grain_detail_retention: phase
+            .metrics
+            .get("grain_reduction")
+            .and_then(|grain| grain.get("detail_retention"))
+            .filter(|value| value.is_object())
+            .map(summarize_grain_detail_retention),
         high_frequency_grain: phase
             .metrics
             .get("high_frequency_grain")
@@ -7007,6 +12756,7 @@ fn empty_colorspace_summary() -> ColorspaceValidationSummary {
     ColorspaceValidationSummary {
         calibration_status: None,
         calibration_source: None,
+        calibration_color_mapping_application: None,
         calibration_scanner_profile_status: None,
         calibration_scanner_profile_id: None,
         calibration_roll_profile_status: None,
@@ -7047,6 +12797,7 @@ fn empty_colorspace_summary() -> ColorspaceValidationSummary {
         reference_patch_evaluation: None,
         neutral_trim_before_after: None,
         calibration_acceptance: None,
+        neutral_safety_rescue: None,
         selection_rejections: Vec::new(),
         regularization_lambda: None,
         neutral_sample_bands: None,
@@ -7084,6 +12835,18 @@ fn empty_colorspace_summary() -> ColorspaceValidationSummary {
 
 fn empty_tone_summary() -> ToneValidationSummary {
     ToneValidationSummary {
+        tone_confidence_status: None,
+        tone_output_evidence_evaluated: None,
+        tone_output_evidence_confidence: None,
+        tone_output_confidence_status: None,
+        tone_output_review_required: None,
+        tone_output_review_reason: None,
+        confidence_limited_by_tone_output_evidence: None,
+        input_luminance_range_p05_p95: None,
+        mapped_luminance_range_p05_p95: None,
+        render_to_mapped_luminance_range_ratio: None,
+        maximum_post_tone_high_clip_ratio: None,
+        maximum_post_tone_low_clip_ratio: None,
         highlight_chroma_compressed_ratio: None,
         highlight_neutral_chroma_compressed_ratio: None,
         highlight_neutral_chroma_enabled: None,
@@ -7118,18 +12881,34 @@ fn empty_tone_summary() -> ToneValidationSummary {
         bright_saturated_saturation_p95: None,
         post_chroma_compression_clipped_high_ratio: None,
         post_chroma_compression_clipped_low_ratio: None,
+        perceptual_gamut_mapping_space: None,
+        perceptual_gamut_mapped_ratio: None,
+        perceptual_gamut_mean_chroma_scale: None,
+        perceptual_gamut_min_chroma_scale: None,
+        adaptive_vibrance_skin_memory_protection: None,
+        adaptive_vibrance_preferred_memory_color_guard: None,
+        preferred_skin_rendering: None,
         noise_reduction_enabled: None,
+        noise_reduction_requested_enabled: None,
         noise_reduction_reason: None,
+        noise_reduction_requested_strength: None,
+        noise_reduction_requested_scale: None,
         noise_reduction_radius: None,
         noise_reduction_chroma_amount: None,
         noise_reduction_luma_amount: None,
         noise_reduction_applied_ratio: None,
+        noise_reduction_structure_gate_start: None,
+        noise_reduction_structure_gate_end: None,
+        noise_reduction_structure_excluded_ratio: None,
         noise_reduction_texture_limited_ratio: None,
         noise_reduction_saturation_limited_ratio: None,
         noise_reduction_mean_abs_chroma_delta: None,
         noise_reduction_max_abs_chroma_delta: None,
         noise_reduction_mean_abs_luma_delta: None,
         noise_reduction_max_abs_luma_delta: None,
+        noise_reduction_flat_luma_p95_reduction_ratio: None,
+        noise_reduction_flat_chroma_p95_reduction_ratio: None,
+        grain_detail_retention: None,
         high_frequency_grain: None,
     }
 }
@@ -7313,6 +13092,47 @@ fn format_f64_vec(value: &Option<Vec<f64>>) -> Option<String> {
             .map(|value| format!("{value:.6}"))
             .collect::<Vec<_>>()
             .join(", ")
+    })
+}
+
+fn format_input_orientation_components(
+    components: &[InputOrientationComponentValidationSummary],
+) -> Option<String> {
+    (!components.is_empty()).then(|| {
+        components
+            .iter()
+            .map(|component| {
+                let index = component
+                    .index
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let tag = component
+                    .tag_value
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "absent".to_string());
+                let transform = component.transform.as_deref().unwrap_or("missing");
+                let correction = component
+                    .orientation_correction_requested
+                    .as_deref()
+                    .unwrap_or("missing");
+                let applied = component
+                    .applied
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "missing".to_string());
+                let source = format_dimensions(component.source_width, component.source_height)
+                    .unwrap_or_else(|| "missing".to_string());
+                let output = format_dimensions(component.output_width, component.output_height)
+                    .unwrap_or_else(|| "missing".to_string());
+                let decoded_pixel_sha256 = component
+                    .decoded_pixel_sha256
+                    .as_deref()
+                    .unwrap_or("missing");
+                format!(
+                    "component {index}: tag={tag} effective_transform={transform} correction={correction} applied={applied} source={source} output={output} decoded_pixel_sha256={decoded_pixel_sha256}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
     })
 }
 

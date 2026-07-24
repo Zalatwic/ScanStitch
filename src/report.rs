@@ -1,9 +1,15 @@
+use crate::atomic_file;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const REPORT_SCHEMA_VERSION: u32 = 2;
+pub const REPORT_SCHEMA_VERSION: u32 = 4;
 pub const PIPELINE_SCHEMA_VERSION: u32 = 1;
+pub const FILE_SHA256_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// Top-level pipeline report, serialized to JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +29,16 @@ pub struct RunMetadata {
     pub package_name: String,
     pub package_version: String,
     pub binary_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_file_size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_identity_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_identity_error: Option<String>,
     pub working_directory: String,
     pub cli_args: Vec<String>,
     pub output_dir: String,
@@ -72,7 +88,7 @@ impl PipelineReport {
     /// Save the report as JSON to the given path.
     pub fn save(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)?;
+        atomic_file::write_bytes(path, json.as_bytes())?;
         Ok(())
     }
 }
@@ -99,6 +115,7 @@ impl RunMetadata {
         let working_directory = std::env::current_dir()
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_default();
+        let binary_identity = current_executable_identity();
 
         Self {
             report_schema_version: REPORT_SCHEMA_VERSION,
@@ -108,12 +125,83 @@ impl RunMetadata {
             package_name: env!("CARGO_PKG_NAME").to_string(),
             package_version: env!("CARGO_PKG_VERSION").to_string(),
             binary_name,
+            binary_path: binary_identity.path.clone(),
+            binary_sha256: binary_identity.sha256.clone(),
+            binary_file_size_bytes: binary_identity.file_size_bytes,
+            binary_identity_status: Some(binary_identity.status.clone()),
+            binary_identity_error: binary_identity.error.clone(),
             working_directory,
             cli_args,
             output_dir: absolute_path_string(output_dir),
             output_path: absolute_path_string(output_path),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct ExecutableIdentity {
+    path: Option<String>,
+    sha256: Option<String>,
+    file_size_bytes: Option<u64>,
+    status: String,
+    error: Option<String>,
+}
+
+fn current_executable_identity() -> &'static ExecutableIdentity {
+    static IDENTITY: OnceLock<ExecutableIdentity> = OnceLock::new();
+    IDENTITY.get_or_init(inspect_current_executable)
+}
+
+fn inspect_current_executable() -> ExecutableIdentity {
+    let path = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            return ExecutableIdentity {
+                path: None,
+                sha256: None,
+                file_size_bytes: None,
+                status: "current_executable_unavailable".to_string(),
+                error: Some(error.to_string()),
+            };
+        }
+    };
+    let display_path = path.to_string_lossy().to_string();
+    let (sha256, file_size_bytes) = match hash_file_sha256(&path) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return ExecutableIdentity {
+                path: Some(display_path),
+                sha256: None,
+                file_size_bytes: None,
+                status: "current_executable_hash_failed".to_string(),
+                error: Some(error.to_string()),
+            };
+        }
+    };
+    ExecutableIdentity {
+        path: Some(display_path),
+        sha256: Some(sha256),
+        file_size_bytes: Some(file_size_bytes),
+        status: "verified_sha256".to_string(),
+        error: None,
+    }
+}
+
+/// Reopen a file and compute the SHA-256 of its exact on-disk bytes with bounded memory.
+pub fn hash_file_sha256(path: &Path) -> std::io::Result<(String, u64)> {
+    let file = File::open(path)?;
+    let file_size_bytes = file.metadata()?.len();
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; FILE_SHA256_BUFFER_BYTES];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok((format!("{:x}", hasher.finalize()), file_size_bytes))
 }
 
 pub fn system_time_unix_ms(time: SystemTime) -> Option<u64> {
@@ -194,5 +282,27 @@ impl PhaseReport {
     pub fn with_duration_ms(mut self, duration_ms: u64) -> Self {
         self.duration_ms = duration_ms;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inspect_current_executable;
+
+    #[test]
+    fn executable_identity_hashing_fits_a_small_cli_stack() {
+        let identity = std::thread::Builder::new()
+            .name("small-cli-stack-binary-hash".to_string())
+            .stack_size(256 * 1024)
+            .spawn(inspect_current_executable)
+            .expect("spawn small-stack executable identity probe")
+            .join()
+            .expect("small-stack executable identity probe must not overflow");
+        assert_eq!(identity.status, "verified_sha256");
+        assert!(identity
+            .sha256
+            .as_deref()
+            .is_some_and(|digest| digest.len() == 64));
+        assert!(identity.file_size_bytes.is_some_and(|size| size > 0));
     }
 }

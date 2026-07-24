@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "scanner_signal_bit_depth": 14,
+  "measurement": {
+    "source_space": {
+      "name": "normalized decoded scanner RGB",
+      "encoding": "scanner_signal"
+    },
+    "scanner": {
+      "make": "Nikon",
+      "model": "CoolScan 4000"
+    },
+    "settings": {
+      "software": "VueScan",
+      "mode": "raw",
+      "bit_depth": 14
+    },
+    "target": {
+      "type": "user-supplied transmissive chart",
+      "illuminant": "D50"
+    },
+    "reference": {
+      "dataset": "REPLACE-WITH-MEASURED-CHART-REFERENCE",
+      "status": "template_only_zero_values_must_be_replaced",
+      "observer": "CIE 1931 2 degree"
+    },
+    "whitepoint": [0.9642, 1.0, 0.8251]
+  },
+  "grid": {
+    "rows": 3,
+    "columns": 4,
+    "patch_inset_fraction": 0.2,
+    "samples_per_axis": 25
+  },
+  "patches": [
+    { "id": "P01", "row": 0, "column": 0, "xyz": [0.0, 0.0, 0.0] },
+    { "id": "P02", "row": 0, "column": 1, "xyz": [0.0, 0.0, 0.0] },
+    { "id": "P03", "row": 0, "column": 2, "xyz": [0.0, 0.0, 0.0] },
+    { "id": "P04", "row": 0, "column": 3, "xyz": [0.0, 0.0, 0.0] },
+    { "id": "P05", "row": 1, "column": 0, "xyz": [0.0, 0.0, 0.0] },
+    { "id": "P06", "row": 1, "column": 1, "xyz": [0.0, 0.0, 0.0] },
+    { "id": "P07", "row": 1, "column": 2, "xyz": [0.0, 0.0, 0.0] },
+    { "id": "P08", "row": 1, "column": 3, "xyz": [0.0, 0.0, 0.0] },
+    { "id": "P09", "row": 2, "column": 0, "xyz": [0.0, 0.0, 0.0] },
+    { "id": "P10", "row": 2, "column": 1, "xyz": [0.0, 0.0, 0.0] },
+    { "id": "P11", "row": 2, "column": 2, "xyz": [0.0, 0.0, 0.0] },
+    { "id": "P12", "row": 2, "column": 3, "xyz": [0.0, 0.0, 0.0] }
+  ],
+  "captures": [
+    {
+      "id": "chart-capture-training",
+      "role": "training",
+      "image": "targets/chart-training.tiff",
+      "corners": {
+        "top_left": [640.0, 520.0],
+        "top_right": [5320.0, 610.0],
+        "bottom_right": [5230.0, 3470.0],
+        "bottom_left": [710.0, 3540.0]
+      }
+    },
+    {
+      "id": "chart-capture-held-out",
+      "role": "held_out",
+      "image": "targets/chart-held-out.tiff",
+      "corners": {
+        "top_left": [670.0, 500.0],
+        "top_right": [5290.0, 590.0],
+        "bottom_right": [5260.0, 3490.0],
+        "bottom_left": [690.0, 3520.0]
+      }
+    }
+  ],
+  "quality": {
+    "minimum_source_bits_per_sample": 12,
+    "minimum_retained_fraction": 0.7,
+    "maximum_clipped_fraction": 0.01,
+    "maximum_channel_robust_spread": 0.08,
+    "maximum_spatial_cell_delta": 0.04,
+    "outlier_z_limit": 6.0,
+    "clipping_margin": 0.0001
+  },
+  "preview_max_dimension": 1800
+}

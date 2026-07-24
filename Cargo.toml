@@ -10,6 +10,8 @@ crossbeam-channel = "0.5.15"
 crossterm = "0.29.0"
 image = { version = "0.25", features = ["tiff"] }
 minifb = "0.28.0"
+moxcms = "0.7.11"
+png = "0.18.1"
 tiff = "0.9"
 ndarray = { version = "0.16", features = ["rayon"] }
 nalgebra = "0.33"
@@ -20,6 +22,7 @@ rayon = "1"
 sha2 = "0.10"
 log = "0.4"
 env_logger = "0.11"
+tempfile = "3"
 
 [features]
 default = []
@@ -28,8 +31,8 @@ use-opencv = ["dep:opencv"]
 [dependencies.opencv]
 version = "0.93"
 optional = true
+default-features = false
 features = ["calib3d", "features2d", "imgproc"]
 
 [dev-dependencies]
-tempfile = "3"
 approx = "0.5"

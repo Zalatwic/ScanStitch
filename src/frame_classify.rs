@@ -39,6 +39,25 @@ pub struct FrameAnalysis {
     pub internal_base_regions: Vec<BaseRegion>,
 }
 
+/// Lightweight component bookkeeping for already-positive input. Negative-film rebate topology is
+/// not meaningful here; multi-input positive sets are overlap-scored directly by the pipeline.
+pub fn positive_input_component(img: &Array3<u16>) -> FrameAnalysis {
+    let (_, width, _) = img.dim();
+    FrameAnalysis {
+        class: FrameClass::Ambiguous,
+        // Negative-film rebate topology was not evaluated. A successful bypass is not
+        // classification evidence and must not be reported as perfect confidence.
+        confidence: 0.0,
+        left_edge_confidence: 0.0,
+        right_edge_confidence: 0.0,
+        content_span: (0, width),
+        content_fraction: if width == 0 { 0.0 } else { 1.0 },
+        activity_score: 0.0,
+        component_score: if width == 0 { 0.0 } else { 1.0 },
+        internal_base_regions: Vec::new(),
+    }
+}
+
 impl StitchDecision {
     pub fn should_score(&self) -> bool {
         !matches!(self.disposition, StitchDisposition::Skip)

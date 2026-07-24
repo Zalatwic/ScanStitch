@@ -1,5 +1,6 @@
 use approx::assert_relative_eq;
 use nalgebra::{Matrix3, Vector3};
+use ndarray::Array3;
 
 fn matrix_from_const(values: &[[f64; 3]; 3]) -> Matrix3<f64> {
     Matrix3::new(
@@ -31,6 +32,22 @@ fn test_prophoto_matrix_white_point_and_inverse_match_d50() {
         for col in 0..3 {
             let expected = if row == col { 1.0 } else { 0.0 };
             assert_relative_eq!(identity[(row, col)], expected, epsilon = 1e-6);
+        }
+    }
+}
+
+#[test]
+fn test_d50_xyz_lab_roundtrip_supports_perceptual_output_mapping() {
+    for xyz in [
+        [0.0, 0.0, 0.0],
+        scanstitch::constants::D50_WHITE,
+        [0.18, 0.20, 0.09],
+        [0.62, 0.31, 0.12],
+    ] {
+        let lab = scanstitch::colorspace::xyz_d50_to_lab(xyz);
+        let reconstructed = scanstitch::colorspace::lab_to_xyz_d50(lab);
+        for (actual, expected) in reconstructed.iter().zip(xyz) {
+            assert_relative_eq!(actual, &expected, epsilon = 1e-10);
         }
     }
 }
@@ -168,6 +185,11 @@ fn diagnostics_with_image_matrix_low_clip(
             within_negative_gamut_limits: None,
             forced_by_color_mode: false,
         },
+        neutral_safety_rescue:
+            scanstitch::colorspace::NeutralSafetyRescueDiagnostics::not_evaluated(
+                "synthetic diagnostics",
+            ),
+        nonlinear_color_model: None,
         pre_scale_preserved_ratio: 1.0,
         post_scale_preserved_ratio: 1.0,
         image_matrix_pre_scale_clipped_low_ratio: low_clip,
@@ -204,6 +226,183 @@ fn synthetic_calibration_profile() -> scanstitch::color_calibration::Calibration
     scanstitch::color_calibration::parse_profile_json(&json, None)
         .profile
         .expect("synthetic calibration profile")
+}
+
+fn nonlinear_target_patches(
+    count: usize,
+    prefix: &str,
+    seed_offset: usize,
+) -> Vec<scanstitch::color_calibration::TargetPatch> {
+    let coefficients = [
+        [0.65, 0.25, 0.03],
+        [0.14, 0.69, 0.08],
+        [0.05, 0.10, 0.76],
+        [0.055, -0.030, 0.010],
+        [-0.025, 0.012, 0.045],
+        [0.012, 0.040, -0.018],
+    ];
+    (0..count)
+        .map(|index| {
+            let seed = index + seed_offset;
+            let code =
+                |multiplier: usize, add: usize| ((seed * multiplier + add) % 997) as f64 / 996.0;
+            let rgb = [
+                0.025 + 0.95 * code(173, 31),
+                0.025 + 0.95 * code(379, 97),
+                0.025 + 0.95 * code(613, 211),
+            ];
+            let basis = scanstitch::color_calibration::root_polynomial_basis_values(2, rgb)
+                .expect("degree-two basis");
+            let reference_xyz = std::array::from_fn(|channel| {
+                basis
+                    .iter()
+                    .zip(coefficients)
+                    .map(|(term, coefficient)| term * coefficient[channel])
+                    .sum()
+            });
+            scanstitch::color_calibration::TargetPatch {
+                patch_id: Some(format!("{prefix}-{index:03}")),
+                scanner_xy: None,
+                source_rgb: rgb,
+                reference_xyz,
+            }
+        })
+        .collect()
+}
+
+fn nonlinear_calibration_profile() -> (
+    scanstitch::color_calibration::CalibrationProfile,
+    Vec<scanstitch::color_calibration::TargetPatch>,
+) {
+    let training = nonlinear_target_patches(48, "runtime-train", 0);
+    let held_out = nonlinear_target_patches(36, "runtime-held", 409);
+    let matrix = scanstitch::color_calibration::fit_rgb_to_xyz_from_disjoint_patches(
+        &training,
+        &held_out,
+        "runtime_matrix_baseline",
+        Some(scanstitch::constants::D50_WHITE),
+        None,
+    )
+    .expect("runtime matrix fit");
+    let model =
+        scanstitch::color_calibration::fit_root_polynomial_color_model_from_disjoint_patches(
+            "runtime-nonlinear",
+            &training,
+            &held_out,
+            &matrix.matrix,
+        )
+        .expect("runtime nonlinear fit")
+        .selected_model
+        .expect("runtime nonlinear model");
+    let mut profile = synthetic_calibration_profile();
+    profile.schema_version = 2;
+    profile.work_to_xyz = matrix.matrix;
+    profile.whitepoint = scanstitch::constants::D50_WHITE;
+    profile.confidence = matrix.confidence;
+    profile.matrix_condition_number = matrix.matrix_condition_number;
+    profile.fit = Some(matrix.fit);
+    profile.target_patches = held_out.clone();
+    profile.application_mode =
+        scanstitch::color_calibration::CalibrationApplicationMode::DirectProfile;
+    profile.color_model = Some(model);
+    profile.color_model_post_xyz = None;
+    (profile, held_out)
+}
+
+fn residual_lut_target_patches(
+    count: usize,
+    prefix: &str,
+    seed_offset: usize,
+    include_domain_corners: bool,
+) -> Vec<scanstitch::color_calibration::TargetPatch> {
+    let matrix = [[0.65, 0.14, 0.05], [0.25, 0.69, 0.10], [0.03, 0.08, 0.76]];
+    (0..count)
+        .map(|index| {
+            let seed = index + seed_offset;
+            let code =
+                |multiplier: usize, add: usize| ((seed * multiplier + add) % 997) as f64 / 996.0;
+            let source_rgb = if include_domain_corners && index < 8 {
+                [
+                    if index & 1 == 0 { 0.025 } else { 0.975 },
+                    if index & 2 == 0 { 0.025 } else { 0.975 },
+                    if index & 4 == 0 { 0.025 } else { 0.975 },
+                ]
+            } else {
+                [
+                    0.04 + 0.92 * code(173, 31),
+                    0.04 + 0.92 * code(379, 97),
+                    0.04 + 0.92 * code(613, 211),
+                ]
+            };
+            let mut reference_xyz = std::array::from_fn(|row| {
+                matrix[row][0] * source_rgb[0]
+                    + matrix[row][1] * source_rgb[1]
+                    + matrix[row][2] * source_rgb[2]
+            });
+            let normalized = source_rgb.map(|value| (value - 0.025) / 0.95);
+            let shape = 64.0
+                * normalized[0]
+                * (1.0 - normalized[0])
+                * normalized[1]
+                * (1.0 - normalized[1])
+                * normalized[2]
+                * (1.0 - normalized[2]);
+            let residual = [
+                0.055 * shape * (0.70 + 0.30 * (2.0 * normalized[0] - 1.0)),
+                -0.040 * shape * (0.75 + 0.25 * (2.0 * normalized[1] - 1.0)),
+                0.050 * shape * (0.65 + 0.35 * (2.0 * normalized[2] - 1.0)),
+            ];
+            for channel in 0..3 {
+                reference_xyz[channel] += residual[channel];
+            }
+            scanstitch::color_calibration::TargetPatch {
+                patch_id: Some(format!("{prefix}-{index:03}")),
+                scanner_xy: None,
+                source_rgb,
+                reference_xyz,
+            }
+        })
+        .collect()
+}
+
+fn residual_lut_calibration_profile() -> (
+    scanstitch::color_calibration::CalibrationProfile,
+    Vec<scanstitch::color_calibration::TargetPatch>,
+) {
+    let training = residual_lut_target_patches(180, "runtime-lut-train", 0, true);
+    let held_out = residual_lut_target_patches(80, "runtime-lut-held", 431, false);
+    let matrix = scanstitch::color_calibration::fit_rgb_to_xyz_from_disjoint_patches(
+        &training,
+        &held_out,
+        "runtime_lut_matrix_baseline",
+        Some(scanstitch::constants::D50_WHITE),
+        None,
+    )
+    .expect("runtime LUT matrix fit");
+    let model =
+        scanstitch::color_calibration::fit_residual_lut_3d_color_model_from_disjoint_patches(
+            "runtime-residual-lut",
+            &training,
+            &held_out,
+            &matrix.matrix,
+            None,
+        )
+        .expect("runtime residual LUT fit")
+        .selected_model
+        .expect("runtime residual LUT model");
+    let mut profile = synthetic_calibration_profile();
+    profile.schema_version = 2;
+    profile.work_to_xyz = matrix.matrix;
+    profile.whitepoint = scanstitch::constants::D50_WHITE;
+    profile.confidence = matrix.confidence;
+    profile.matrix_condition_number = matrix.matrix_condition_number;
+    profile.fit = Some(matrix.fit);
+    profile.target_patches = held_out.clone();
+    profile.application_mode =
+        scanstitch::color_calibration::CalibrationApplicationMode::DirectProfile;
+    profile.lut_3d_model = Some(model);
+    profile.color_model_post_xyz = None;
+    (profile, held_out)
 }
 
 fn prophoto_matrix_rows() -> [[f64; 3]; 3] {
@@ -309,6 +508,7 @@ fn reference_fit_patches_for_matrix(
             * (matrix_to_prophoto * Vector3::new(source_rgb[0], source_rgb[1], source_rgb[2]));
         scanstitch::color_calibration::TargetPatch {
             patch_id: Some(format!("patch-{idx}")),
+            scanner_xy: None,
             source_rgb,
             reference_xyz: [xyz[0], xyz[1], xyz[2]],
         }
@@ -371,7 +571,7 @@ fn positive_rgb_detail_image(width: usize, height: usize) -> ndarray::Array3<f64
 }
 
 #[test]
-fn test_positive_rgb_passthrough_reports_safe_trusted_mapping() {
+fn test_unprofiled_positive_rgb_passthrough_requires_color_review() {
     let img = positive_rgb_detail_image(96, 64);
     let result =
         scanstitch::colorspace::map_positive_scan_rgb_to_prophoto_d50_with_diagnostics(&img);
@@ -384,15 +584,17 @@ fn test_positive_rgb_passthrough_reports_safe_trusted_mapping() {
         result.diagnostics.selected_candidate,
         "positive_scan_rgb_passthrough"
     );
-    assert_eq!(result.diagnostics.candidate_risk, "safe");
+    assert_eq!(result.diagnostics.candidate_risk, "review_unprofiled_input");
     assert_eq!(
         scanstitch::colorspace::tone_color_trust_state(&result.diagnostics),
-        "trusted"
+        "review_required"
     );
     assert_eq!(result.diagnostics.pre_scale_preserved_ratio, 1.0);
     assert_eq!(result.diagnostics.post_scale_preserved_ratio, 1.0);
     assert_eq!(result.diagnostics.channel_anchor_low_support, [false; 3]);
     assert!(result.diagnostics.neutral_estimate_quality.accepted);
+    assert!(!result.diagnostics.neutral_safety_rescue.evaluated);
+    assert!(!result.diagnostics.neutral_safety_rescue.applied);
 
     let left =
         result.prophoto[[32, 8, 0]] + result.prophoto[[32, 8, 1]] + result.prophoto[[32, 8, 2]];
@@ -401,6 +603,69 @@ fn test_positive_rgb_passthrough_reports_safe_trusted_mapping() {
     assert!(
         right > left,
         "positive RGB passthrough must preserve non-inverted luminance ordering"
+    );
+}
+
+#[test]
+fn test_profiled_positive_rgb_is_a_trusted_linear_prophoto_input() {
+    let img = positive_rgb_detail_image(96, 64);
+    let result =
+        scanstitch::colorspace::map_profiled_positive_scan_rgb_to_prophoto_d50_with_diagnostics(
+            &img,
+        );
+
+    assert_eq!(
+        result.diagnostics.mapping_strategy,
+        "embedded_icc_to_linear_prophoto"
+    );
+    assert_eq!(
+        result.diagnostics.selected_candidate,
+        "profiled_positive_scan_rgb"
+    );
+    assert_eq!(result.diagnostics.candidate_risk, "safe");
+    assert_eq!(
+        scanstitch::colorspace::tone_color_trust_state(&result.diagnostics),
+        "trusted"
+    );
+    assert_eq!(result.diagnostics.pre_scale_preserved_ratio, 1.0);
+    assert_eq!(result.diagnostics.post_scale_preserved_ratio, 1.0);
+    assert!(result
+        .diagnostics
+        .selected_mapping_reason
+        .contains("ICC device-to-PCS"));
+    assert!(!result.diagnostics.neutral_safety_rescue.evaluated);
+    assert!(!result.diagnostics.neutral_safety_rescue.applied);
+}
+
+#[test]
+fn test_forced_neutral_fallback_cannot_become_trusted_colour() {
+    let img = broad_neutral_band_image(72, 72);
+    let result =
+        scanstitch::colorspace::map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
+            &img,
+            None,
+            scanstitch::colorspace::ColorMode::Neutral,
+        )
+        .unwrap();
+
+    assert_eq!(result.diagnostics.candidate_risk, "fallback_only");
+    assert!(!result.diagnostics.neutral_safety_rescue.evaluated);
+    assert!(!result.diagnostics.neutral_safety_rescue.applied);
+    assert!(result
+        .diagnostics
+        .neutral_safety_rescue
+        .reason
+        .contains("auto-only"));
+    assert_eq!(
+        scanstitch::colorspace::tone_color_trust_state(&result.diagnostics),
+        "review_required"
+    );
+    let protection =
+        scanstitch::tonemap::ToneColorProtection::from_colorspace_diagnostics(&result.diagnostics);
+    assert_eq!(protection.color_trust_state(), "review_required");
+    assert_eq!(
+        protection.policy.as_str(),
+        "disabled_color_candidate_review"
     );
 }
 
@@ -517,6 +782,41 @@ fn test_direct_density_render_fallback_rejects_quality_win_with_worse_risk() {
     assert!(
         scanstitch::colorspace::direct_density_render_fallback_reason(&ica, &direct).is_none(),
         "direct density should not replace ICA when the stronger score carries worse risk"
+    );
+}
+
+#[test]
+fn test_direct_density_render_prefers_safe_physical_prior_with_close_quality() {
+    let mut ica = diagnostics_with_image_matrix_low_clip([0.012, 0.003, 0.0], false);
+    ica.selected_quality_score = Some(1.20);
+    ica.candidate_risk = "safe".to_string();
+    ica.post_scale_preserved_ratio = 0.991;
+    let mut direct = diagnostics_with_image_matrix_low_clip([0.013, 0.003, 0.0], false);
+    direct.selected_quality_score = Some(1.85);
+    direct.candidate_risk = "safe".to_string();
+    direct.post_scale_preserved_ratio = 0.990;
+
+    let reason = scanstitch::colorspace::direct_density_render_fallback_reason(&ica, &direct)
+        .expect("safe physical direct-density prior");
+
+    assert!(reason.contains("physically grounded negative-response reconstruction"));
+    assert!(reason.contains("blind ICA is underconstrained"));
+}
+
+#[test]
+fn test_direct_density_render_physical_prior_rejects_material_gamut_regression() {
+    let mut ica = diagnostics_with_image_matrix_low_clip([0.01, 0.0, 0.0], false);
+    ica.selected_quality_score = Some(1.20);
+    ica.candidate_risk = "safe".to_string();
+    ica.post_scale_preserved_ratio = 0.995;
+    let mut direct = diagnostics_with_image_matrix_low_clip([0.01, 0.0, 0.0], false);
+    direct.selected_quality_score = Some(1.30);
+    direct.candidate_risk = "safe".to_string();
+    direct.post_scale_preserved_ratio = 0.960;
+
+    assert!(
+        scanstitch::colorspace::direct_density_render_fallback_reason(&ica, &direct).is_none(),
+        "physical prior must not override a materially safer ICA color mapping"
     );
 }
 
@@ -672,6 +972,15 @@ fn test_colorspace_prefers_valid_calibration_profile() {
             >= 1.0
     );
     assert!(diagnostics.image_matrix_exposure_scale >= 1.0);
+    assert!(diagnostics.neutral_safety_rescue.evaluated);
+    assert!(!diagnostics.neutral_safety_rescue.applied);
+    assert_eq!(
+        diagnostics
+            .neutral_safety_rescue
+            .matrix_candidate_kind
+            .as_deref(),
+        Some("calibrated_direct")
+    );
 }
 
 #[test]
@@ -1019,6 +1328,19 @@ fn test_scanner_prior_beats_weak_anchor_image_candidate_when_safe() {
         diagnostics.mapping_strategy,
         "scanner_constrained_image_derived_matrix"
     );
+    assert!(diagnostics.neutral_safety_rescue.evaluated);
+    assert!(!diagnostics.neutral_safety_rescue.applied);
+    assert_eq!(
+        diagnostics
+            .neutral_safety_rescue
+            .matrix_candidate_kind
+            .as_deref(),
+        Some("scanner_prior")
+    );
+    assert!(diagnostics
+        .neutral_safety_rescue
+        .reason
+        .contains("protected"));
     assert!(
         !diagnostics.weak_anchor_fallback_used,
         "scanner-prior candidate should be selected without weak-anchor fallback: {:?}",
@@ -1044,6 +1366,12 @@ fn test_auto_mode_ranks_neutral_fallback_behind_safe_image_matrix() {
         "gamut_trusted_image_matrix_blend"
     );
     assert_eq!(diagnostics.selected_candidate_rank, Some(1));
+    assert!(diagnostics.neutral_safety_rescue.evaluated);
+    assert!(!diagnostics.neutral_safety_rescue.applied);
+    assert!(diagnostics
+        .neutral_safety_rescue
+        .reason
+        .contains("not applied"));
     let selected_score = diagnostics
         .candidate_scores
         .iter()
@@ -1219,6 +1547,7 @@ fn test_auto_mode_keeps_image_candidate_when_calibration_quality_does_not_win() 
         patch_count: 24,
         target_residual_rms: 0.50,
         target_residual_max: 1.20,
+        validation: None,
         per_hue_residuals: Vec::new(),
         worst_patches: Vec::new(),
     });
@@ -1730,7 +2059,7 @@ fn test_dominant_anchor_sampling_rejects_edge_artifacts_and_reports_luma_bands()
 }
 
 #[test]
-fn test_dominant_anchor_stability_penalizes_narrow_band_support() {
+fn test_dominant_anchor_instability_applies_evidence_gated_neutral_safety_rescue() {
     let mut img = broad_neutral_band_image(45, 45);
     for y in 17..29 {
         for x in 4..17 {
@@ -1761,26 +2090,61 @@ fn test_dominant_anchor_stability_penalizes_narrow_band_support() {
     );
     assert_eq!(anchor_quality.channel_populated_band_count, [1, 1, 1]);
     assert_eq!(anchor_quality.channel_unstable, [true, true, true]);
-    assert!(
-        matches!(
-            diagnostics.candidate_risk.as_str(),
-            "review_anchor_support" | "review_gamut"
-        ),
-        "unstable anchors should keep the candidate in review even when another risk is stronger: {:?}",
-        diagnostics
+    assert_eq!(diagnostics.candidate_risk, "fallback_only");
+    assert_eq!(
+        diagnostics.mapping_strategy,
+        "neutral_balance_evidence_rescue"
     );
-    let selected_score = diagnostics
-        .candidate_scores
-        .iter()
-        .find(|score| score.selected)
-        .expect("selected score");
-    assert!(
-        selected_score.quality_components.anchor_stability_penalty > 0.0,
-        "candidate score should include anchor stability risk: {:?}",
-        selected_score
+    assert_eq!(diagnostics.selected_candidate, "neutral_balance_fallback");
+    assert!(diagnostics.neutral_safety_rescue.evaluated);
+    assert!(diagnostics.neutral_safety_rescue.applied);
+    assert_eq!(
+        diagnostics
+            .neutral_safety_rescue
+            .matrix_candidate
+            .as_deref(),
+        Some("gamut_trusted_image_matrix_blend")
     );
     assert_eq!(
-        selected_score.dominant_anchor_unstable_channels,
+        diagnostics
+            .neutral_safety_rescue
+            .matrix_anchor_evidence_supported,
+        Some(false)
+    );
+    assert!(diagnostics
+        .neutral_safety_rescue
+        .preserved_ratio_gain
+        .is_some_and(|gain| gain >= 0.50));
+    assert!(diagnostics
+        .neutral_safety_rescue
+        .midtone_saturation_p95_reduction
+        .is_some_and(|reduction| reduction >= 0.30));
+    assert_eq!(
+        scanstitch::colorspace::tone_color_trust_state(&diagnostics),
+        "review_required"
+    );
+    assert!(diagnostics.candidate_acceptance.iter().any(|candidate| {
+        candidate.candidate == "neutral_balance_fallback"
+            && candidate.status == "selected_evidence_rescue"
+    }));
+    let superseded_score = diagnostics
+        .candidate_scores
+        .iter()
+        .find(|score| {
+            Some(score.candidate)
+                == diagnostics
+                    .neutral_safety_rescue
+                    .matrix_candidate
+                    .as_deref()
+        })
+        .expect("superseded image-derived score");
+    assert!(
+        superseded_score.quality_components.anchor_stability_penalty > 0.0,
+        "candidate score should include anchor stability risk: {:?}",
+        superseded_score
+    );
+    assert_eq!(
+        superseded_score.dominant_anchor_unstable_channels,
         [true, true, true]
     );
 }
@@ -1932,4 +2296,201 @@ fn test_reference_patch_evaluation_reports_lab_delta_e_residuals() {
         .reference_patch_delta_e2000_max_delta_vs_image_derived
         .is_some());
     assert!(calibrated_score.quality_components.target_residual_penalty > 0.0);
+}
+
+#[test]
+fn held_out_root_polynomial_is_applied_when_scene_support_and_quality_pass() {
+    let (profile, held_out) = nonlinear_calibration_profile();
+    let mut image = Array3::<f64>::zeros((16, 16, 3));
+    for y in 0..16 {
+        for x in 0..16 {
+            let rgb = held_out[(y * 16 + x) % held_out.len()].source_rgb;
+            for channel in 0..3 {
+                image[[y, x, channel]] = rgb[channel];
+            }
+        }
+    }
+    let result =
+        scanstitch::colorspace::map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
+            &image,
+            Some(&profile),
+            scanstitch::colorspace::ColorMode::Calibrated,
+        )
+        .expect("held-out nonlinear calibrated mapping");
+    assert_eq!(
+        result.diagnostics.selected_candidate,
+        "calibrated_root_polynomial"
+    );
+    let runtime = result
+        .diagnostics
+        .nonlinear_color_model
+        .as_ref()
+        .expect("nonlinear runtime diagnostics");
+    assert_eq!(runtime.support_status, "accepted");
+    assert!(runtime.outside_training_chromaticity_hull_ratio <= 0.35);
+    assert!(!result.diagnostics.neutral_trim_applied);
+    assert!(!result.diagnostics.neutral_safety_rescue.evaluated);
+    assert!(!result.diagnostics.neutral_safety_rescue.applied);
+    assert!(result
+        .diagnostics
+        .neutral_trim_before_after
+        .reason
+        .contains("nonlinear calibration is preserved exactly as held-out validated"));
+
+    let model = profile.color_model.as_ref().unwrap();
+    let expected_xyz =
+        scanstitch::color_calibration::evaluate_root_polynomial_xyz(model, held_out[0].source_rgb);
+    let expected = scanstitch::colorspace::xyz_d50_to_prophoto_matrix()
+        * scanstitch::colorspace::bradford_cat(&profile.whitepoint)
+        * nalgebra::Vector3::new(expected_xyz[0], expected_xyz[1], expected_xyz[2]);
+    for channel in 0..3 {
+        assert!(
+            (result.prophoto[[0, 0, channel]]
+                - expected[channel] / result.diagnostics.exposure_scale)
+                .abs()
+                < 1e-9
+        );
+    }
+}
+
+#[test]
+fn root_polynomial_falls_back_to_matrix_outside_measured_scene_support() {
+    let (profile, _) = nonlinear_calibration_profile();
+    let mut image = Array3::<f64>::zeros((16, 16, 3));
+    for y in 0..16 {
+        for x in 0..16 {
+            image[[y, x, 0]] = 1.0;
+            image[[y, x, 1]] = 0.001;
+            image[[y, x, 2]] = 0.001;
+        }
+    }
+    let result =
+        scanstitch::colorspace::map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
+            &image,
+            Some(&profile),
+            scanstitch::colorspace::ColorMode::Calibrated,
+        )
+        .expect("matrix fallback remains a calibrated candidate");
+    assert_eq!(
+        result.diagnostics.selected_candidate,
+        "calibrated_direct_profile"
+    );
+    let nonlinear = result
+        .diagnostics
+        .candidate_scores
+        .iter()
+        .find(|candidate| candidate.candidate == "calibrated_root_polynomial")
+        .expect("nonlinear candidate audit");
+    assert!(nonlinear.rejected);
+    assert!(nonlinear
+        .rejection_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("target-domain support rejected")));
+}
+
+#[test]
+fn held_out_residual_lut_is_applied_inside_measured_scene_support() {
+    let (profile, held_out) = residual_lut_calibration_profile();
+    let model = profile.lut_3d_model.as_ref().expect("residual LUT model");
+    let supported = held_out
+        .iter()
+        .filter(|patch| {
+            scanstitch::color_calibration::residual_lut_3d_has_full_support(model, patch.source_rgb)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        supported.len() >= 64,
+        "synthetic scene needs broad LUT support"
+    );
+    let mut image = Array3::<f64>::zeros((16, 16, 3));
+    for y in 0..16 {
+        for x in 0..16 {
+            let rgb = supported[(y * 16 + x) % supported.len()].source_rgb;
+            for channel in 0..3 {
+                image[[y, x, channel]] = rgb[channel];
+            }
+        }
+    }
+
+    let result =
+        scanstitch::colorspace::map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
+            &image,
+            Some(&profile),
+            scanstitch::colorspace::ColorMode::Calibrated,
+        )
+        .expect("held-out residual LUT calibrated mapping");
+    assert_eq!(
+        result.diagnostics.selected_candidate,
+        "calibrated_residual_lut_3d"
+    );
+    let runtime = result
+        .diagnostics
+        .nonlinear_color_model
+        .as_ref()
+        .expect("residual LUT runtime diagnostics");
+    assert_eq!(runtime.model_type, "residual_lut_3d");
+    assert_eq!(runtime.grid_size, Some(5));
+    assert_eq!(runtime.baseline_kind, "matrix");
+    assert_eq!(runtime.support_status, "accepted");
+    assert!(runtime.full_model_application_ratio >= 0.65);
+    assert!(!result.diagnostics.neutral_trim_applied);
+    assert!(!result.diagnostics.neutral_safety_rescue.evaluated);
+    assert!(!result.diagnostics.neutral_safety_rescue.applied);
+
+    let expected_xyz = scanstitch::color_calibration::evaluate_residual_lut_3d_xyz(
+        model,
+        &profile.work_to_xyz,
+        None,
+        supported[0].source_rgb,
+    );
+    let expected = scanstitch::colorspace::xyz_d50_to_prophoto_matrix()
+        * scanstitch::colorspace::bradford_cat(&profile.whitepoint)
+        * Vector3::new(expected_xyz[0], expected_xyz[1], expected_xyz[2]);
+    for channel in 0..3 {
+        assert!(
+            (result.prophoto[[0, 0, channel]]
+                - expected[channel] / result.diagnostics.exposure_scale)
+                .abs()
+                < 1e-9
+        );
+    }
+}
+
+#[test]
+fn residual_lut_falls_back_to_matrix_outside_measured_rgb_volume() {
+    let (profile, _) = residual_lut_calibration_profile();
+    let mut image = Array3::<f64>::zeros((16, 16, 3));
+    image.fill(1.25);
+
+    let result =
+        scanstitch::colorspace::map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
+            &image,
+            Some(&profile),
+            scanstitch::colorspace::ColorMode::Calibrated,
+        )
+        .expect("matrix fallback remains available outside the LUT volume");
+    assert_eq!(
+        result.diagnostics.selected_candidate,
+        "calibrated_direct_profile"
+    );
+    let lut = result
+        .diagnostics
+        .candidate_scores
+        .iter()
+        .find(|candidate| candidate.candidate == "calibrated_residual_lut_3d")
+        .expect("residual LUT candidate audit");
+    assert!(lut.rejected);
+    assert!(lut.rejection_reason.as_deref().is_some_and(|reason| {
+        reason.contains("target-domain support rejected")
+            && reason.contains("outside the measured 3D LUT input domain")
+    }));
+    let runtime = result
+        .diagnostics
+        .nonlinear_color_model
+        .as_ref()
+        .expect("residual LUT rejection diagnostics");
+    assert_eq!(runtime.model_type, "residual_lut_3d");
+    assert_eq!(runtime.support_status, "rejected");
+    assert_eq!(runtime.outside_training_input_domain_ratio, 1.0);
+    assert_eq!(runtime.full_model_application_ratio, 0.0);
 }

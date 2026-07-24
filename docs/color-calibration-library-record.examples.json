@@ -1,6 +1,6 @@
 {
   "scanner_profile": {
-    "schema_version": 1,
+    "schema_version": 2,
     "record_type": "scanner_profile",
     "profile_id": "example-coolscan-vuescan-raw",
     "source_space": {
@@ -29,11 +29,46 @@
       [0.2880, 0.7119, 0.0001],
       [0.0000, 0.0000, 0.8251]
     ],
+    "scanner_linearization": {
+      "model_id": "example-coolscan-linearization-v1",
+      "curves": {
+        "red": [[0.0, 0.0], [0.25, 0.0625], [0.5, 0.25], [0.75, 0.5625], [1.0, 1.0]],
+        "green": [[0.0, 0.0], [0.25, 0.0625], [0.5, 0.25], [0.75, 0.5625], [1.0, 1.0]],
+        "blue": [[0.0, 0.0], [0.25, 0.0625], [0.5, 0.25], [0.75, 0.5625], [1.0, 1.0]]
+      },
+      "black_level_normalized": [0.01, 0.01, 0.01],
+      "white_level_normalized": [0.99, 0.99, 0.99],
+      "additive_flare_normalized": [0.002, 0.002, 0.002],
+      "shading_gain_polynomial": [
+        [1.0, 0.01, 0.0, 0.0, 0.0, 0.0],
+        [1.0, 0.01, 0.0, 0.0, 0.0, 0.0],
+        [1.0, 0.01, 0.0, 0.0, 0.0, 0.0]
+      ],
+      "confidence": 0.95,
+      "validation": {
+        "held_out_sample_count": 24,
+        "transmittance_rmse": 0.002,
+        "transmittance_max_error": 0.008,
+        "identity_baseline_rmse": 0.08
+      }
+    },
+    "target_patch_signal_domain": "scanner_linearized_transmittance",
+    "target_patch_linearization_model_id": "example-coolscan-linearization-v1",
     "fit": {
       "method": "least_squares_rgb_to_xyz",
       "patch_count": 24,
       "target_residual_rms": 0.006,
       "target_residual_max": 0.018,
+      "validation": {
+        "evaluation_set": "held_out",
+        "training_patch_count": 24,
+        "held_out_patch_count": 24,
+        "training_residual_rms": 0.004,
+        "training_residual_max": 0.012,
+        "identity_baseline_residual_rms": 0.12,
+        "identity_baseline_residual_max": 0.25,
+        "held_out_identity_improvement_fraction": 0.95
+      },
       "per_hue_residuals": [
         {
           "hue_family": "red",
@@ -60,7 +95,7 @@
     "auto_match": false
   },
   "roll_profile": {
-    "schema_version": 1,
+    "schema_version": 2,
     "record_type": "roll_profile",
     "profile_id": "example-logan-roll",
     "scanner_profile_id": "example-coolscan-vuescan-raw",
@@ -78,11 +113,51 @@
       [0.0, 1.0, 0.0],
       [0.0, 0.0, 1.0]
     ],
+    "scanner_color_model_application": {
+      "transform": "matrix",
+      "output_domain": "reference_xyz_d50",
+      "numerical_zero_tolerance": 1e-12,
+      "numerical_zero_clamp_count": 0
+    },
+    "target_patch_signal_domain": "scanner_linearized_transmittance",
+    "target_patch_linearization_model_id": "example-coolscan-linearization-v1",
+    "negative_response": {
+      "model_id": "example-logan-roll-response-v1",
+      "scanner_density_to_layer_density": [
+        [1.0, -0.08, 0.01],
+        [-0.04, 1.0, -0.05],
+        [0.01, -0.04, 1.0]
+      ],
+      "characteristic_curves": {
+        "red": [[0.0, 0.0], [0.25, 0.25], [0.70, 0.75], [1.30, 1.40]],
+        "green": [[0.0, 0.0], [0.30, 0.25], [0.85, 0.75], [1.45, 1.40]],
+        "blue": [[0.0, 0.0], [0.20, 0.25], [0.62, 0.75], [1.18, 1.40]]
+      },
+      "white_anchor_percentile": 0.995,
+      "confidence": 0.94,
+      "validation": {
+        "held_out_patch_count": 24,
+        "delta_e00_rms": 1.8,
+        "delta_e00_max": 4.9,
+        "unit_slope_delta_e00_rms": 8.2,
+        "worst_hue_family": "deep-blue"
+      }
+    },
     "fit": {
       "method": "least_squares_xyz_post_scanner_correction",
       "patch_count": 12,
       "target_residual_rms": 0.012,
-      "target_residual_max": 0.031
+      "target_residual_max": 0.031,
+      "validation": {
+        "evaluation_set": "held_out",
+        "training_patch_count": 18,
+        "held_out_patch_count": 12,
+        "training_residual_rms": 0.009,
+        "training_residual_max": 0.024,
+        "identity_baseline_residual_rms": 0.05,
+        "identity_baseline_residual_max": 0.12,
+        "held_out_identity_improvement_fraction": 0.76
+      }
     },
     "scanner_settings_fingerprint": "fnv1a64:8dd3282dc8a98ba4",
     "confidence": 0.85

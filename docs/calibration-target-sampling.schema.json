@@ -1,0 +1,285 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/scanstitch/calibration-target-sampling.schema.json",
+  "title": "ScanStitch Calibration Target Sampling Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "measurement",
+    "scanner_signal_bit_depth",
+    "grid",
+    "patches",
+    "captures"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "scanner_signal_bit_depth": {
+      "description": "Effective scanner code range; use 14 for 14-bit samples padded into a 16-bit TIFF container.",
+      "type": "integer",
+      "minimum": 8,
+      "maximum": 16
+    },
+    "measurement": {
+      "description": "Metadata copied into the generated scanner-target or roll-target measurement JSON.",
+      "type": "object",
+      "required": ["target", "reference"],
+      "properties": {
+        "target": { "type": "object" },
+        "reference": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    "grid": { "$ref": "#/$defs/grid" },
+    "patches": {
+      "type": "array",
+      "minItems": 12,
+      "items": { "$ref": "#/$defs/referencePatch" }
+    },
+    "reference_review": {
+      "$ref": "#/$defs/referenceReview"
+    },
+    "captures": {
+      "type": "array",
+      "minItems": 2,
+      "items": { "$ref": "#/$defs/capture" },
+      "allOf": [
+        {
+          "contains": {
+            "type": "object",
+            "properties": { "role": { "const": "training" } },
+            "required": ["role"]
+          },
+          "minContains": 1
+        },
+        {
+          "contains": {
+            "type": "object",
+            "properties": { "role": { "const": "held_out" } },
+            "required": ["role"]
+          },
+          "minContains": 1
+        }
+      ]
+    },
+    "quality": { "$ref": "#/$defs/quality" },
+    "preview_max_dimension": {
+      "type": "integer",
+      "minimum": 512,
+      "maximum": 4096,
+      "default": 1800
+    }
+  },
+  "$defs": {
+    "finitePair": {
+      "type": "array",
+      "prefixItems": [
+        { "type": "number" },
+        { "type": "number" }
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "finiteVector3": {
+      "type": "array",
+      "prefixItems": [
+        { "type": "number" },
+        { "type": "number" },
+        { "type": "number" }
+      ],
+      "items": false,
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "grid": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rows", "columns"],
+      "properties": {
+        "rows": { "type": "integer", "minimum": 1 },
+        "columns": { "type": "integer", "minimum": 1 },
+        "patch_inset_fraction": {
+          "type": "number",
+          "minimum": 0.05,
+          "maximum": 0.4,
+          "default": 0.2
+        },
+        "samples_per_axis": {
+          "type": "integer",
+          "minimum": 9,
+          "maximum": 101,
+          "default": 25
+        }
+      }
+    },
+    "referencePatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "row", "column"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "row": { "type": "integer", "minimum": 0 },
+        "column": { "type": "integer", "minimum": 0 },
+        "reference_xyz": { "$ref": "#/$defs/finiteVector3" },
+        "xyz": { "$ref": "#/$defs/finiteVector3" },
+        "reference_lab": { "$ref": "#/$defs/finiteVector3" },
+        "lab": { "$ref": "#/$defs/finiteVector3" }
+      },
+      "oneOf": [
+        {
+          "required": ["reference_xyz"],
+          "not": {
+            "anyOf": [
+              { "required": ["xyz"] },
+              { "required": ["reference_lab"] },
+              { "required": ["lab"] }
+            ]
+          }
+        },
+        {
+          "required": ["xyz"],
+          "not": {
+            "anyOf": [
+              { "required": ["reference_xyz"] },
+              { "required": ["reference_lab"] },
+              { "required": ["lab"] }
+            ]
+          }
+        },
+        {
+          "required": ["reference_lab"],
+          "not": {
+            "anyOf": [
+              { "required": ["reference_xyz"] },
+              { "required": ["xyz"] },
+              { "required": ["lab"] }
+            ]
+          }
+        },
+        {
+          "required": ["lab"],
+          "not": {
+            "anyOf": [
+              { "required": ["reference_xyz"] },
+              { "required": ["xyz"] },
+              { "required": ["reference_lab"] }
+            ]
+          }
+        }
+      ]
+    },
+    "capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "role", "image", "corners"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "role": { "enum": ["training", "held_out"] },
+        "image": { "type": "string", "minLength": 1 },
+        "corners": {
+          "description": "Outer corners of the rectangular patch-grid footprint (not the backing board) in decoded, EXIF-oriented pixel coordinates.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "top_left",
+            "top_right",
+            "bottom_right",
+            "bottom_left"
+          ],
+          "properties": {
+            "top_left": { "$ref": "#/$defs/finitePair" },
+            "top_right": { "$ref": "#/$defs/finitePair" },
+            "bottom_right": { "$ref": "#/$defs/finitePair" },
+            "bottom_left": { "$ref": "#/$defs/finitePair" }
+          }
+        },
+        "corner_review": {
+          "$ref": "#/$defs/cornerReview"
+        }
+      }
+    },
+    "cornerReview": {
+      "description": "Human approval binding the declared chart corners to the exact orientation-materialized decoded pixels, ordered corner coordinates, and rendered review-overlay pixels. Omit or leave approved=false while preparing overlays.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approved",
+        "decoded_pixel_sha256",
+        "chart_corners_sha256",
+        "overlay_pixel_sha256"
+      ],
+      "properties": {
+        "approved": { "type": "boolean" },
+        "decoded_pixel_sha256": { "$ref": "#/$defs/sha256Hex" },
+        "chart_corners_sha256": { "$ref": "#/$defs/sha256Hex" },
+        "overlay_pixel_sha256": { "$ref": "#/$defs/sha256Hex" }
+      }
+    },
+    "sha256Hex": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$"
+    },
+    "referenceReview": {
+      "description": "Human approval that the embedded patch IDs, grid positions, and XYZ/Lab values were checked against the named factual reference dataset. Omit or leave approved=false until verified.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approved",
+        "reference_patch_sha256"
+      ],
+      "properties": {
+        "approved": { "type": "boolean" },
+        "reference_patch_sha256": { "$ref": "#/$defs/sha256Hex" }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "minimum_source_bits_per_sample": {
+          "type": "integer",
+          "minimum": 8,
+          "maximum": 16,
+          "default": 12
+        },
+        "minimum_retained_fraction": {
+          "type": "number",
+          "minimum": 0.5,
+          "maximum": 1,
+          "default": 0.7
+        },
+        "maximum_clipped_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 0.2,
+          "default": 0.01
+        },
+        "maximum_channel_robust_spread": {
+          "type": "number",
+          "minimum": 0.005,
+          "maximum": 0.5,
+          "default": 0.08
+        },
+        "maximum_spatial_cell_delta": {
+          "type": "number",
+          "minimum": 0.002,
+          "maximum": 0.5,
+          "default": 0.04
+        },
+        "outlier_z_limit": {
+          "type": "number",
+          "minimum": 3,
+          "maximum": 12,
+          "default": 6
+        },
+        "clipping_margin": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 0.05,
+          "default": 0.0001
+        }
+      }
+    }
+  }
+}

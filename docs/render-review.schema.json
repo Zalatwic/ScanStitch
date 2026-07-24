@@ -1,0 +1,188 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/scanstitch/render-review.schema.json",
+  "title": "ScanStitch Hash-Bound Human Render Review",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "fixture",
+    "review_status",
+    "instructions",
+    "source_report",
+    "source_report_sha256",
+    "technical_delivery_reviewable",
+    "input_component_count",
+    "stitch_applicable",
+    "grain_reduction_applicable",
+    "grain_reduction_control",
+    "inputs",
+    "artifacts",
+    "decisions",
+    "reviewer",
+    "reviewed_at",
+    "review_notes"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "fixture": { "$ref": "#/$defs/nonEmptyString" },
+    "review_status": { "enum": ["requires_human_approval", "approved"] },
+    "instructions": { "$ref": "#/$defs/nonEmptyString" },
+    "source_report": { "$ref": "#/$defs/nonEmptyString" },
+    "source_report_sha256": { "$ref": "#/$defs/sha256Hex" },
+    "technical_delivery_reviewable": { "type": "boolean" },
+    "input_component_count": { "type": "integer", "minimum": 1 },
+    "stitch_applicable": { "type": "boolean" },
+    "grain_reduction_applicable": { "type": "boolean" },
+    "grain_reduction_control": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/grainControlBinding" }
+      ]
+    },
+    "inputs": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/inputBinding" }
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 2,
+      "items": { "$ref": "#/$defs/artifactBinding" }
+    },
+    "decisions": { "$ref": "#/$defs/decisions" },
+    "reviewer": { "type": ["string", "null"] },
+    "reviewed_at": { "type": ["string", "null"], "format": "date-time" },
+    "review_notes": { "type": ["string", "null"] }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "grain_reduction_applicable": { "const": true } },
+        "required": ["grain_reduction_applicable"]
+      },
+      "then": {
+        "properties": {
+          "grain_reduction_control": { "$ref": "#/$defs/grainControlBinding" }
+        }
+      },
+      "else": {
+        "properties": { "grain_reduction_control": { "type": "null" } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "review_status": { "const": "approved" } },
+        "required": ["review_status"]
+      },
+      "then": {
+        "properties": {
+          "reviewer": { "$ref": "#/$defs/nonEmptyString" },
+          "reviewed_at": {
+            "type": "string",
+            "minLength": 1,
+            "format": "date-time"
+          },
+          "review_notes": { "$ref": "#/$defs/nonEmptyString" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sha256Hex": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$"
+    },
+    "artifactBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "sha256", "file_size_bytes"],
+      "properties": {
+        "kind": {
+          "enum": ["primary_output", "master_scene_referred", "review_srgb"]
+        },
+        "path": { "$ref": "#/$defs/nonEmptyString" },
+        "sha256": { "$ref": "#/$defs/sha256Hex" },
+        "file_size_bytes": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "inputBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "component_index",
+        "path",
+        "sha256",
+        "file_size_bytes",
+        "decoded_pixel_sha256"
+      ],
+      "properties": {
+        "component_index": { "type": "integer", "minimum": 1 },
+        "path": { "$ref": "#/$defs/nonEmptyString" },
+        "sha256": { "$ref": "#/$defs/sha256Hex" },
+        "file_size_bytes": { "type": "integer", "minimum": 1 },
+        "decoded_pixel_sha256": { "$ref": "#/$defs/sha256Hex" }
+      }
+    },
+    "grainControlBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "purpose",
+        "source_report",
+        "source_report_sha256",
+        "technical_delivery_reviewable",
+        "artifacts"
+      ],
+      "properties": {
+        "purpose": { "const": "grain_reduction_off_control" },
+        "source_report": { "$ref": "#/$defs/nonEmptyString" },
+        "source_report_sha256": { "$ref": "#/$defs/sha256Hex" },
+        "technical_delivery_reviewable": { "const": true },
+        "artifacts": {
+          "type": "array",
+          "minItems": 3,
+          "items": { "$ref": "#/$defs/artifactBinding" }
+        }
+      }
+    },
+    "reviewDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["applicable", "approved", "notes"],
+      "properties": {
+        "applicable": { "type": "boolean" },
+        "approved": { "type": "boolean" },
+        "notes": { "type": ["string", "null"] }
+      }
+    },
+    "decisions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "orientation_and_retained_content",
+        "border_crop_and_no_lost_content",
+        "stitch_geometry_and_full_union",
+        "seam_tone_color_texture_sharpness",
+        "color_and_neutrality",
+        "tone_and_dynamic_range",
+        "grain_and_fine_detail",
+        "overall_visual_preference"
+      ],
+      "properties": {
+        "orientation_and_retained_content": { "$ref": "#/$defs/reviewDecision" },
+        "border_crop_and_no_lost_content": { "$ref": "#/$defs/reviewDecision" },
+        "stitch_geometry_and_full_union": { "$ref": "#/$defs/reviewDecision" },
+        "seam_tone_color_texture_sharpness": { "$ref": "#/$defs/reviewDecision" },
+        "color_and_neutrality": { "$ref": "#/$defs/reviewDecision" },
+        "tone_and_dynamic_range": { "$ref": "#/$defs/reviewDecision" },
+        "grain_and_fine_detail": { "$ref": "#/$defs/reviewDecision" },
+        "overall_visual_preference": { "$ref": "#/$defs/reviewDecision" }
+      }
+    }
+  }
+}

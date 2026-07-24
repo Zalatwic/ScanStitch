@@ -47,16 +47,34 @@ jobs:
 
       - name: Test fast integration suites
         run: |
-          cargo test --locked --test test_base_detect --test test_border --test test_colorspace --test test_density --test test_ica --test test_tiff_io --test test_tonemap -- --test-threads=1
+          cargo test --locked --test test_base_detect --test test_border --test test_color_calibration --test test_colorspace --test test_density --test test_deskew --test test_ica --test test_interactive --test test_scanner_linearization --test test_tiff_io --test test_tonemap --test test_white_balance -- --test-threads=1
           cargo test --locked --test test_pipeline -- --test-threads=1
           cargo test --locked --test test_stitch -- --test-threads=1 --skip test_real_sample_pair_uses_rgba8_load_path_and_accepts_narrow_overlap_stitch
 
-      - name: Build OpenCV feature when native dependencies are available
-        if: runner.os == 'Linux'
-        shell: bash
+  opencv-native:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: opencv-native
+
+      - name: Install pinned Ubuntu native build dependencies
         run: |
-          if command -v llvm-config >/dev/null 2>&1 && pkg-config --exists opencv4; then
-            cargo build --locked --features use-opencv
-          else
-            echo "Skipping use-opencv build: llvm-config and opencv4 pkg-config metadata are not both available."
-          fi
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends clang libopencv-dev libclang-dev llvm-dev pkg-config
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+
+      - name: Verify native dependency discovery
+        run: |
+          llvm-config --version
+          pkg-config --modversion opencv4
+
+      - name: Build and execute the OpenCV feature tests
+        run: cargo test --locked --features use-opencv --lib -- --test-threads=1

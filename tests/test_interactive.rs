@@ -14,8 +14,10 @@ use tempfile::TempDir;
 
 fn test_cli(output_dir: std::path::PathBuf) -> scanstitch::cli::Cli {
     scanstitch::cli::Cli {
-        component1: output_dir.join("component1.tiff"),
-        component2: output_dir.join("component2.tiff"),
+        inputs: vec![
+            output_dir.join("component1.tiff"),
+            output_dir.join("component2.tiff"),
+        ],
         output_dir,
         calibration_profile: None,
         calibration_library: None,
@@ -31,6 +33,9 @@ fn test_cli(output_dir: std::path::PathBuf) -> scanstitch::cli::Cli {
         input_mode: scanstitch::cli::InputMode::Negative,
         render_intent: scanstitch::cli::RenderIntent::ModernClean,
         quality_mode: scanstitch::cli::QualityMode::Perfect,
+        white_balance: scanstitch::cli::WhiteBalanceArgs::default(),
+        geometry: scanstitch::cli::GeometryArgs::default(),
+        grain: scanstitch::cli::GrainReductionArgs::default(),
         write_master: false,
         review_sidecar: None,
         write_review_sidecar: None,
@@ -42,6 +47,7 @@ fn test_cli(output_dir: std::path::PathBuf) -> scanstitch::cli::Cli {
         ica_tol: 1e-4,
         bit_depth: 14,
         use_opencv: false,
+        require_reviewable: false,
     }
 }
 
@@ -51,8 +57,7 @@ fn pipeline_cli(
     output_dir: std::path::PathBuf,
 ) -> scanstitch::cli::Cli {
     scanstitch::cli::Cli {
-        component1,
-        component2,
+        inputs: vec![component1, component2],
         output_dir,
         calibration_profile: None,
         calibration_library: None,
@@ -68,6 +73,9 @@ fn pipeline_cli(
         input_mode: scanstitch::cli::InputMode::Negative,
         render_intent: scanstitch::cli::RenderIntent::ModernClean,
         quality_mode: scanstitch::cli::QualityMode::Perfect,
+        white_balance: scanstitch::cli::WhiteBalanceArgs::default(),
+        geometry: scanstitch::cli::GeometryArgs::default(),
+        grain: scanstitch::cli::GrainReductionArgs::default(),
         write_master: false,
         review_sidecar: None,
         write_review_sidecar: None,
@@ -79,6 +87,7 @@ fn pipeline_cli(
         ica_tol: 1e-4,
         bit_depth: 14,
         use_opencv: false,
+        require_reviewable: false,
     }
 }
 
@@ -113,6 +122,14 @@ fn test_cache(output_dir: std::path::PathBuf, prophoto: Array3<f64>) -> Interact
         output_path,
         run_started_at: SystemTime::now(),
         base_confidence: 1.0,
+        geometry_review_required: false,
+        geometry_review_reason: "positive test cache".to_string(),
+        input_mode_review_required: false,
+        input_mode_review_reason: "positive test cache".to_string(),
+        negative_response_review_required: false,
+        negative_response_review_reason: "positive test cache".to_string(),
+        technical_white_balance_review_required: false,
+        technical_white_balance_review_reason: "positive test cache".to_string(),
     }
 }
 
@@ -140,6 +157,58 @@ fn control_defaults_match_auto_tone_fit() {
     assert_eq!(controls.slope, cache.auto_tone_params.slope);
     assert_eq!(controls.toe_lift, cache.auto_tone_params.toe_lift);
     assert_eq!(controls.shoulder_max, cache.auto_tone_params.shoulder_max);
+    assert!(!controls.grain_reduction_enabled);
+    assert_eq!(controls.grain_reduction_strength, 0.5);
+    assert_eq!(controls.grain_reduction_scale, 1.0);
+}
+
+#[test]
+fn independent_grain_controls_apply_under_film_faithful_intent() {
+    let tmp = TempDir::new().unwrap();
+    let mut prophoto = Array3::<f64>::from_elem((41, 41, 3), 0.38);
+    for y in 0..41 {
+        for x in 0..41 {
+            let sign = if (x + y) % 2 == 0 { 1.0 } else { -1.0 };
+            prophoto[[y, x, 0]] += 0.07 * sign;
+            prophoto[[y, x, 2]] -= 0.07 * sign;
+        }
+    }
+    let mut cache = test_cache(tmp.path().join("output"), prophoto);
+    cache.cli.render_intent = scanstitch::cli::RenderIntent::FilmFaithful;
+    let mut controls = cache.default_controls();
+    controls.grain_reduction_enabled = true;
+    controls.grain_reduction_strength = 0.8;
+    controls.grain_reduction_scale = 1.5;
+
+    let result = interactive::render_interactive_image(&cache, &controls);
+
+    assert!(result.diagnostics.noise_reduction_enabled);
+    assert_eq!(result.diagnostics.noise_reduction_requested_strength, 0.8);
+    assert_eq!(result.diagnostics.noise_reduction_requested_scale, 1.5);
+    assert_eq!(result.diagnostics.noise_reduction_radius, 3);
+    assert!(result.diagnostics.noise_reduction_mean_abs_chroma_delta > 0.0);
+    assert!(result.diagnostics.noise_reduction_applied_ratio > 0.0);
+    assert!(result.diagnostics.noise_reduction_structure_excluded_ratio > 0.0);
+}
+
+#[test]
+fn command_line_grain_policy_seeds_batch_and_review_defaults() {
+    let tmp = TempDir::new().unwrap();
+    let mut cache = test_cache(
+        tmp.path().join("output"),
+        Array3::<f64>::from_elem((8, 8, 3), 0.25),
+    );
+    cache.cli.grain = scanstitch::cli::GrainReductionArgs {
+        grain_reduction: scanstitch::cli::GrainReductionMode::On,
+        grain_strength: 0.6,
+        grain_scale: 1.75,
+    };
+
+    let controls = cache.default_controls();
+
+    assert!(controls.grain_reduction_enabled);
+    assert_eq!(controls.grain_reduction_strength, 0.6);
+    assert_eq!(controls.grain_reduction_scale, 1.75);
 }
 
 #[test]
@@ -166,6 +235,26 @@ fn exposure_ev_scales_render_luminance_without_changing_dimensions() {
 
     assert_eq!(base.dim(), brighter.dim());
     assert!(mean_luminance(&brighter) > mean_luminance(&base));
+}
+
+#[test]
+fn creative_white_balance_controls_change_preview_without_mutating_technical_cache() {
+    let tmp = TempDir::new().unwrap();
+    let prophoto = Array3::<f64>::from_elem((16, 20, 3), 0.3);
+    let cache = test_cache(tmp.path().join("output"), prophoto.clone());
+    let neutral_controls = cache.default_controls();
+    let warm_controls = InteractiveRenderControls {
+        creative_temperature: 0.8,
+        creative_tint: 0.3,
+        ..neutral_controls
+    };
+
+    let neutral = interactive::render_interactive_image(&cache, &neutral_controls).image;
+    let warm = interactive::render_interactive_image(&cache, &warm_controls).image;
+
+    assert_eq!(cache.prophoto, prophoto);
+    assert_eq!(neutral.dim(), warm.dim());
+    assert!(warm[[8, 10, 0]] / warm[[8, 10, 2]] > neutral[[8, 10, 0]] / neutral[[8, 10, 2]]);
 }
 
 #[test]
@@ -247,12 +336,83 @@ fn explicit_interactive_save_writes_output_and_report_metrics() {
         tone_phase.metrics["interactive_controls"]["exposure_ev"],
         serde_json::json!(0.5)
     );
+    assert_eq!(
+        tone_phase.metrics["grain_reduction"]["requested"]["enabled"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        tone_phase.metrics["grain_reduction"]["before"],
+        tone_phase.metrics["grain_reduction"]["after"]
+    );
+    assert_eq!(
+        tone_phase.metrics["render_input_buffer_policy"],
+        "separate_render_buffer_from_cached_interactive_master"
+    );
+    assert_eq!(
+        tone_phase.metrics["scene_referred_master_preservation_policy"],
+        "cached_interactive_master_unchanged"
+    );
     let save_phase = report
         .phases
         .iter()
         .find(|phase| phase.name == "save")
         .expect("save phase");
     assert!(save_phase.metrics["written_review_sidecar_sha256"].is_string());
+    assert_eq!(
+        save_phase.metrics["master_write_timing"],
+        "during_interactive_save"
+    );
+}
+
+#[test]
+fn grain_enabled_save_reports_requested_effective_and_before_after_metrics() {
+    let tmp = TempDir::new().unwrap();
+    let output_dir = tmp.path().join("grain-output");
+    let mut prophoto = Array3::<f64>::from_elem((41, 41, 3), 0.38);
+    for y in 0..41 {
+        for x in 0..41 {
+            let sign = if (x + y) % 2 == 0 { 1.0 } else { -1.0 };
+            prophoto[[y, x, 0]] += 0.07 * sign;
+            prophoto[[y, x, 2]] -= 0.07 * sign;
+        }
+    }
+    let cache = test_cache(output_dir, prophoto);
+    let mut controls = cache.default_controls();
+    controls.grain_reduction_enabled = true;
+    controls.grain_reduction_strength = 0.75;
+    controls.grain_reduction_scale = 2.0;
+
+    let report = scanstitch::pipeline::save_interactive_render(&cache, &controls).unwrap();
+    let tone = &report
+        .phases
+        .iter()
+        .find(|phase| phase.name == "tone_mapping")
+        .unwrap()
+        .metrics;
+
+    assert_eq!(tone["grain_reduction"]["requested"]["enabled"], true);
+    assert_eq!(tone["grain_reduction"]["requested"]["strength"], 0.75);
+    assert_eq!(tone["grain_reduction"]["requested"]["scale"], 2.0);
+    assert_eq!(tone["grain_reduction"]["effective"]["enabled"], true);
+    assert_eq!(tone["grain_reduction"]["effective"]["radius"], 4);
+    assert!(
+        tone["grain_reduction"]["effect"]["mean_abs_chroma_delta"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
+    assert!(
+        tone["grain_reduction"]["effective"]["applied_ratio"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
+    assert!(
+        tone["grain_reduction"]["effective"]["structure_excluded_ratio"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
 }
 
 #[test]
@@ -271,10 +431,15 @@ fn review_sidecar_roundtrip_applies_controls_and_reports_hash() {
         render_intent: Some("modern-clean".to_string()),
         controls: Some(InteractiveRenderControls {
             exposure_ev: 0.75,
+            creative_temperature: 0.2,
+            creative_tint: -0.1,
             midpoint: 0.33,
             slope: 2.4,
             toe_lift: 0.01,
             shoulder_max: 0.98,
+            grain_reduction_enabled: true,
+            grain_reduction_strength: 0.65,
+            grain_reduction_scale: 1.5,
         }),
         marks: vec![scanstitch::interactive::ReviewMark {
             kind: "neutral_grey".to_string(),
@@ -300,6 +465,9 @@ fn review_sidecar_roundtrip_applies_controls_and_reports_hash() {
     );
     assert_eq!(controls.exposure_ev, 0.75);
     assert_eq!(controls.midpoint, 0.33);
+    assert!(controls.grain_reduction_enabled);
+    assert_eq!(controls.grain_reduction_strength, 0.65);
+    assert_eq!(controls.grain_reduction_scale, 1.5);
 
     cache.cli.review_sidecar = Some(sidecar_path);
     cache.cli.write_review_sidecar = Some(written_sidecar_path);
@@ -314,6 +482,29 @@ fn review_sidecar_roundtrip_applies_controls_and_reports_hash() {
     assert_eq!(save_phase.metrics["review_sidecar_mark_count"], 1);
     assert!(save_phase.metrics["review_sidecar_sha256"].is_string());
     assert!(save_phase.metrics["written_review_sidecar_sha256"].is_string());
+}
+
+#[test]
+fn legacy_review_controls_default_new_grain_fields_without_enabling_smoothing() {
+    let legacy = serde_json::json!({
+        "schema_version": scanstitch::interactive::REVIEW_SIDECAR_SCHEMA_VERSION,
+        "sidecar_type": "scanstitch_guided_review",
+        "controls": {
+            "exposure_ev": 0.25,
+            "midpoint": 0.4,
+            "slope": 2.0,
+            "toe_lift": 0.005,
+            "shoulder_max": 0.995
+        }
+    });
+
+    let sidecar: scanstitch::interactive::ReviewSidecar = serde_json::from_value(legacy).unwrap();
+    let controls = sidecar.controls.unwrap();
+    assert_eq!(controls.creative_temperature, 0.0);
+    assert_eq!(controls.creative_tint, 0.0);
+    assert!(!controls.grain_reduction_enabled);
+    assert_eq!(controls.grain_reduction_strength, 0.5);
+    assert_eq!(controls.grain_reduction_scale, 1.0);
 }
 
 #[test]
@@ -339,11 +530,12 @@ fn interactive_cache_writes_nothing_until_save_and_default_render_matches_batch(
     assert!(!interactive_output_dir.join("output.tiff").exists());
     assert!(!interactive_output_dir.join("report.json").exists());
 
-    scanstitch::pipeline::save_interactive_render(&cache, &cache.default_controls()).unwrap();
+    let interactive_report =
+        scanstitch::pipeline::save_interactive_render(&cache, &cache.default_controls()).unwrap();
 
     let batch_output_dir = tmp.path().join("batch-output");
     let batch_cli = pipeline_cli(path1, path2, batch_output_dir.clone());
-    scanstitch::pipeline::run(&batch_cli).unwrap();
+    let batch_report = scanstitch::pipeline::run(&batch_cli).unwrap();
 
     let interactive_output =
         scanstitch::tiff_io::load_tiff_u16(&interactive_output_dir.join("output.tiff"), 16)
@@ -352,4 +544,49 @@ fn interactive_cache_writes_nothing_until_save_and_default_render_matches_batch(
         scanstitch::tiff_io::load_tiff_u16(&batch_output_dir.join("output.tiff"), 16).unwrap();
 
     assert_eq!(interactive_output.image, batch_output.image);
+    assert_eq!(
+        std::fs::read(interactive_output_dir.join("master_scene_referred.tiff")).unwrap(),
+        std::fs::read(batch_output_dir.join("master_scene_referred.tiff")).unwrap()
+    );
+    assert_eq!(
+        std::fs::read(interactive_output_dir.join("review_srgb.png")).unwrap(),
+        std::fs::read(batch_output_dir.join("review_srgb.png")).unwrap(),
+        "interactive and owned-batch rendering must write the same deterministic proof"
+    );
+    let interactive_proof = image::open(interactive_output_dir.join("review_srgb.png"))
+        .unwrap()
+        .to_rgb8();
+    let batch_proof = image::open(batch_output_dir.join("review_srgb.png"))
+        .unwrap()
+        .to_rgb8();
+    assert_eq!(interactive_proof, batch_proof);
+    let interactive_proof_inspection =
+        scanstitch::tiff_io::inspect_srgb_png(&interactive_output_dir.join("review_srgb.png"))
+            .unwrap();
+    let batch_proof_inspection =
+        scanstitch::tiff_io::inspect_srgb_png(&batch_output_dir.join("review_srgb.png")).unwrap();
+    assert!(interactive_proof_inspection.icc_profile_matches_standard_srgb);
+    assert!(batch_proof_inspection.icc_profile_matches_standard_srgb);
+    assert_eq!(
+        interactive_proof_inspection.icc_profile_description,
+        batch_proof_inspection.icc_profile_description
+    );
+    let interactive_tone = interactive_report
+        .phases
+        .iter()
+        .find(|phase| phase.name == "tone_mapping")
+        .unwrap();
+    let batch_tone = batch_report
+        .phases
+        .iter()
+        .find(|phase| phase.name == "tone_mapping")
+        .unwrap();
+    assert_eq!(
+        interactive_tone.metrics["render_input_buffer_policy"],
+        "separate_render_buffer_from_cached_interactive_master"
+    );
+    assert_eq!(
+        batch_tone.metrics["render_input_buffer_policy"],
+        "owned_scene_buffer_reused_for_batch_render"
+    );
 }

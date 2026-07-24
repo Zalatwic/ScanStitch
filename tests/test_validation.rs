@@ -2,11 +2,28 @@
 
 mod common;
 use common::synthetic;
+use ndarray::{s, Array3};
 use scanstitch::report::{PhaseReport, PipelineReport, RunMetadata};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::Path;
 use std::process::Command;
+
+fn textured_positive_panorama(height: usize, width: usize) -> Array3<u16> {
+    let mut image = Array3::<u16>::zeros((height, width, 3));
+    for y in 0..height {
+        for x in 0..width {
+            let tx = x as f64 / width.saturating_sub(1).max(1) as f64;
+            let ty = y as f64 / height.saturating_sub(1).max(1) as f64;
+            let feature =
+                ((x.wrapping_mul(73) ^ y.wrapping_mul(151) ^ (x * y + 17)) % 997) as f64 / 997.0;
+            image[[y, x, 0]] = ((0.10 + 0.55 * tx + 0.12 * feature) * 16_383.0) as u16;
+            image[[y, x, 1]] = ((0.12 + 0.48 * ty + 0.10 * feature) * 16_383.0) as u16;
+            image[[y, x, 2]] = ((0.14 + 0.34 * (1.0 - tx) + 0.16 * feature) * 16_383.0) as u16;
+        }
+    }
+    image
+}
 
 fn file_sha256_hex(path: &Path) -> String {
     let mut file = std::fs::File::open(path).unwrap();
@@ -74,16 +91,37 @@ fn write_rgba8_tiff(path: &Path, width: u32, height: u32) {
         .unwrap();
 }
 
+fn write_rgb16_tiff_with_orientation(path: &Path, image: &Array3<u16>, orientation: u16) {
+    let (height, width, channels) = image.dim();
+    assert_eq!(channels, 3);
+    let pixels = image.iter().copied().collect::<Vec<_>>();
+    let file = std::fs::File::create(path).unwrap();
+    let mut encoder = tiff::encoder::TiffEncoder::new(std::io::BufWriter::new(file)).unwrap();
+    let mut output = encoder
+        .new_image::<tiff::encoder::colortype::RGB16>(width as u32, height as u32)
+        .unwrap();
+    output
+        .encoder()
+        .write_tag(tiff::tags::Tag::Orientation, orientation)
+        .unwrap();
+    output.write_data(&pixels).unwrap();
+}
+
 fn fixture_report() -> PipelineReport {
     let mut report = PipelineReport::new();
     report.metadata = Some(RunMetadata {
-        report_schema_version: 2,
+        report_schema_version: 3,
         pipeline_schema_version: 1,
         generated_at: "2026-05-01T21:00:00Z".to_string(),
         generated_at_unix_ms: 1_777_665_600_000,
         package_name: "scanstitch".to_string(),
         package_version: "0.1.0".to_string(),
         binary_name: "scanstitch".to_string(),
+        binary_path: Some("V:\\PERSONAL\\PHOTOGRAPHY\\SCANSTITCH\\scanstitch.exe".to_string()),
+        binary_sha256: Some("a".repeat(64)),
+        binary_file_size_bytes: Some(1),
+        binary_identity_status: Some("verified_sha256".to_string()),
+        binary_identity_error: None,
         working_directory: "V:\\PERSONAL\\PHOTOGRAPHY\\SCANSTITCH".to_string(),
         cli_args: vec!["scanstitch".to_string()],
         output_dir: "output".to_string(),
@@ -95,20 +133,236 @@ fn fixture_report() -> PipelineReport {
         serde_json::json!({
             "decision": "accepted",
             "chosen_hypothesis": "[1|2]",
+            "homography_feature_validation": {
+                "accepted": true,
+                "reason": "spatially disjoint cross-fit passed",
+                "partition_method": "4x4_whole_cell_checkerboard_cross_fit",
+                "match_count": 64,
+                "training_match_count": 32,
+                "held_out_match_count": 32,
+                "training_spatial_cell_count": 8,
+                "held_out_spatial_cell_count": 8,
+                "training_inlier_count": 29,
+                "training_inlier_ratio": 0.90625,
+                "training_median_error_px": 0.42,
+                "training_p95_error_px": 1.4,
+                "held_out_inlier_count": 28,
+                "held_out_inlier_ratio": 0.875,
+                "held_out_median_error_px": 0.48,
+                "held_out_p95_error_px": 1.6,
+                "reverse_validation_inlier_count": 29,
+                "reverse_validation_inlier_ratio": 0.90625,
+                "reverse_validation_median_error_px": 0.46,
+                "reverse_validation_p95_error_px": 1.5,
+                "cross_fit_max_disagreement_px": 0.72
+            },
+            "homography_spatial_validation": {
+                "accepted": true,
+                "reason": "homography improved both spatial score partitions",
+                "method": "two_spatial_checkerboard_ncc_splits_against_translation",
+                "baseline_ncc": [0.81, 0.82],
+                "candidate_ncc": [0.91, 0.92],
+                "ncc_improvement": [0.10, 0.10],
+                "mean_ncc_improvement": 0.10,
+                "registration_error_reduction": [0.526, 0.556],
+                "mean_registration_error_reduction": 0.541,
+                "sample_count": [1600, 1590],
+                "maximum_deviation_from_translation_px": 2.4,
+                "transform_right_to_left": [[1.0, 0.0, 380.0], [0.0, 1.0, 0.0], [0.00002, 0.0, 1.0]],
+                "model_selection_limit": "candidate features are fit only on whole-cell training regions"
+            },
             "seam_exposure_correction": {
                 "mode": "auto",
+                "model": "gain_only_scalar",
                 "applied": true,
                 "reason": "applied luma-only overlap gain",
                 "sample_count": 8192,
                 "valid_sample_ratio": 0.72,
                 "gain_rgb": [0.91, 0.91, 0.91],
                 "gain_luma": 0.91,
+                "spatial_gain_log_slope_x_rgb": [0.0, 0.0, 0.0],
+                "spatial_gain_log_slope_x_luma": 0.0,
+                "spatial_gain_log_slope_y_rgb": [0.0, 0.0, 0.0],
+                "spatial_gain_log_slope_y_luma": 0.0,
+                "spatial_gain_log_quadratic_xx_rgb": [0.0, 0.0, 0.0],
+                "spatial_gain_log_quadratic_xx_luma": 0.0,
+                "spatial_gain_log_quadratic_xy_rgb": [0.0, 0.0, 0.0],
+                "spatial_gain_log_quadratic_xy_luma": 0.0,
+                "spatial_gain_log_quadratic_yy_rgb": [0.0, 0.0, 0.0],
+                "spatial_gain_log_quadratic_yy_luma": 0.0,
+                "spatial_gain_top_rgb": [0.91, 0.91, 0.91],
+                "spatial_gain_bottom_rgb": [0.91, 0.91, 0.91],
+                "spatial_offset_slope_x_rgb": [0.0, 0.0, 0.0],
+                "spatial_offset_slope_x_luma": 0.0,
+                "spatial_offset_slope_x_rgb_normalized": [0.0, 0.0, 0.0],
+                "spatial_offset_slope_y_rgb": [0.0, 0.0, 0.0],
+                "spatial_offset_slope_y_luma": 0.0,
+                "spatial_offset_slope_y_rgb_normalized": [0.0, 0.0, 0.0],
+                "spatial_offset_quadratic_xx_rgb": [0.0, 0.0, 0.0],
+                "spatial_offset_quadratic_xx_luma": 0.0,
+                "spatial_offset_quadratic_xx_rgb_normalized": [0.0, 0.0, 0.0],
+                "spatial_offset_quadratic_xy_rgb": [0.0, 0.0, 0.0],
+                "spatial_offset_quadratic_xy_luma": 0.0,
+                "spatial_offset_quadratic_xy_rgb_normalized": [0.0, 0.0, 0.0],
+                "spatial_offset_quadratic_yy_rgb": [0.0, 0.0, 0.0],
+                "spatial_offset_quadratic_yy_luma": 0.0,
+                "spatial_offset_quadratic_yy_rgb_normalized": [0.0, 0.0, 0.0],
+                "spatial_offset_top_rgb": [0.0, 0.0, 0.0],
+                "spatial_offset_bottom_rgb": [0.0, 0.0, 0.0],
+                "spatial_offset_top_rgb_normalized": [0.0, 0.0, 0.0],
+                "spatial_offset_bottom_rgb_normalized": [0.0, 0.0, 0.0],
+                "offset_rgb": [0.0, 0.0, 0.0],
+                "offset_luma": 0.0,
+                "offset_rgb_normalized": [0.0, 0.0, 0.0],
                 "seam_score_before": 0.102,
                 "seam_score_after": 0.018,
                 "clipped_high_before": [0.0, 0.0, 0.0],
                 "clipped_high_after": [0.0, 0.0, 0.0],
                 "clipped_low_before": [0.0, 0.0, 0.0],
-                "clipped_low_after": [0.0, 0.0, 0.0]
+                "clipped_low_after": [0.0, 0.0, 0.0],
+                "training_window_count": 12,
+                "held_out_window_count": 12,
+                "training_sample_count": 4096,
+                "held_out_sample_count": 4096,
+                "spatial_training_window_count": 12,
+                "spatial_held_out_window_count": 12,
+                "spatial_distinct_training_rows": 4,
+                "spatial_distinct_held_out_rows": 4,
+                "spatial_consistent_window_ratio": 1.0,
+                "spatial_slope_agreement_ratio": 0.0,
+                "spatial_affine_training_window_count": 12,
+                "spatial_affine_held_out_window_count": 12,
+                "spatial_affine_distinct_training_rows": 4,
+                "spatial_affine_distinct_held_out_rows": 4,
+                "spatial_affine_consistent_window_ratio": 1.0,
+                "spatial_affine_slope_agreement_ratio": 0.0,
+                "spatial_affine_center_offset_delta_normalized": 0.001,
+                "held_out_identity_seam_score": 0.101,
+                "held_out_gain_seam_score": 0.019,
+                "held_out_gain_offset_seam_score": 0.018,
+                "held_out_spatial_gain_seam_score": 0.019,
+                "held_out_spatial_gain_offset_seam_score": 0.0185,
+                "held_out_selected_seam_score": 0.019,
+                "held_out_improvement_over_identity": 0.082,
+                "held_out_improvement_over_gain": 0.001,
+                "held_out_spatial_improvement_over_best_constant": 0.0,
+                "held_out_spatial_gain_offset_improvement_over_best_simpler": 0.0005,
+                "held_out_validation_passed": true,
+                "gain_offset_rejection_reason": "gain+offset did not materially beat gain-only",
+                "spatial_rejection_reason": "vertical gain field is unnecessary",
+                "spatial_gain_offset_rejection_reason": "vertical gain+offset field is unnecessary",
+                "spatial_2d_validation": {
+                    "coordinate_system": "normalized_overlap_xy_clamped_outside_support",
+                    "training_window_count": 12,
+                    "held_out_window_count": 12,
+                    "distinct_training_rows": 4,
+                    "distinct_held_out_rows": 4,
+                    "distinct_training_columns": 3,
+                    "distinct_held_out_columns": 3,
+                    "gain_consistent_window_ratio": 1.0,
+                    "gain_slope_agreement_ratio": 0.0,
+                    "gain_horizontal_slope_agreement_ratio": 0.0,
+                    "gain_center_log_delta": 0.001,
+                    "gain_offset_consistent_window_ratio": 1.0,
+                    "gain_offset_slope_agreement_ratio": 0.0,
+                    "gain_offset_horizontal_slope_agreement_ratio": 0.0,
+                    "gain_offset_center_gain_log_delta": 0.001,
+                    "gain_offset_center_offset_delta_normalized": 0.001,
+                    "held_out_gain_seam_score": 0.019,
+                    "held_out_gain_offset_seam_score": 0.0185,
+                    "gain_best_simpler_model": "gain-only",
+                    "gain_improvement_over_best_simpler": 0.0,
+                    "gain_offset_best_simpler_model": "gain-only",
+                    "gain_offset_improvement_over_best_simpler": 0.0005,
+                    "gain_accepted": false,
+                    "gain_offset_accepted": false,
+                    "gain_rejection_reason": "2D gain field is unnecessary",
+                    "gain_offset_rejection_reason": "2D gain+offset field is unnecessary",
+                    "quadratic": {
+                        "basis": ["1", "x", "y", "x_squared", "x_y", "y_squared"],
+                        "evaluation_grid_size": 9,
+                        "regularization_lambda": 0.001,
+                        "minimum_windows_per_split": 18,
+                        "minimum_rows_per_split": 6,
+                        "minimum_columns_per_split": 5,
+                        "training_window_count": 12,
+                        "held_out_window_count": 12,
+                        "distinct_training_rows": 4,
+                        "distinct_held_out_rows": 4,
+                        "distinct_training_columns": 3,
+                        "distinct_held_out_columns": 3,
+                        "gain_design_condition_number": 4.5,
+                        "held_out_gain_design_condition_number": 4.6,
+                        "gain_consistent_window_ratio": 1.0,
+                        "gain_curvature_coefficient_agreement_ratio": 0.0,
+                        "gain_max_validation_field_log_delta": 0.001,
+                        "gain_curvature_signal": 0.0,
+                        "estimated_gain_log_quadratic_xx_rgb": [0.0, 0.0, 0.0],
+                        "estimated_gain_log_quadratic_xy_rgb": [0.0, 0.0, 0.0],
+                        "estimated_gain_log_quadratic_yy_rgb": [0.0, 0.0, 0.0],
+                        "gain_grid_min_rgb": [0.91, 0.91, 0.91],
+                        "gain_grid_max_rgb": [0.91, 0.91, 0.91],
+                        "gain_offset_design_condition_number": 0.0,
+                        "held_out_gain_offset_design_condition_number": 0.0,
+                        "gain_offset_consistent_window_ratio": 1.0,
+                        "gain_offset_curvature_coefficient_agreement_ratio": 0.0,
+                        "gain_offset_max_validation_gain_field_log_delta": 0.001,
+                        "gain_offset_max_validation_offset_field_delta_normalized": 0.001,
+                        "gain_offset_curvature_signal": 0.0,
+                        "estimated_gain_offset_log_quadratic_xx_rgb": [0.0, 0.0, 0.0],
+                        "estimated_gain_offset_log_quadratic_xy_rgb": [0.0, 0.0, 0.0],
+                        "estimated_gain_offset_log_quadratic_yy_rgb": [0.0, 0.0, 0.0],
+                        "estimated_gain_offset_quadratic_xx_rgb": [0.0, 0.0, 0.0],
+                        "estimated_gain_offset_quadratic_xy_rgb": [0.0, 0.0, 0.0],
+                        "estimated_gain_offset_quadratic_yy_rgb": [0.0, 0.0, 0.0],
+                        "gain_offset_grid_gain_min_rgb": [0.91, 0.91, 0.91],
+                        "gain_offset_grid_gain_max_rgb": [0.91, 0.91, 0.91],
+                        "gain_offset_grid_offset_abs_max_normalized": 0.0,
+                        "held_out_gain_seam_score": 0.019,
+                        "held_out_gain_offset_seam_score": 0.0185,
+                        "gain_best_simpler_model": "gain-only",
+                        "gain_improvement_over_best_simpler": 0.0,
+                        "gain_offset_best_simpler_model": "gain-only",
+                        "gain_offset_improvement_over_best_simpler": 0.0005,
+                        "gain_accepted": false,
+                        "gain_offset_accepted": false,
+                        "gain_rejection_reason": "insufficient quadratic support",
+                        "gain_offset_rejection_reason": "insufficient quadratic support"
+                    }
+                }
+            },
+            "seam_blend": {
+                "mode": "seam_aware_multiband",
+                "applied": true,
+                "reason": "minimum-cost seam with five frequency bands",
+                "review_required": false,
+                "review_reason": "seam detail and gradient gates passed",
+                "overlap_width_px": 180,
+                "overlap_height_px": 1180,
+                "transition_width_px": 50,
+                "pyramid_levels": 5,
+                "seam_path_mean_normalized_cost": 0.014,
+                "seam_path_p95_normalized_cost": 0.042,
+                "overlap_mean_abs_difference": 0.035,
+                "overlap_p95_abs_difference": 0.161,
+                "output_seam_gradient_p95": 0.009,
+                "source_seam_gradient_p95": 0.016,
+                "output_to_source_seam_gradient_ratio": 0.576,
+                "detail_consistency": {
+                    "method": "multiscale_luma_highpass_energy_disjoint_checkerboard_windows",
+                    "evaluated": true,
+                    "reason": "no repeated severe imbalance",
+                    "supported_scale_count": 3,
+                    "decision_supported": true,
+                    "imbalanced_scale_count": 0,
+                    "maximum_symmetric_energy_ratio": 1.08,
+                    "review_ratio_threshold": 2.0,
+                    "minimum_direction_consistency": 0.75,
+                    "maximum_cross_split_ratio": 1.35,
+                    "minimum_repeated_scale_count": 2,
+                    "review_required": false,
+                    "review_reason": "no repeated severe detail transition"
+                }
             },
             "hypotheses": [
                 {
@@ -163,6 +417,15 @@ fn fixture_report() -> PipelineReport {
             "calibration": {
                 "status": "applied",
                 "source": "external_calibration_profile",
+                "color_mapping_application": {
+                    "evaluated": true,
+                    "applied": false,
+                    "selection_status": "rejected_reference_fit",
+                    "selected_candidate": "neutral_balance_fallback",
+                    "preferred_candidate": "calibrated_direct_profile",
+                    "reason": "calibrated profile regressed synthetic reference patches",
+                    "definition": "whether a calibration or scanner-prior color mapping candidate was selected for the final colorspace output; scanner linearization, film-base, and negative-response calibration are separate application stages"
+                },
                 "external_profile": {
                     "path": "docs/color-calibration-profile.example.json",
                     "profile_id": "synthetic-prophoto-d50"
@@ -483,8 +746,8 @@ fn fixture_report() -> PipelineReport {
                 "preserved_ratio_decreased": false
             },
             "calibration_acceptance": {
-                "status": "accepted",
-                "reason": "calibrated profile beat image-derived score",
+                "status": "rejected_reference_fit",
+                "reason": "calibrated profile regressed synthetic reference patches",
                 "color_mode": "auto",
                 "preferred_candidate": "calibrated_direct_profile",
                 "preferred_candidate_quality_score": 0.31,
@@ -492,6 +755,34 @@ fn fixture_report() -> PipelineReport {
                 "beats_image_derived": true,
                 "within_negative_gamut_limits": true,
                 "forced_by_color_mode": false
+            },
+            "neutral_safety_rescue": {
+                "evaluated": true,
+                "applied": true,
+                "matrix_candidate": "gamut_trusted_image_matrix_blend",
+                "matrix_candidate_kind": "image_derived",
+                "matrix_anchor_evidence_supported": false,
+                "neutral_estimate_supported": true,
+                "neutral_model_evidence_supported": true,
+                "matrix_pre_scale_preserved_ratio": 0.74,
+                "neutral_pre_scale_preserved_ratio": 0.998,
+                "preserved_ratio_gain": 0.258,
+                "minimum_preserved_ratio": 0.97,
+                "minimum_preserved_ratio_gain": 0.10,
+                "matrix_midtone_saturation_p95": 0.94,
+                "neutral_midtone_saturation_p95": 0.66,
+                "midtone_saturation_p95_reduction": 0.28,
+                "maximum_midtone_saturation_p95": 0.85,
+                "minimum_midtone_saturation_p95_reduction": 0.12,
+                "matrix_memory_color_penalty": 0.013,
+                "neutral_memory_color_penalty": 0.0,
+                "matrix_spatial_consistency_penalty": 0.018,
+                "neutral_spatial_consistency_penalty": 0.0,
+                "neutral_saturation_preservation_sample_count": 4096,
+                "neutral_saturation_preservation_p05_ratio": 0.72,
+                "neutral_saturation_preservation_median_ratio": 0.90,
+                "neutral_saturation_preservation_p95_ratio": 0.97,
+                "reason": "auto neutral safety rescue replaced unsupported image-derived candidate"
             },
             "selection_rejections": ["image_derived_matrix rejected: synthetic destructive clip"],
             "regularization_lambda": 0.20,
@@ -545,6 +836,18 @@ fn fixture_report() -> PipelineReport {
         "tone_mapping",
         0.90,
         serde_json::json!({
+            "tone_confidence_status": "supported_tone_and_optional_grain_evidence",
+            "tone_output_evidence_evaluated": true,
+            "tone_output_evidence_confidence": 1.0,
+            "tone_output_confidence_status": "supported_render_tonal_distribution",
+            "tone_output_review_required": false,
+            "tone_output_review_reason": "rendered tonal distribution is supported",
+            "confidence_limited_by_tone_output_evidence": false,
+            "input_luminance_range_p05_p95": 0.80,
+            "mapped_luminance_range_p05_p95": 0.85,
+            "render_to_mapped_luminance_range_ratio": 1.0588235294117647,
+            "maximum_post_tone_high_clip_ratio": 0.002,
+            "maximum_post_tone_low_clip_ratio": 0.001,
             "shadow_saturation_median": 0.12,
             "shadow_saturation_p95": 0.31,
             "highlight_chroma_compressed_ratio": 0.004,
@@ -574,6 +877,158 @@ fn fixture_report() -> PipelineReport {
             "bright_saturated_saturation_p95": 0.81,
             "post_chroma_compression_clipped_high_ratio": [0.0, 0.0, 0.002],
             "post_chroma_compression_clipped_low_ratio": [0.0, 0.001, 0.0],
+            "perceptual_gamut_mapping_space": "CIELAB_D50_constant_lightness_and_hue",
+            "perceptual_gamut_mapped_ratio": 0.012,
+            "perceptual_gamut_mean_chroma_scale": 0.83,
+            "perceptual_gamut_min_chroma_scale": 0.41,
+            "adaptive_vibrance_skin_memory_protection": {
+                "enabled": true,
+                "method": "feathered_cielab_lightness_chroma_hue_region_limits_only_creative_vibrance",
+                "working_space": "CIELAB_D50_from_linear_ProPhoto_RGB_D50",
+                "reference": "https://doi.org/10.1002/col.70012",
+                "core_lightness": [27.12, 73.71],
+                "support_lightness": [18.0, 88.0],
+                "core_chroma": [9.01, 30.43],
+                "support_chroma": [5.0, 45.0],
+                "core_hue_degrees": [24.63, 79.64],
+                "support_hue_degrees": [15.0, 90.0],
+                "maximum_vibrance_reduction": 0.90,
+                "evaluated_pixel_ratio": 0.53,
+                "protected_pixel_ratio": 0.18,
+                "mean_protection_weight": 0.72,
+                "max_protection_weight": 1.0
+            },
+            "adaptive_vibrance_preferred_memory_color_guard": {
+                "enabled": true,
+                "method": "published_preference_ellipse_support_then_one_way_ab_path_projection_limits_only_creative_vibrance",
+                "working_space": "CIELAB_D50_ab_projection_from_linear_ProPhoto_RGB_D50",
+                "reference": "https://doi.org/10.2352/issn.2169-2629.2021.29.170",
+                "interpretation": "appearance-relative proxy only; not semantic detection, calibration evidence, or an instruction to pull pixels toward a preferred center",
+                "core_normalized_radius": 1.0,
+                "support_normalized_radius": 2.0,
+                "evaluated_pixel_ratio": 0.53,
+                "matched_pixel_ratio": 0.20,
+                "limited_pixel_ratio": 0.08,
+                "mean_scale_reduction": 0.0175,
+                "max_scale_reduction": 0.05,
+                "families": [
+                    {
+                        "family": "sky",
+                        "preferred_center_lab": [58.3, 5.930770515379112, -43.295680628602085],
+                        "preferred_center_lch": [58.3, 43.7, 277.8],
+                        "semi_major_axis_ab": 15.02,
+                        "semi_minor_axis_ab": 8.118918918918919,
+                        "axis_ratio": 1.85,
+                        "ellipse_rotation_degrees": 120.0,
+                        "matched_pixel_ratio": 0.10,
+                        "limited_pixel_ratio": 0.05,
+                        "mean_scale_reduction": 0.02,
+                        "max_scale_reduction": 0.04
+                    },
+                    {
+                        "family": "spring_grass",
+                        "preferred_center_lab": [37.7, -34.50220214414507, 51.15161822664608],
+                        "preferred_center_lch": [37.7, 61.7, 124.0],
+                        "semi_major_axis_ab": 32.71,
+                        "semi_minor_axis_ab": 11.894545454545455,
+                        "axis_ratio": 2.75,
+                        "ellipse_rotation_degrees": 125.77,
+                        "matched_pixel_ratio": 0.06,
+                        "limited_pixel_ratio": 0.02,
+                        "mean_scale_reduction": 0.015,
+                        "max_scale_reduction": 0.03
+                    },
+                    {
+                        "family": "autumn_grass",
+                        "preferred_center_lab": [45.3, 1.3112479885618953, 44.18054581727678],
+                        "preferred_center_lch": [45.3, 44.2, 88.3],
+                        "semi_major_axis_ab": 16.08,
+                        "semi_minor_axis_ab": 12.864,
+                        "axis_ratio": 1.25,
+                        "ellipse_rotation_degrees": 96.77,
+                        "matched_pixel_ratio": 0.04,
+                        "limited_pixel_ratio": 0.01,
+                        "mean_scale_reduction": 0.01,
+                        "max_scale_reduction": 0.05
+                    }
+                ]
+            },
+            "preferred_skin_rendering": {
+                "enabled": true,
+                "reason": "trusted modern-clean render applied a bounded one-way excess-chroma preference-ellipse shoulder while preserving CIELAB lightness",
+                "method": "published_skin_preference_ellipse_with_bounded_one_way_excess_chroma_shoulder",
+                "working_space": "CIELAB_D50_ab_projection_from_linear_ProPhoto_RGB_D50",
+                "preference_reference": "https://doi.org/10.2352/issn.2169-2629.2021.29.170",
+                "support_reference": "https://doi.org/10.1002/col.70012",
+                "interpretation": "display-only aggregate appearance proxy; not face or skin-group detection, calibration evidence, or a claim that every matched pixel is skin",
+                "preferred_center_lab": [61.3, 19.52430924020962, 16.557818355467763],
+                "preferred_center_lch": [61.3, 25.6, 40.3],
+                "semi_major_axis_ab": 19.41,
+                "semi_minor_axis_ab": 6.982014388489209,
+                "axis_ratio": 2.78,
+                "ellipse_rotation_degrees": 71.57,
+                "core_normalized_radius": 1.0,
+                "radial_excess_reduction": 0.35,
+                "maximum_delta_e_ab": 3.0,
+                "minimum_support_weight": 0.05,
+                "evaluated_pixel_ratio": 0.70,
+                "matched_pixel_ratio": 0.25,
+                "outside_preferred_core_ratio": 0.15,
+                "adjusted_pixel_ratio": 0.10,
+                "gamut_limited_pixel_ratio": 0.01,
+                "mean_delta_e_ab": 1.1,
+                "max_delta_e_ab": 2.5,
+                "mean_abs_hue_shift_degrees": 1.5,
+                "max_abs_hue_shift_degrees": 4.0,
+                "mean_chroma_delta": -0.5,
+                "max_abs_chroma_delta": 2.0
+            },
+            "noise_reduction_requested_enabled": true,
+            "noise_reduction_requested_strength": 0.7,
+            "noise_reduction_requested_scale": 1.5,
+            "noise_reduction_enabled": true,
+            "noise_reduction_reason": "independently requested edge-aware film-grain reduction",
+            "noise_reduction_radius": 3,
+            "noise_reduction_chroma_amount": 0.672,
+            "noise_reduction_luma_amount": 0.21,
+            "noise_reduction_applied_ratio": 0.81,
+            "noise_reduction_structure_gate_start": 0.018,
+            "noise_reduction_structure_gate_end": 0.035,
+            "noise_reduction_structure_excluded_ratio": 0.12,
+            "noise_reduction_texture_limited_ratio": 0.12,
+            "noise_reduction_saturation_limited_ratio": 0.04,
+            "noise_reduction_mean_abs_chroma_delta": 0.003,
+            "noise_reduction_max_abs_chroma_delta": 0.02,
+            "noise_reduction_mean_abs_luma_delta": 0.001,
+            "noise_reduction_max_abs_luma_delta": 0.008,
+            "noise_reduction_flat_luma_p95_reduction_ratio": 0.18,
+            "noise_reduction_flat_chroma_p95_reduction_ratio": 0.42,
+            "grain_reduction": {
+                "detail_retention": {
+                    "method": "coherent_multiscale_opponent_edge_retention_v1",
+                    "evaluated": true,
+                    "decision_supported": true,
+                    "sample_stride": 2,
+                    "probe_radius": 3,
+                    "minimum_probe_count": 64,
+                    "luminance_probe_count": 512,
+                    "chroma_probe_count": 384,
+                    "luminance_decision_supported": true,
+                    "chroma_decision_supported": true,
+                    "luminance_median_retention": 0.98,
+                    "luminance_p10_retention": 0.94,
+                    "chroma_median_retention": 0.97,
+                    "chroma_p10_retention": 0.92,
+                    "luminance_contrast_threshold": 0.035,
+                    "chroma_contrast_threshold": 0.05,
+                    "coherence_threshold": 0.75,
+                    "median_retention_threshold": 0.90,
+                    "p10_retention_threshold": 0.70,
+                    "review_required": false,
+                    "reason": "coherent pre/post detail probes passed",
+                    "review_reason": null
+                }
+            },
             "high_frequency_grain": {
                 "sample_count": 4096,
                 "sample_stride": 2,
@@ -613,6 +1068,10 @@ fn fixture_report() -> PipelineReport {
             "render_review_status": "reviewable",
             "render_reviewable": true,
             "render_review_reason": "working-image base estimate is strong enough for normal visual review",
+            "tone_output_review_required": false,
+            "tone_output_review_reason": "rendered tonal distribution is supported",
+            "tone_output_confidence_status": "supported_render_tonal_distribution",
+            "tone_output_evidence_confidence": 1.0,
             "overwrote_existing_output": true,
             "stale_render_artifact_count": 1,
             "stale_render_artifacts": [
@@ -625,6 +1084,396 @@ fn fixture_report() -> PipelineReport {
         }),
     ));
     report
+}
+
+#[test]
+fn test_final_delivery_reviewability_requires_intact_saved_artifact_evidence() {
+    use scanstitch::validation::{
+        delivery_artifact_integrity_issues, final_delivery_evidence_is_reviewable,
+        RenderDiagnosticSummary,
+    };
+
+    let digest = "a".repeat(64);
+    let render = RenderDiagnosticSummary {
+        artifact_sha256_binding_required: true,
+        output_path: Some("output/output.tiff".to_string()),
+        output_width: Some(640),
+        output_height: Some(480),
+        output_sha256: Some(digest.clone()),
+        output_file_sha256: Some(digest),
+        output_file_sha256_matches_report: Some(true),
+        output_file_dimensions_match_report: Some(true),
+        output_file_storage_matches_report: Some(true),
+        output_file_icc_profile_matches_report: Some(true),
+        master_scene_referred_requested: Some(false),
+        review_srgb_requested: Some(false),
+        stale_render_artifact_count: Some(0),
+        render_review_status: Some("reviewable".to_string()),
+        render_reviewable: Some(true),
+        ..RenderDiagnosticSummary::default()
+    };
+    assert!(delivery_artifact_integrity_issues(&render).is_empty());
+    assert!(final_delivery_evidence_is_reviewable(&render));
+
+    let mut legacy_structural_only = render.clone();
+    legacy_structural_only.artifact_sha256_binding_required = false;
+    legacy_structural_only.output_sha256 = None;
+    legacy_structural_only.output_file_sha256 = None;
+    legacy_structural_only.output_file_sha256_matches_report = None;
+    assert!(delivery_artifact_integrity_issues(&legacy_structural_only).is_empty());
+    assert!(final_delivery_evidence_is_reviewable(
+        &legacy_structural_only
+    ));
+
+    let mut missing = render.clone();
+    missing.output_path = None;
+    missing.output_width = Some(0);
+    missing.output_height = None;
+    missing.output_file_dimensions_match_report = Some(false);
+    missing.output_file_storage_matches_report = None;
+    missing.output_file_icc_profile_matches_report = Some(false);
+    missing.output_sha256 = None;
+    missing.output_file_sha256 = None;
+    missing.output_file_sha256_matches_report = None;
+    missing.stale_render_artifact_count = None;
+    let issues = delivery_artifact_integrity_issues(&missing);
+    assert_eq!(
+        issues,
+        [
+            "output_path_missing",
+            "output_dimensions_missing_or_invalid",
+            "output_dimensions_mismatch",
+            "output_storage_evidence_missing",
+            "output_icc_profile_mismatch",
+            "output_sha256_declaration_missing_or_invalid",
+            "stale_render_artifact_evidence_missing",
+        ]
+    );
+    assert!(!final_delivery_evidence_is_reviewable(&missing));
+
+    let mut missing_auxiliary = render.clone();
+    missing_auxiliary.master_scene_referred_requested = Some(true);
+    missing_auxiliary.review_srgb_requested = Some(true);
+    assert_eq!(
+        delivery_artifact_integrity_issues(&missing_auxiliary),
+        [
+            "master_scene_referred_path_missing",
+            "master_scene_referred_artifact_evidence_missing",
+            "review_srgb_path_missing",
+            "review_srgb_artifact_evidence_missing",
+            "master_scene_referred_sha256_declaration_missing_or_invalid",
+            "review_srgb_sha256_declaration_missing_or_invalid",
+            "review_srgb_gamut_mapping_evidence_missing",
+        ]
+    );
+
+    let mut stale = render;
+    stale.stale_render_artifact_count = Some(2);
+    assert_eq!(
+        delivery_artifact_integrity_issues(&stale),
+        ["stale_render_artifacts"]
+    );
+}
+
+#[test]
+fn test_validation_summary_preserves_n_component_inferred_order() {
+    let mut report = fixture_report();
+    let stitch = report
+        .phases
+        .iter_mut()
+        .find(|phase| phase.name == "stitch")
+        .expect("stitch phase");
+    let mut corrected_pair = stitch.metrics.clone();
+    corrected_pair["seam_exposure_correction"]["offset_rgb_normalized"] =
+        serde_json::json!([0.02, -0.01, 0.005]);
+    let mut identity_pair = stitch.metrics.clone();
+    identity_pair["seam_exposure_correction"]["model"] = serde_json::json!("identity");
+    identity_pair["seam_exposure_correction"]["applied"] = serde_json::json!(false);
+    identity_pair["seam_exposure_correction"]["held_out_validation_passed"] =
+        serde_json::json!(false);
+    identity_pair["seam_exposure_correction"]["offset_rgb_normalized"] =
+        serde_json::json!([0.0, 0.0, 0.0]);
+    stitch.metrics = serde_json::json!({
+        "decision": "accepted_sequence",
+        "ordering": {
+            "inferred_order": [2, 3, 1],
+            "all_adjacencies_validated": true
+        },
+        "pair_merges": [
+            {"pair_report": {"metrics": corrected_pair}},
+            {"pair_report": {"metrics": identity_pair}}
+        ]
+    });
+
+    let summary = scanstitch::validation::summarize_report("three-way", &report);
+    assert_eq!(summary.stitch.inferred_order, vec![2, 3, 1]);
+    let exposure = summary.stitch.seam_exposure_correction.unwrap();
+    assert_eq!(exposure.model.as_deref(), Some("sequence_mixed"));
+    assert_eq!(exposure.applied, Some(true));
+    assert_eq!(exposure.held_out_validation_passed, Some(true));
+    assert_eq!(
+        exposure.offset_rgb_normalized,
+        Some(vec![0.02, 0.01, 0.005])
+    );
+    let blend = summary.stitch.seam_blend.unwrap();
+    assert_eq!(blend.merge_count, 2);
+    assert_eq!(blend.review_required, Some(false));
+    assert_eq!(
+        blend
+            .detail_consistency
+            .unwrap()
+            .minimum_supported_scale_count,
+        Some(3)
+    );
+}
+
+#[test]
+fn test_validation_summary_extracts_absolute_deskew_evidence() {
+    let mut report = fixture_report();
+    report.phases.push(PhaseReport::ok(
+        "load",
+        1.0,
+        serde_json::json!({
+            "input_count": 1,
+            "components": [{
+                "index": 1,
+                "decode": {
+                    "decoded_pixel_sha256": "a".repeat(64),
+                    "source_orientation_materialized_decoded_pixel_sha256": "b".repeat(64),
+                    "orientation": {
+                        "tag_value": 6,
+                        "transform": "rotate_90_clockwise",
+                        "applied": true,
+                        "source_width": 220,
+                        "source_height": 160,
+                        "output_width": 160,
+                        "output_height": 220
+                    },
+                    "orientation_correction": {
+                        "requested": "rotate-180",
+                        "transform": "rotate_180",
+                        "applied": true,
+                        "input_width": 160,
+                        "input_height": 220,
+                        "output_width": 160,
+                        "output_height": 220,
+                        "effective_tag_value": 8,
+                        "effective_transform": "rotate_270_clockwise",
+                        "source_orientation_materialized_decoded_pixel_sha256": "b".repeat(64),
+                        "corrected_decoded_pixel_sha256": "a".repeat(64),
+                        "reason": "explicit correction"
+                    }
+                }
+            }]
+        }),
+    ));
+    report.phases.push(PhaseReport::ok(
+        "deskew",
+        0.91,
+        serde_json::json!({
+            "requested_mode": "auto",
+            "status": "applied",
+            "applied": true,
+            "applied_component_count": 1,
+            "input_count": 1,
+            "detected_source_skew_degrees": 0.72,
+            "correction_degrees": -0.72,
+            "review_required": false,
+            "review_reason": "accepted",
+            "retained_area_ratio": 0.96,
+            "proposed_retained_area_ratio": 0.96,
+            "supporting_side_count": 4,
+            "horizontal_side_count": 2,
+            "vertical_side_count": 2,
+            "side_angle_spread_degrees": 0.04,
+            "interpolation": "bicubic_catmull_rom_single_resample",
+            "reason": "four sides agree",
+            "components": [{
+                "index": 1,
+                "diagnostics": {
+                    "applied": true,
+                    "retained_area_ratio": 0.96
+                }
+            }]
+        }),
+    ));
+
+    let summary = scanstitch::validation::summarize_report("deskewed", &report);
+    assert_eq!(summary.input_orientation.input_count, Some(1));
+    assert_eq!(summary.input_orientation.component_count, 1);
+    assert_eq!(
+        summary.input_orientation.all_components_reported,
+        Some(true)
+    );
+    assert_eq!(summary.input_orientation.components[0].tag_value, Some(6));
+    assert_eq!(
+        summary.input_orientation.components[0]
+            .decoded_pixel_sha256
+            .as_deref(),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
+    assert_eq!(
+        summary.input_orientation.components[0].transform.as_deref(),
+        Some("rotate_270_clockwise")
+    );
+    assert_eq!(
+        summary.input_orientation.components[0]
+            .source_orientation_materialized_decoded_pixel_sha256
+            .as_deref(),
+        Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    );
+    assert_eq!(
+        summary.input_orientation.components[0]
+            .metadata_transform
+            .as_deref(),
+        Some("rotate_90_clockwise")
+    );
+    assert_eq!(
+        summary.input_orientation.components[0]
+            .orientation_correction_requested
+            .as_deref(),
+        Some("rotate-180")
+    );
+    assert_eq!(
+        summary.input_orientation.components[0]
+            .orientation_correction_transform
+            .as_deref(),
+        Some("rotate_180")
+    );
+    assert_eq!(
+        summary.input_orientation.components[0].effective_tag_value,
+        Some(8)
+    );
+    assert_eq!(
+        summary.input_orientation.components[0].output_width,
+        Some(160)
+    );
+    assert_eq!(summary.deskew.status.as_deref(), Some("applied"));
+    assert_eq!(summary.deskew.applied, Some(true));
+    assert_eq!(summary.deskew.correction_degrees, Some(-0.72));
+    assert_eq!(summary.deskew.supporting_side_count, Some(4));
+    assert_eq!(summary.deskew.retained_area_ratio, Some(0.96));
+    assert_eq!(summary.deskew.proposed_retained_area_ratio, Some(0.96));
+    assert_eq!(summary.deskew.all_components_reported, Some(true));
+    assert_eq!(summary.deskew.all_components_applied, Some(true));
+    assert_eq!(
+        summary.deskew.minimum_component_retained_area_ratio,
+        Some(0.96)
+    );
+    assert_eq!(
+        summary.deskew.interpolation.as_deref(),
+        Some("bicubic_catmull_rom_single_resample")
+    );
+    let markdown = scanstitch::validation::summary_to_markdown(&summary);
+    assert!(markdown.contains(
+        "component 1: tag=6 effective_transform=rotate_270_clockwise correction=rotate-180 applied=true"
+    ));
+    assert!(markdown.contains("detected_source_skew_degrees"));
+    assert!(markdown.contains("retained_area_ratio"));
+}
+
+#[test]
+fn test_validation_summary_extracts_border_crop_and_measured_negative_reconstruction() {
+    let mut report = PipelineReport::new();
+    report.add_phase(PhaseReport::ok(
+        "border_removal",
+        1.0,
+        serde_json::json!({
+            "input_count": 2,
+            "components": [
+                {
+                    "index": 1,
+                    "crop": {
+                        "top_removed": 8,
+                        "bottom_removed": 9,
+                        "left_removed": 10,
+                        "right_removed": 11,
+                        "dead_zone_detected": true
+                    },
+                    "output_shape": [103, 179]
+                },
+                {
+                    "index": 2,
+                    "crop": {
+                        "top_removed": 7,
+                        "bottom_removed": 8,
+                        "left_removed": 9,
+                        "right_removed": 10,
+                        "dead_zone_detected": true
+                    },
+                    "output_shape": [105, 181]
+                }
+            ]
+        }),
+    ));
+    report.add_phase(PhaseReport::ok(
+        "density_inversion",
+        0.84,
+        serde_json::json!({
+            "input_mode": "negative",
+            "skipped": false,
+            "direct_density_response_model": {
+                "model": "measured_nonlinear_dye_separation",
+                "source": "measured_roll_target_with_held_out_validation",
+                "accepted": true,
+                "review_required": false,
+                "crosstalk_model": "measured_3x3_scanner_density_to_film_layers",
+                "characteristic_curve_model": "measured_monotone_pchip_density_to_scene_log_exposure",
+                "measured_model_id": "synthetic-response-v1",
+                "measured_confidence": 0.91,
+                "held_out_delta_e00_rms": 2.4,
+                "held_out_delta_e00_max": 5.8,
+                "unit_slope_delta_e00_rms": 4.1,
+                "maximum_density_noise_gain": 1.8
+            }
+        }),
+    ));
+    report.add_phase(PhaseReport::ok(
+        "colorspace_mapping",
+        0.93,
+        serde_json::json!({
+            "negative_response_review_required": false,
+            "negative_response_reconstruction": {
+                "signed_headroom_preserved": true,
+                "curve_extrapolated_any_ratio": 0.004,
+                "curve_interpolation": "monotone_piecewise_cubic_hermite_with_endpoint_tangent_extrapolation"
+            }
+        }),
+    ));
+
+    let summary = scanstitch::validation::summarize_report("negative-border", &report);
+    assert_eq!(summary.border_crop.all_components_reported, Some(true));
+    assert_eq!(summary.border_crop.all_components_cropped, Some(true));
+    assert_eq!(summary.border_crop.total_removed_edge_count, 8);
+    assert_eq!(
+        summary.border_crop.minimum_removed_edge_count_per_component,
+        Some(4)
+    );
+    assert_eq!(summary.border_crop.components[0].input_width, Some(200));
+    assert_eq!(summary.border_crop.components[0].input_height, Some(120));
+    assert_eq!(
+        summary.negative_reconstruction.response_model.as_deref(),
+        Some("measured_nonlinear_dye_separation")
+    );
+    assert_eq!(
+        summary
+            .negative_reconstruction
+            .held_out_improvement_over_unit_slope,
+        Some(1.6999999999999997)
+    );
+    assert_eq!(
+        summary
+            .negative_reconstruction
+            .reconstruction_review_required,
+        Some(false)
+    );
+    assert_eq!(
+        summary.negative_reconstruction.signed_headroom_preserved,
+        Some(true)
+    );
+    let markdown = scanstitch::validation::summary_to_markdown(&summary);
+    assert!(markdown.contains("all_components_cropped"));
+    assert!(markdown.contains("held_out_improvement_over_unit_slope"));
 }
 
 fn clear_stale_artifacts(report: &mut PipelineReport) {
@@ -694,6 +1543,12 @@ fn test_validation_summary_extracts_standard_report_fields() {
         summary.report.generated_at.as_deref(),
         Some("2026-05-01T21:00:00Z")
     );
+    assert_eq!(
+        summary.report.binary_identity_status.as_deref(),
+        Some("verified_sha256")
+    );
+    assert_eq!(summary.report.binary_sha256, Some("a".repeat(64)));
+    assert_eq!(summary.report.binary_file_size_bytes, Some(1));
     assert_eq!(summary.render.output_width, Some(1800));
     assert_eq!(summary.render.output_height, Some(1200));
     assert_eq!(
@@ -711,6 +1566,18 @@ fn test_validation_summary_extracts_standard_report_fields() {
         Some("reviewable")
     );
     assert_eq!(summary.render.render_reviewable, Some(true));
+    assert_eq!(summary.render.tone_output_review_required, Some(false));
+    assert_eq!(
+        summary.render.tone_output_confidence_status.as_deref(),
+        Some("supported_render_tonal_distribution")
+    );
+    assert_eq!(summary.render.tone_output_evidence_confidence, Some(1.0));
+    assert_eq!(
+        summary
+            .render
+            .tone_output_render_to_mapped_luminance_range_ratio,
+        Some(1.0588235294117647)
+    );
     assert_eq!(summary.render.stale_render_artifact_count, Some(1));
     assert_eq!(summary.stitch.decision.as_deref(), Some("accepted"));
     assert_eq!(summary.stitch.confidence, Some(0.82));
@@ -723,15 +1590,113 @@ fn test_validation_summary_extracts_standard_report_fields() {
         summary.stitch.top_candidates[0].correspondence_score,
         Some(0.91)
     );
+    let homography_features = summary
+        .stitch
+        .homography_feature_validation
+        .as_ref()
+        .expect("homography feature validation summary");
+    assert_eq!(homography_features.accepted, Some(true));
+    assert_eq!(homography_features.validation_count, 1);
+    assert_eq!(homography_features.accepted_count, 1);
+    assert_eq!(homography_features.minimum_training_match_count, Some(32));
+    assert_eq!(homography_features.minimum_held_out_match_count, Some(32));
+    assert_eq!(
+        homography_features.minimum_held_out_inlier_ratio,
+        Some(0.875)
+    );
+    assert_eq!(
+        homography_features.maximum_cross_fit_disagreement_px,
+        Some(0.72)
+    );
+    let homography = summary
+        .stitch
+        .homography_spatial_validation
+        .as_ref()
+        .expect("homography spatial validation summary");
+    assert_eq!(homography.accepted, Some(true));
+    assert_eq!(homography.validation_count, 1);
+    assert_eq!(homography.accepted_count, 1);
+    assert_eq!(homography.minimum_split_ncc_improvement, Some(0.10));
+    assert_eq!(homography.minimum_mean_ncc_improvement, Some(0.10));
+    assert_eq!(
+        homography.minimum_split_registration_error_reduction,
+        Some(0.526)
+    );
+    assert_eq!(
+        homography.minimum_mean_registration_error_reduction,
+        Some(0.541)
+    );
+    assert_eq!(homography.minimum_split_sample_count, Some(1590));
+    assert_eq!(
+        homography.minimum_model_deviation_from_translation_px,
+        Some(2.4)
+    );
     let seam = summary
         .stitch
         .seam_exposure_correction
         .as_ref()
         .expect("seam exposure summary");
     assert_eq!(seam.applied, Some(true));
+    assert_eq!(seam.model.as_deref(), Some("gain_only_scalar"));
     assert_eq!(seam.gain_rgb, Some(vec![0.91, 0.91, 0.91]));
+    assert_eq!(seam.spatial_gain_log_slope_x_rgb, Some(vec![0.0, 0.0, 0.0]));
+    assert_eq!(seam.spatial_gain_log_slope_y_rgb, Some(vec![0.0, 0.0, 0.0]));
+    assert_eq!(
+        seam.spatial_gain_log_quadratic_xx_rgb,
+        Some(vec![0.0, 0.0, 0.0])
+    );
+    assert_eq!(seam.spatial_gain_top_rgb, Some(vec![0.91, 0.91, 0.91]));
+    assert_eq!(
+        seam.spatial_offset_slope_y_rgb_normalized,
+        Some(vec![0.0, 0.0, 0.0])
+    );
+    assert_eq!(seam.offset_rgb, Some(vec![0.0, 0.0, 0.0]));
     assert_eq!(seam.seam_score_before, Some(0.102));
     assert_eq!(seam.seam_score_after, Some(0.018));
+    assert_eq!(seam.held_out_validation_passed, Some(true));
+    assert_eq!(seam.held_out_selected_seam_score, Some(0.019));
+    assert_eq!(seam.held_out_spatial_gain_seam_score, Some(0.019));
+    assert_eq!(seam.spatial_distinct_training_rows, Some(4));
+    assert_eq!(seam.held_out_spatial_gain_offset_seam_score, Some(0.0185));
+    assert_eq!(seam.spatial_affine_distinct_training_rows, Some(4));
+    let spatial_2d = seam
+        .spatial_2d_validation
+        .as_ref()
+        .expect("2D seam validation summary");
+    assert_eq!(spatial_2d.distinct_training_columns, Some(3));
+    assert_eq!(spatial_2d.gain_accepted, Some(false));
+    assert_eq!(spatial_2d.gain_offset_accepted, Some(false));
+    let quadratic = spatial_2d
+        .quadratic
+        .as_ref()
+        .expect("quadratic seam validation summary");
+    assert_eq!(quadratic.evaluation_grid_size, Some(9));
+    assert_eq!(quadratic.minimum_windows_per_split, Some(18));
+    assert_eq!(quadratic.gain_design_condition_number, Some(4.5));
+    assert_eq!(quadratic.gain_accepted, Some(false));
+    let seam_blend = summary
+        .stitch
+        .seam_blend
+        .as_ref()
+        .expect("seam blend summary");
+    assert_eq!(seam_blend.mode.as_deref(), Some("seam_aware_multiband"));
+    assert_eq!(seam_blend.applied, Some(true));
+    assert_eq!(seam_blend.merge_count, 1);
+    assert_eq!(seam_blend.applied_merge_count, 1);
+    assert_eq!(seam_blend.review_required, Some(false));
+    assert_eq!(seam_blend.review_required_merge_count, 0);
+    assert_eq!(seam_blend.overlap_p95_abs_difference, Some(0.161));
+    assert_eq!(seam_blend.output_to_source_seam_gradient_ratio, Some(0.576));
+    let detail = seam_blend
+        .detail_consistency
+        .as_ref()
+        .expect("seam detail summary");
+    assert_eq!(detail.evaluated, Some(true));
+    assert_eq!(detail.decision_supported, Some(true));
+    assert_eq!(detail.review_required, Some(false));
+    assert_eq!(detail.minimum_supported_scale_count, Some(3));
+    assert_eq!(detail.maximum_imbalanced_scale_count, Some(0));
+    assert_eq!(detail.maximum_symmetric_energy_ratio, Some(1.08));
     assert_eq!(summary.base_density.base_confidence, Some(0.73));
     assert_eq!(summary.base_density.raw_base_proxy_confidence, Some(0.12));
     assert_eq!(summary.base_density.raw_base_support_fraction, Some(0.014));
@@ -1081,7 +2046,40 @@ fn test_validation_summary_extracts_standard_report_fields() {
             .calibration_acceptance
             .as_ref()
             .and_then(|acceptance| acceptance.status.as_deref()),
-        Some("accepted")
+        Some("rejected_reference_fit")
+    );
+    let calibration_color_mapping = summary
+        .colorspace
+        .calibration_color_mapping_application
+        .as_ref()
+        .expect("calibration color-mapping application summary");
+    assert_eq!(calibration_color_mapping.evaluated, Some(true));
+    assert_eq!(calibration_color_mapping.applied, Some(false));
+    assert_eq!(
+        calibration_color_mapping.selection_status.as_deref(),
+        Some("rejected_reference_fit")
+    );
+    assert_eq!(
+        calibration_color_mapping.selected_candidate.as_deref(),
+        Some("neutral_balance_fallback")
+    );
+    assert!(summary.diagnostic_consistency_issues.is_empty());
+    let neutral_rescue = summary
+        .colorspace
+        .neutral_safety_rescue
+        .as_ref()
+        .expect("neutral safety rescue summary");
+    assert_eq!(neutral_rescue.evaluated, Some(true));
+    assert_eq!(neutral_rescue.applied, Some(true));
+    assert_eq!(
+        neutral_rescue.matrix_candidate.as_deref(),
+        Some("gamut_trusted_image_matrix_blend")
+    );
+    assert_eq!(neutral_rescue.preserved_ratio_gain, Some(0.258));
+    assert_eq!(neutral_rescue.midtone_saturation_p95_reduction, Some(0.28));
+    assert_eq!(
+        neutral_rescue.reason.as_deref(),
+        Some("auto neutral safety rescue replaced unsupported image-derived candidate")
     );
     assert_eq!(summary.colorspace.neutral_trim_applied, Some(true));
     assert_eq!(
@@ -1113,6 +2111,25 @@ fn test_validation_summary_extracts_standard_report_fields() {
         Some(vec![0.04, 0.48, 0.94])
     );
     assert_eq!(summary.tone.render_luminance_range_p05_p95, Some(0.90));
+    assert_eq!(
+        summary.tone.tone_confidence_status.as_deref(),
+        Some("supported_tone_and_optional_grain_evidence")
+    );
+    assert_eq!(summary.tone.tone_output_evidence_evaluated, Some(true));
+    assert_eq!(summary.tone.tone_output_evidence_confidence, Some(1.0));
+    assert_eq!(
+        summary.tone.tone_output_confidence_status.as_deref(),
+        Some("supported_render_tonal_distribution")
+    );
+    assert_eq!(summary.tone.tone_output_review_required, Some(false));
+    assert_eq!(summary.tone.input_luminance_range_p05_p95, Some(0.80));
+    assert_eq!(summary.tone.mapped_luminance_range_p05_p95, Some(0.85));
+    assert_eq!(
+        summary.tone.render_to_mapped_luminance_range_ratio,
+        Some(1.0588235294117647)
+    );
+    assert_eq!(summary.tone.maximum_post_tone_high_clip_ratio, Some(0.002));
+    assert_eq!(summary.tone.maximum_post_tone_low_clip_ratio, Some(0.001));
     assert_eq!(summary.tone.bright_neutral_saturation_p95, Some(0.08));
     assert_eq!(summary.tone.shadow_rgb_median, Some(vec![0.14, 0.13, 0.12]));
     assert_eq!(
@@ -1132,6 +2149,36 @@ fn test_validation_summary_extracts_standard_report_fields() {
         Some("enabled")
     );
     assert_eq!(summary.tone.color_trust_state.as_deref(), Some("trusted"));
+    assert_eq!(summary.tone.noise_reduction_requested_enabled, Some(true));
+    assert_eq!(summary.tone.noise_reduction_requested_strength, Some(0.7));
+    assert_eq!(summary.tone.noise_reduction_requested_scale, Some(1.5));
+    assert_eq!(summary.tone.noise_reduction_enabled, Some(true));
+    assert_eq!(summary.tone.noise_reduction_radius, Some(3));
+    assert_eq!(
+        summary.tone.noise_reduction_structure_gate_start,
+        Some(0.018)
+    );
+    assert_eq!(summary.tone.noise_reduction_structure_gate_end, Some(0.035));
+    assert_eq!(
+        summary.tone.noise_reduction_structure_excluded_ratio,
+        Some(0.12)
+    );
+    assert_eq!(
+        summary.tone.noise_reduction_flat_chroma_p95_reduction_ratio,
+        Some(0.42)
+    );
+    let grain_detail = summary
+        .tone
+        .grain_detail_retention
+        .as_ref()
+        .expect("grain detail retention summary");
+    assert_eq!(grain_detail.decision_supported, Some(true));
+    assert_eq!(grain_detail.review_required, Some(false));
+    assert_eq!(grain_detail.luminance_probe_count, Some(512));
+    assert_eq!(grain_detail.chroma_probe_count, Some(384));
+    assert_eq!(grain_detail.luminance_p10_retention, Some(0.94));
+    assert_eq!(grain_detail.chroma_p10_retention, Some(0.92));
+    assert_eq!(summary.render.noise_reduction_requested_strength, Some(0.7));
     assert_eq!(
         summary
             .tone
@@ -1160,6 +2207,56 @@ fn test_validation_summary_extracts_standard_report_fields() {
         summary.tone.post_chroma_compression_clipped_high_ratio,
         Some(vec![0.0, 0.0, 0.002])
     );
+    assert_eq!(
+        summary.tone.perceptual_gamut_mapping_space.as_deref(),
+        Some("CIELAB_D50_constant_lightness_and_hue")
+    );
+    assert_eq!(summary.tone.perceptual_gamut_mapped_ratio, Some(0.012));
+    assert_eq!(summary.tone.perceptual_gamut_mean_chroma_scale, Some(0.83));
+    assert_eq!(summary.tone.perceptual_gamut_min_chroma_scale, Some(0.41));
+    let skin_memory = summary
+        .tone
+        .adaptive_vibrance_skin_memory_protection
+        .as_ref()
+        .expect("skin-memory protection summary");
+    assert_eq!(skin_memory.enabled, Some(true));
+    assert_eq!(
+        skin_memory.working_space.as_deref(),
+        Some("CIELAB_D50_from_linear_ProPhoto_RGB_D50")
+    );
+    assert_eq!(skin_memory.core_lightness, Some(vec![27.12, 73.71]));
+    assert_eq!(skin_memory.protected_pixel_ratio, Some(0.18));
+    assert_eq!(skin_memory.mean_protection_weight, Some(0.72));
+    assert_eq!(skin_memory.max_protection_weight, Some(1.0));
+    let preferred_memory = summary
+        .tone
+        .adaptive_vibrance_preferred_memory_color_guard
+        .as_ref()
+        .expect("preferred-memory-colour guard summary");
+    assert_eq!(preferred_memory.enabled, Some(true));
+    assert_eq!(
+        preferred_memory.working_space.as_deref(),
+        Some("CIELAB_D50_ab_projection_from_linear_ProPhoto_RGB_D50")
+    );
+    assert_eq!(preferred_memory.matched_pixel_ratio, Some(0.20));
+    assert_eq!(preferred_memory.limited_pixel_ratio, Some(0.08));
+    assert_eq!(preferred_memory.mean_scale_reduction, Some(0.0175));
+    assert_eq!(preferred_memory.families.len(), 3);
+    assert_eq!(preferred_memory.families[0].family.as_deref(), Some("sky"));
+    let preferred_skin = summary
+        .tone
+        .preferred_skin_rendering
+        .as_ref()
+        .expect("preferred-skin rendering summary");
+    assert_eq!(preferred_skin.enabled, Some(true));
+    assert_eq!(
+        preferred_skin.preference_reference.as_deref(),
+        Some("https://doi.org/10.2352/issn.2169-2629.2021.29.170")
+    );
+    assert_eq!(preferred_skin.matched_pixel_ratio, Some(0.25));
+    assert_eq!(preferred_skin.adjusted_pixel_ratio, Some(0.10));
+    assert_eq!(preferred_skin.mean_delta_e_ab, Some(1.1));
+    assert!(summary.diagnostic_consistency_issues.is_empty());
     assert_eq!(summary.warnings.len(), 1);
 }
 
@@ -1243,6 +2340,45 @@ fn test_tracked_baseline_from_summary_exports_compact_regression_contract() {
     assert_eq!(baseline.stitch.decision.as_deref(), Some("accepted"));
     assert_eq!(baseline.stitch.confidence, Some(0.82));
     assert_eq!(baseline.stitch.seam_exposure_correction_applied, Some(true));
+    assert_eq!(
+        baseline.stitch.seam_exposure_model.as_deref(),
+        Some("gain_only_scalar")
+    );
+    assert_eq!(
+        baseline.stitch.seam_exposure_spatial_2d_gain_accepted,
+        Some(false)
+    );
+    assert_eq!(
+        baseline
+            .stitch
+            .seam_exposure_spatial_2d_gain_offset_accepted,
+        Some(false)
+    );
+    assert_eq!(
+        baseline
+            .stitch
+            .seam_exposure_spatial_quadratic_gain_accepted,
+        Some(false)
+    );
+    assert_eq!(
+        baseline
+            .stitch
+            .seam_exposure_spatial_quadratic_gain_offset_accepted,
+        Some(false)
+    );
+    assert_eq!(
+        baseline.stitch.seam_blend_mode.as_deref(),
+        Some("seam_aware_multiband")
+    );
+    assert_eq!(baseline.stitch.seam_blend_applied, Some(true));
+    assert_eq!(baseline.stitch.seam_blend_review_required, Some(false));
+    assert_eq!(baseline.stitch.seam_detail_review_required, Some(false));
+    assert_eq!(
+        baseline.stitch.seam_detail_max_symmetric_energy_ratio,
+        Some(1.08)
+    );
+    assert_eq!(baseline.stitch.seam_gradient_ratio, Some(0.576));
+    assert_eq!(baseline.stitch.seam_overlap_p95_abs_difference, Some(0.161));
     assert_eq!(baseline.render.output_width, Some(1800));
     assert_eq!(baseline.render.output_height, Some(1200));
     assert_eq!(baseline.render.raw_base_proxy_confidence, Some(0.12));
@@ -1251,6 +2387,11 @@ fn test_tracked_baseline_from_summary_exports_compact_regression_contract() {
         baseline.render.colorspace_mapping_strategy.as_deref(),
         Some("neutral_balance_weak_anchor_fallback")
     );
+    assert_eq!(
+        baseline.render.render_review_status.as_deref(),
+        Some("reviewable")
+    );
+    assert_eq!(baseline.render.render_reviewable, Some(true));
     assert_eq!(
         baseline.colorspace.candidate_risk.as_deref(),
         Some("review_reference_fit")
@@ -1424,6 +2565,96 @@ fn test_tracked_baseline_from_summary_exports_compact_regression_contract() {
         ]
     );
     assert_eq!(baseline.tone.highlight_chroma_compressed_ratio, Some(0.004));
+    assert_eq!(
+        baseline.tone.tone_output_confidence_status.as_deref(),
+        Some("supported_render_tonal_distribution")
+    );
+    assert_eq!(baseline.tone.tone_output_review_required, Some(false));
+    assert_eq!(baseline.tone.tone_output_evidence_confidence, Some(1.0));
+    assert_eq!(baseline.tone.render_luminance_range_p05_p95, Some(0.90));
+    assert_eq!(
+        baseline.tone.render_to_mapped_luminance_range_ratio,
+        Some(1.0588235294117647)
+    );
+    assert_eq!(
+        baseline
+            .tone
+            .adaptive_vibrance_skin_memory_protection_enabled,
+        Some(true)
+    );
+    assert_eq!(
+        baseline
+            .tone
+            .adaptive_vibrance_skin_memory_protection_space
+            .as_deref(),
+        Some("CIELAB_D50_from_linear_ProPhoto_RGB_D50")
+    );
+    assert_eq!(
+        baseline.tone.adaptive_vibrance_skin_memory_protected_ratio,
+        Some(0.18)
+    );
+    assert_eq!(
+        baseline.tone.adaptive_vibrance_skin_memory_mean_protection,
+        Some(0.72)
+    );
+    assert_eq!(
+        baseline
+            .tone
+            .adaptive_vibrance_preferred_memory_color_guard_enabled,
+        Some(true)
+    );
+    assert_eq!(
+        baseline
+            .tone
+            .adaptive_vibrance_preferred_memory_color_guard_space
+            .as_deref(),
+        Some("CIELAB_D50_ab_projection_from_linear_ProPhoto_RGB_D50")
+    );
+    assert_eq!(
+        baseline
+            .tone
+            .adaptive_vibrance_preferred_memory_color_guard_reference
+            .as_deref(),
+        Some("https://doi.org/10.2352/issn.2169-2629.2021.29.170")
+    );
+    assert_eq!(
+        baseline
+            .tone
+            .adaptive_vibrance_preferred_memory_color_matched_ratio,
+        Some(0.20)
+    );
+    assert_eq!(
+        baseline
+            .tone
+            .adaptive_vibrance_preferred_memory_color_limited_ratio,
+        Some(0.08)
+    );
+    assert_eq!(
+        baseline
+            .tone
+            .adaptive_vibrance_preferred_memory_color_mean_scale_reduction,
+        Some(0.0175)
+    );
+    assert_eq!(baseline.tone.preferred_skin_rendering_enabled, Some(true));
+    assert_eq!(
+        baseline.tone.preferred_skin_rendering_space.as_deref(),
+        Some("CIELAB_D50_ab_projection_from_linear_ProPhoto_RGB_D50")
+    );
+    assert_eq!(
+        baseline
+            .tone
+            .preferred_skin_rendering_preference_reference
+            .as_deref(),
+        Some("https://doi.org/10.2352/issn.2169-2629.2021.29.170")
+    );
+    assert_eq!(
+        baseline.tone.preferred_skin_rendering_adjusted_ratio,
+        Some(0.10)
+    );
+    assert_eq!(
+        baseline.tone.preferred_skin_rendering_mean_delta_e_ab,
+        Some(1.1)
+    );
     assert_eq!(baseline.grain.chroma_to_luma_p95_ratio, Some(1.5));
 
     let comparison =
@@ -1442,7 +2673,39 @@ fn test_validation_summary_markdown_is_compact() {
     assert!(markdown.contains("generated_at"));
     assert!(markdown.contains("output_dimensions"));
     assert!(markdown.contains("seam_exposure_gain_rgb"));
-    assert!(markdown.contains("calibration_status"));
+    assert!(markdown.contains("seam_exposure_spatial_gain_log_slope_y_rgb"));
+    assert!(markdown.contains("seam_exposure_spatial_gain_log_slope_x_rgb"));
+    assert!(markdown.contains("seam_exposure_held_out_spatial_gain_score"));
+    assert!(markdown.contains("seam_exposure_spatial_offset_slope_y_rgb"));
+    assert!(markdown.contains("seam_exposure_held_out_spatial_gain_offset_score"));
+    assert!(markdown.contains("seam_exposure_spatial_2d_gain_offset_accepted"));
+    assert!(markdown.contains("seam_exposure_spatial_quadratic_gain_accepted"));
+    assert!(markdown.contains("seam_exposure_spatial_quadratic_gain_offset_accepted"));
+    assert!(markdown.contains("seam_blend_review_required"));
+    assert!(markdown.contains("seam_detail_review_required"));
+    assert!(markdown.contains("seam_detail_max_symmetric_energy_ratio"));
+    assert!(markdown.contains("seam_exposure_offset_rgb"));
+    assert!(markdown.contains("seam_exposure_held_out_validation_passed"));
+    assert!(markdown.contains("homography_feature_validation_accepted"));
+    assert!(markdown.contains("homography_minimum_held_out_feature_inlier_ratio"));
+    assert!(markdown.contains("homography_spatial_validation_accepted"));
+    assert!(markdown.contains("homography_minimum_split_ncc_improvement"));
+    assert!(markdown.contains("calibration_record_status"));
+    assert!(markdown.contains("calibration_color_mapping_evaluated"));
+    assert!(markdown.contains("calibration_color_mapping_applied"));
+    assert!(markdown.contains("calibration_color_mapping_status"));
+    assert!(markdown.contains("calibration_color_mapping_selected_candidate"));
+    assert!(markdown.contains("calibration_color_mapping_preferred_candidate"));
+    assert!(markdown.contains("calibration_color_mapping_reason"));
+    assert!(markdown.contains("calibration_color_mapping_consistency_issues"));
+    assert!(markdown.contains("adaptive_vibrance_preferred_memory_color_guard_enabled"));
+    assert!(markdown.contains("adaptive_vibrance_preferred_memory_color_matched_ratio"));
+    assert!(markdown.contains("adaptive_vibrance_preferred_memory_color_limited_ratio"));
+    assert!(markdown.contains("preferred_skin_rendering_enabled"));
+    assert!(markdown.contains("preferred_skin_rendering_adjusted_ratio"));
+    assert!(markdown.contains("preferred_skin_rendering_mean_delta_e_ab"));
+    assert!(markdown.contains("noise_reduction_structure_gate_start"));
+    assert!(markdown.contains("noise_reduction_structure_excluded_ratio"));
     assert!(markdown.contains("selected_candidate"));
     assert!(markdown.contains("selected_quality_score"));
     assert!(markdown.contains("technical_safety_score"));
@@ -1454,6 +2717,10 @@ fn test_validation_summary_markdown_is_compact() {
     assert!(markdown.contains("selected_spatial_consistency_penalty"));
     assert!(markdown.contains("candidate_risk"));
     assert!(markdown.contains("tone_color_trust_state"));
+    assert!(markdown.contains("neutral_safety_rescue_applied"));
+    assert!(markdown.contains("neutral_safety_rescue_preserved_ratio_gain"));
+    assert!(markdown.contains("neutral_safety_rescue_midtone_saturation_p95_reduction"));
+    assert!(markdown.contains("neutral_safety_rescue_reason"));
     assert!(markdown.contains("selected_runner_up_quality_delta"));
     assert!(markdown.contains("candidate_acceptance"));
     assert!(markdown.contains("strategy=image_derived_matrix"));
@@ -1472,9 +2739,19 @@ fn test_validation_summary_markdown_is_compact() {
     assert!(markdown.contains("neutral_trim_delta_before"));
     assert!(markdown.contains("color_protection_policy"));
     assert!(markdown.contains("color_trust_state"));
+    assert!(markdown.contains("adaptive_vibrance_skin_memory_protection_enabled"));
+    assert!(markdown.contains("adaptive_vibrance_skin_memory_protected_ratio"));
     assert!(markdown.contains("render_luminance_range_p05_p95"));
+    assert!(markdown.contains("tone_output_confidence_status"));
+    assert!(markdown.contains("tone_output_evidence_confidence"));
+    assert!(markdown.contains("render_to_mapped_luminance_range_ratio"));
+    assert!(markdown.contains("maximum_post_tone_high_clip_ratio"));
     assert!(markdown.contains("high_frequency_luma_residual_p95"));
     assert!(markdown.contains("high_frequency_flat_chroma_residual_p95"));
+    assert!(markdown.contains("grain_detail_review_required"));
+    assert!(markdown.contains("grain_detail_decision_supported"));
+    assert!(markdown.contains("grain_detail_luminance_p10_retention"));
+    assert!(markdown.contains("grain_detail_chroma_p10_retention"));
     assert!(markdown.contains("neutral_balance_weak_anchor_fallback"));
     assert!(markdown.contains("bright_neutral_saturation_p95"));
     assert!(markdown.contains("bright_neutral_rgb_median"));
@@ -1482,16 +2759,121 @@ fn test_validation_summary_markdown_is_compact() {
 }
 
 #[test]
+fn test_validation_summary_rejects_contradictory_calibration_application_claim() {
+    let mut report = fixture_report();
+    let colorspace = report
+        .phases
+        .iter_mut()
+        .find(|phase| phase.name == "colorspace_mapping")
+        .expect("colorspace phase");
+    colorspace.metrics["calibration"]["color_mapping_application"]["applied"] =
+        serde_json::json!(true);
+
+    let summary = scanstitch::validation::summarize_report("fixture", &report);
+    assert!(summary
+        .diagnostic_consistency_issues
+        .contains(&"calibration_color_mapping_applied_status_mismatch".to_string()));
+}
+
+#[test]
+fn test_validation_summary_rejects_contradictory_preferred_memory_color_guard_population() {
+    let mut report = fixture_report();
+    let tone = report
+        .phases
+        .iter_mut()
+        .find(|phase| phase.name == "tone_mapping")
+        .expect("tone phase");
+    tone.metrics["adaptive_vibrance_preferred_memory_color_guard"]["limited_pixel_ratio"] =
+        serde_json::json!(0.25);
+
+    let summary = scanstitch::validation::summarize_report("fixture", &report);
+    assert!(summary
+        .diagnostic_consistency_issues
+        .contains(&"preferred_memory_color_guard_limited_exceeds_matched".to_string()));
+    assert!(summary
+        .diagnostic_consistency_issues
+        .contains(&"preferred_memory_color_guard_family_limited_sum_mismatch".to_string()));
+}
+
+#[test]
+fn test_validation_summary_rejects_contradictory_preferred_skin_rendering_effect() {
+    let mut report = fixture_report();
+    let tone = report
+        .phases
+        .iter_mut()
+        .find(|phase| phase.name == "tone_mapping")
+        .expect("tone phase");
+    tone.metrics["preferred_skin_rendering"]["adjusted_pixel_ratio"] = serde_json::json!(0.20);
+    tone.metrics["preferred_skin_rendering"]["max_delta_e_ab"] = serde_json::json!(3.5);
+    tone.metrics["preferred_skin_rendering"]["mean_chroma_delta"] = serde_json::json!(0.1);
+
+    let summary = scanstitch::validation::summarize_report("fixture", &report);
+    assert!(summary
+        .diagnostic_consistency_issues
+        .contains(&"preferred_skin_rendering_adjusted_exceeds_outside_core".to_string()));
+    assert!(summary
+        .diagnostic_consistency_issues
+        .contains(&"preferred_skin_rendering_delta_e_cap_exceeded".to_string()));
+    assert!(summary
+        .diagnostic_consistency_issues
+        .contains(&"preferred_skin_rendering_chroma_increase_detected".to_string()));
+}
+
+#[test]
+fn test_validation_summary_rejects_contradictory_grain_selectivity_evidence() {
+    let mut report = fixture_report();
+    let tone = report
+        .phases
+        .iter_mut()
+        .find(|phase| phase.name == "tone_mapping")
+        .expect("tone phase");
+    tone.metrics["noise_reduction_structure_gate_start"] = serde_json::json!(0.04);
+    tone.metrics["noise_reduction_structure_excluded_ratio"] = serde_json::json!(0.30);
+    tone.metrics["noise_reduction_mean_abs_chroma_delta"] = serde_json::json!(0.03);
+
+    let summary = scanstitch::validation::summarize_report("fixture", &report);
+    assert!(summary
+        .diagnostic_consistency_issues
+        .contains(&"grain_reduction_structure_gate_invalid".to_string()));
+    assert!(summary
+        .diagnostic_consistency_issues
+        .contains(&"grain_reduction_applied_and_excluded_overlap".to_string()));
+    assert!(summary
+        .diagnostic_consistency_issues
+        .contains(&"grain_reduction_chroma_delta_mean_exceeds_max".to_string()));
+}
+
+#[test]
 fn test_synthetic_color_suite_proves_required_decision_edges() {
     let suite = scanstitch::validation::run_synthetic_color_suite();
 
     assert_eq!(suite.status, "passed", "issues: {:?}", suite.issues);
-    assert_eq!(suite.cases.len(), 20);
+    assert_eq!(suite.cases.len(), 24);
     assert!(suite.cases.iter().any(|case| {
         case.name == "calibrated_profile_beats_image_derived"
             && case.actual_selected_candidate.as_deref() == Some("calibrated_direct_profile")
             && case.actual_calibration_acceptance_status.as_deref() == Some("accepted")
             && case.actual_calibration_beats_image_derived == Some(true)
+    }));
+    assert!(suite.cases.iter().any(|case| {
+        case.name == "root_polynomial_selected_inside_measured_support"
+            && case.actual_selected_candidate.as_deref() == Some("calibrated_root_polynomial")
+            && case.actual_mapping_strategy.as_deref() == Some("calibrated_root_polynomial")
+    }));
+    assert!(suite.cases.iter().any(|case| {
+        case.name == "root_polynomial_rejected_outside_measured_support"
+            && case.actual_selected_candidate.as_deref() == Some("calibrated_direct_profile")
+            && case.actual_mapping_strategy.as_deref() == Some("calibrated_profile")
+    }));
+    assert!(suite.cases.iter().any(|case| {
+        case.name == "residual_lut_selected_inside_measured_support"
+            && case.actual_selected_candidate.as_deref() == Some("calibrated_residual_lut_3d")
+            && case.actual_mapping_strategy.as_deref() == Some("calibrated_residual_lut_3d")
+    }));
+    assert!(suite.cases.iter().any(|case| {
+        case.name == "residual_lut_rejected_outside_measured_rgb_volume"
+            && case.actual_selected_candidate.as_deref() == Some("calibrated_direct_profile")
+            && case.actual_mapping_strategy.as_deref() == Some("calibrated_profile")
     }));
     assert!(suite.cases.iter().any(|case| {
         case.name == "weak_calibration_rejected_quality"
@@ -1580,11 +2962,9 @@ fn test_synthetic_color_suite_proves_required_decision_edges() {
     }));
     assert!(suite.cases.iter().any(|case| {
         case.name == "biased_scene_anchor_review_required"
-            && case.actual_selected_candidate.as_deref() == Some("gamut_trusted_image_matrix_blend")
-            && matches!(
-                case.actual_candidate_risk.as_deref(),
-                Some("review_anchor_support" | "review_gamut")
-            )
+            && case.actual_selected_candidate.as_deref() == Some("neutral_balance_fallback")
+            && case.actual_mapping_strategy.as_deref() == Some("neutral_balance_evidence_rescue")
+            && case.actual_candidate_risk.as_deref() == Some("fallback_only")
             && case.actual_tone_color_trust_state.as_deref() == Some("review_required")
             && case.actual_neutral_estimate_accepted == Some(true)
             && case.actual_dominant_anchor_accepted == Some(false)
@@ -1596,7 +2976,7 @@ fn test_synthetic_color_suite_proves_required_decision_edges() {
         .iter()
         .filter(|case| case.actual_selected_candidate.is_some())
         .collect::<Vec<_>>();
-    assert_eq!(selected_candidate_cases.len(), 12);
+    assert_eq!(selected_candidate_cases.len(), 16);
     assert!(selected_candidate_cases.iter().all(|case| {
         case.actual_density_monotonicity_score.is_some()
             && case.actual_hue_linearity_score.is_some()
@@ -1765,7 +3145,7 @@ fn test_validate_cli_runs_synthetic_color_suite_strict() {
     let summary: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&summary_json).unwrap()).unwrap();
     assert_eq!(summary["status"], "passed");
-    assert_eq!(summary["cases"].as_array().map(Vec::len), Some(20));
+    assert_eq!(summary["cases"].as_array().map(Vec::len), Some(24));
     let cases = summary["cases"].as_array().expect("synthetic cases");
     assert!(cases
         .iter()
@@ -1778,6 +3158,10 @@ fn test_validate_cli_runs_synthetic_color_suite_strict() {
         .any(|case| case["actual_spatial_consistency_penalty"].is_number()));
     let markdown = std::fs::read_to_string(&summary_md).unwrap();
     assert!(markdown.contains("calibrated_profile_beats_image_derived"));
+    assert!(markdown.contains("root_polynomial_selected_inside_measured_support"));
+    assert!(markdown.contains("root_polynomial_rejected_outside_measured_support"));
+    assert!(markdown.contains("residual_lut_selected_inside_measured_support"));
+    assert!(markdown.contains("residual_lut_rejected_outside_measured_rgb_volume"));
     assert!(markdown.contains("calibration_neutral_regression_rejected"));
     assert!(markdown.contains("rejected_neutral"));
     assert!(markdown.contains("unsafe_calibration_rejected_auto"));
@@ -1788,6 +3172,7 @@ fn test_validate_cli_runs_synthetic_color_suite_strict() {
     assert!(markdown.contains("sparse_uncalibrated_anchor_review_required"));
     assert!(markdown.contains("dirty_edge_samples_rejected"));
     assert!(markdown.contains("biased_scene_anchor_review_required"));
+    assert!(markdown.contains("neutral_balance_evidence_rescue"));
     assert!(markdown.contains("Anchor stability"));
     assert!(markdown.contains("high_key_exposure_normalization_preserves_headroom"));
     assert!(markdown.contains("high_clip"));
@@ -1944,6 +3329,56 @@ fn test_validate_cli_rejects_unknown_summary_baseline_fields() {
 }
 
 #[test]
+fn test_validate_cli_strict_rejects_contradictory_calibration_application_claim() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let report_path = tmp.path().join("report.json");
+    let summary_json = tmp.path().join("summary.json");
+    let summary_md = tmp.path().join("summary.md");
+    let output_path = tmp.path().join("output.tiff");
+    scanstitch::tiff_io::save_tiff_f64_linear_prophoto(&small_rgb_image(), &output_path).unwrap();
+
+    let mut report = fixture_report();
+    set_report_output_path(&mut report, &output_path);
+    let colorspace = report
+        .phases
+        .iter_mut()
+        .find(|phase| phase.name == "colorspace_mapping")
+        .expect("colorspace phase");
+    colorspace.metrics["calibration"]["color_mapping_application"]["applied"] =
+        serde_json::json!(true);
+    report.save(&report_path).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture")
+        .arg("calibration-consistency")
+        .arg("--report")
+        .arg(&report_path)
+        .arg("--strict")
+        .arg("--quiet")
+        .arg("--summary-json")
+        .arg(&summary_json)
+        .arg("--summary-md")
+        .arg(&summary_md)
+        .output()
+        .expect("run scanstitch-validate with contradictory calibration application claim");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("strict report consistency validation failed")
+            && stderr.contains("calibration_color_mapping_applied_status_mismatch"),
+        "unexpected stderr: {stderr}"
+    );
+    let summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&summary_json).unwrap()).unwrap();
+    assert!(summary["diagnostic_consistency_issues"]
+        .as_array()
+        .is_some_and(|issues| issues
+            .iter()
+            .any(|issue| issue == "calibration_color_mapping_applied_status_mismatch")));
+}
+
+#[test]
 fn test_validate_cli_rejects_incomplete_direct_summary_baseline_contract() {
     let tmp = tempfile::TempDir::new().unwrap();
     let report_path = tmp.path().join("report.json");
@@ -2058,19 +3493,82 @@ fn test_validate_cli_rejects_fixture_registry_contract_violations() {
                     "component1": "left.tif",
                     "component2": "right.tif",
                     "input_mode": "not-a-mode",
+                    "deskew": "sideways",
+                    "orientation_correction": "sideways",
                     "bit_depth": 12,
+                    "grain_reduction": "sideways",
+                    "grain_strength": 1.1,
+                    "grain_scale": 0.1,
                     "force_stitch": true,
                     "force_no_stitch": true
+                },
+                "grain-conflict": {
+                    "component1": "left.tif",
+                    "component2": "right.tif",
+                    "grain_reduction": "on",
+                    "expectations": {
+                        "grain_reduction_enabled": false
+                    }
+                },
+                "single-orphans": {
+                    "component1": "single.tif",
+                    "component2_sha256": "0".repeat(64),
+                    "additional_components": [{
+                        "path": "third.tif"
+                    }]
+                },
+                "single-force-stitch": {
+                    "component1": "single.tif",
+                    "force_stitch": true
                 },
                 "bad-expectations": {
                     "component1": "left.tif",
                     "component2": "right.tif",
                     "component1_sha256": "not-a-sha256",
+                    "additional_components": [{
+                        "path": "left.tif",
+                        "sha256": "0".repeat(64)
+                    }],
                     "summary_baseline_sha256": "not-a-sha256",
                     "calibration_library_sha256": "not-a-sha256",
                     "reference_evidence": ["gray-card", "gray-card"],
                     "expectations": {
+                        "deskew_status": "",
+                        "deskew_retained_area_ratio_min": 1.1,
+                        "orientation_components_expected": [{
+                            "component_index": 4,
+                            "upright_approved": false,
+                            "decoded_pixel_sha256": "not-a-sha256",
+                            "tag_present": false,
+                            "tag_value": 6,
+                            "transform": "",
+                            "applied": false,
+                            "source_width": 0,
+                            "source_height": 0,
+                            "output_width": 0,
+                            "output_height": 0
+                        }],
                         "stitch_decision": "",
+                        "inferred_component_order": [1, 1, 4],
+                        "technical_white_balance_status": "",
+                        "creative_temperature": 1.1,
+                        "creative_tint": -1.1,
+                        "seam_exposure_model": "",
+                        "seam_exposure_held_out_improvement_over_gain_min": -0.1,
+                        "seam_exposure_offset_normalized_abs_max": 1.1,
+                        "seam_exposure_spatial_slope_abs_min": 0.3,
+                        "seam_exposure_spatial_slope_abs_max": 0.2,
+                        "seam_exposure_spatial_slope_agreement_ratio_min": 1.1,
+                        "seam_exposure_held_out_spatial_improvement_over_best_constant_min": -0.1,
+                        "seam_exposure_spatial_offset_slope_normalized_abs_min": 0.3,
+                        "seam_exposure_spatial_offset_slope_normalized_abs_max": 0.2,
+                        "seam_exposure_spatial_offset_endpoint_normalized_abs_max": 1.1,
+                        "seam_exposure_spatial_affine_slope_agreement_ratio_min": 1.1,
+                        "seam_exposure_spatial_affine_center_offset_delta_normalized_max": 1.1,
+                        "seam_exposure_held_out_spatial_gain_offset_improvement_over_best_simpler_min": -0.1,
+                        "seam_exposure_spatial_2d_distinct_columns_min": 0,
+                        "seam_exposure_spatial_2d_horizontal_slope_agreement_ratio_min": 1.1,
+                        "seam_exposure_held_out_spatial_2d_improvement_over_best_simpler_min": -0.1,
                         "base_estimate_source": "",
                         "output_color_space": "",
                         "render_input_source": "",
@@ -2096,10 +3594,17 @@ fn test_validate_cli_rejects_fixture_registry_contract_violations() {
                         "selected_quality_score_max": -0.1,
                         "technical_safety_score_max": -0.1,
                         "color_fidelity_score_max": -0.1,
+                        "neutral_safety_rescue_preserved_ratio_gain_min": 1.1,
+                        "neutral_safety_rescue_midtone_saturation_p95_reduction_min": 1.1,
+                        "neutral_safety_rescue_reason_contains": "",
                         "highlight_chroma_compressed_ratio_min": 1.1,
                         "highlight_chroma_compressed_ratio_max": 1.1,
                         "highlight_neutral_chroma_compressed_ratio_max": 1.1,
                         "shadow_chroma_compressed_ratio_max": 1.1,
+                        "grain_reduction_applied_ratio_min": 1.1,
+                        "grain_reduction_structure_excluded_ratio_min": 1.1,
+                        "grain_reduction_flat_luma_p95_reduction_ratio_min": 1.1,
+                        "grain_reduction_flat_chroma_p95_reduction_ratio_min": 1.1,
                         "memory_color_penalty_max": -0.1,
                         "spatial_consistency_penalty_max": -0.1,
                         "selected_runner_up_quality_delta_min": -0.1,
@@ -2108,6 +3613,13 @@ fn test_validate_cli_rejects_fixture_registry_contract_violations() {
                         "saturation_preservation_median_ratio_min": -0.1,
                         "spatial_neutral_delta_p95_max": -0.1,
                         "post_scale_preserved_ratio_min": 1.1,
+                        "render_luminance_range_p05_p95_min": 1.1,
+                        "render_review_status": "",
+                        "tone_output_confidence_status": "",
+                        "tone_output_evidence_confidence_min": 1.1,
+                        "render_to_mapped_luminance_range_ratio_min": -0.1,
+                        "post_chroma_compression_clipped_high_ratio_max": 1.1,
+                        "post_chroma_compression_clipped_low_ratio_max": 1.1,
                         "reference_patch_rms_delta_e_max": -0.1,
                         "reference_patch_rms_delta_e2000_max": -0.1,
                         "debug_artifact_kinds_required": [
@@ -2156,16 +3668,53 @@ fn test_validate_cli_rejects_fixture_registry_contract_violations() {
         "external-no-profile:external_profile_case_without_calibration_profile",
         "uncalibrated-with-profile:uncalibrated_case_declares_calibration_profile",
         "bad-overrides:input_mode_invalid:not-a-mode",
+        "bad-overrides:deskew_invalid:sideways",
+        "bad-overrides:orientation_correction_invalid:sideways",
         "bad-overrides:bit_depth_invalid",
+        "bad-overrides:grain_reduction_invalid:sideways",
+        "bad-overrides:grain_strength_invalid",
+        "bad-overrides:grain_scale_invalid",
         "bad-overrides:force_stitch_and_force_no_stitch",
+        "grain-conflict:grain_reduction_conflicts_with_enabled_expectation",
+        "single-orphans:component2_sha256_without_component2",
+        "single-orphans:additional_components_without_component2",
+        "single-force-stitch:force_stitch_requires_multiple_components",
         "bad-expectations:component1_sha256_invalid",
         "bad-expectations:component_sha256_pair_incomplete",
+        "bad-expectations:component_sha256_set_incomplete",
+        "bad-expectations:component3_path_duplicate",
         "bad-expectations:summary_baseline_sha256_invalid",
         "bad-expectations:summary_baseline_sha256_without_summary_baseline",
         "bad-expectations:calibration_library_sha256_invalid",
         "bad-expectations:calibration_library_sha256_without_calibration_library",
         "bad-expectations:reference_evidence_duplicate:gray-card",
+        "bad-expectations:expectations.deskew_status_empty",
+        "bad-expectations:expectations.deskew_retained_area_ratio_min_out_of_range",
+        "bad-expectations:expectations.orientation_components_expected_component_out_of_range:4",
+        "bad-expectations:expectations.orientation_components_expected_decoded_pixel_sha256_invalid:4",
+        "bad-expectations:expectations.orientation_components_expected_tag_invalid:4",
+        "bad-expectations:expectations.orientation_components_expected_transform_empty:4",
+        "bad-expectations:expectations.orientation_components_expected_dimensions_out_of_range:4",
         "bad-expectations:expectations.stitch_decision_empty",
+        "bad-expectations:expectations.technical_white_balance_status_empty",
+        "bad-expectations:expectations.inferred_component_order_duplicate:1",
+        "bad-expectations:expectations.inferred_component_order_out_of_range:4",
+        "bad-expectations:expectations.creative_temperature_out_of_range",
+        "bad-expectations:expectations.creative_tint_out_of_range",
+        "bad-expectations:expectations.seam_exposure_model_empty",
+        "bad-expectations:expectations.seam_exposure_held_out_improvement_over_gain_min_out_of_range",
+        "bad-expectations:expectations.seam_exposure_offset_normalized_abs_max_out_of_range",
+        "bad-expectations:expectations.seam_exposure_spatial_slope_bounds_inverted",
+        "bad-expectations:expectations.seam_exposure_spatial_slope_agreement_ratio_min_out_of_range",
+        "bad-expectations:expectations.seam_exposure_held_out_spatial_improvement_over_best_constant_min_out_of_range",
+        "bad-expectations:expectations.seam_exposure_spatial_offset_slope_bounds_inverted",
+        "bad-expectations:expectations.seam_exposure_spatial_offset_endpoint_normalized_abs_max_out_of_range",
+        "bad-expectations:expectations.seam_exposure_spatial_affine_slope_agreement_ratio_min_out_of_range",
+        "bad-expectations:expectations.seam_exposure_spatial_affine_center_offset_delta_normalized_max_out_of_range",
+        "bad-expectations:expectations.seam_exposure_held_out_spatial_gain_offset_improvement_over_best_simpler_min_out_of_range",
+        "bad-expectations:expectations.seam_exposure_spatial_2d_distinct_columns_min_out_of_range",
+        "bad-expectations:expectations.seam_exposure_spatial_2d_horizontal_slope_agreement_ratio_min_out_of_range",
+        "bad-expectations:expectations.seam_exposure_held_out_spatial_2d_improvement_over_best_simpler_min_out_of_range",
         "bad-expectations:expectations.base_estimate_source_empty",
         "bad-expectations:expectations.output_color_space_empty",
         "bad-expectations:expectations.render_input_source_empty",
@@ -2182,10 +3731,17 @@ fn test_validate_cli_rejects_fixture_registry_contract_violations() {
         "bad-expectations:expectations.selected_quality_score_max_out_of_range",
         "bad-expectations:expectations.technical_safety_score_max_out_of_range",
         "bad-expectations:expectations.color_fidelity_score_max_out_of_range",
+        "bad-expectations:expectations.neutral_safety_rescue_preserved_ratio_gain_min_out_of_range",
+        "bad-expectations:expectations.neutral_safety_rescue_midtone_saturation_p95_reduction_min_out_of_range",
+        "bad-expectations:expectations.neutral_safety_rescue_reason_contains_empty",
         "bad-expectations:expectations.highlight_chroma_compressed_ratio_min_out_of_range",
         "bad-expectations:expectations.highlight_chroma_compressed_ratio_max_out_of_range",
         "bad-expectations:expectations.highlight_neutral_chroma_compressed_ratio_max_out_of_range",
         "bad-expectations:expectations.shadow_chroma_compressed_ratio_max_out_of_range",
+        "bad-expectations:expectations.grain_reduction_applied_ratio_min_out_of_range",
+        "bad-expectations:expectations.grain_reduction_structure_excluded_ratio_min_out_of_range",
+        "bad-expectations:expectations.grain_reduction_flat_luma_p95_reduction_ratio_min_out_of_range",
+        "bad-expectations:expectations.grain_reduction_flat_chroma_p95_reduction_ratio_min_out_of_range",
         "bad-expectations:expectations.memory_color_penalty_max_out_of_range",
         "bad-expectations:expectations.spatial_consistency_penalty_max_out_of_range",
         "bad-expectations:expectations.selected_runner_up_quality_delta_min_out_of_range",
@@ -2194,6 +3750,13 @@ fn test_validate_cli_rejects_fixture_registry_contract_violations() {
         "bad-expectations:expectations.saturation_preservation_median_ratio_min_out_of_range",
         "bad-expectations:expectations.spatial_neutral_delta_p95_max_out_of_range",
         "bad-expectations:expectations.post_scale_preserved_ratio_min_out_of_range",
+        "bad-expectations:expectations.render_luminance_range_p05_p95_min_out_of_range",
+        "bad-expectations:expectations.render_review_status_empty",
+        "bad-expectations:expectations.tone_output_confidence_status_empty",
+        "bad-expectations:expectations.tone_output_evidence_confidence_min_out_of_range",
+        "bad-expectations:expectations.render_to_mapped_luminance_range_ratio_min_out_of_range",
+        "bad-expectations:expectations.post_chroma_compression_clipped_high_ratio_max_out_of_range",
+        "bad-expectations:expectations.post_chroma_compression_clipped_low_ratio_max_out_of_range",
         "bad-expectations:expectations.reference_patch_rms_delta_e_max_out_of_range",
         "bad-expectations:expectations.reference_patch_rms_delta_e2000_max_out_of_range",
         "bad-expectations:expectations.debug_artifact_kinds_required_empty",
@@ -2354,7 +3917,11 @@ fn test_validate_cli_writes_summary_baseline_from_report() {
     assert_eq!(baseline.colorspace.selected_candidate_rank, Some(1));
     assert_eq!(
         baseline.colorspace.calibration_acceptance_status.as_deref(),
-        Some("accepted")
+        Some("rejected_reference_fit")
+    );
+    assert_eq!(
+        baseline.colorspace.calibration_color_mapping_applied,
+        Some(false)
     );
     assert_eq!(baseline.colorspace.selected_quality_score, Some(0.42));
     assert_eq!(baseline.colorspace.technical_safety_score, Some(0.12));
@@ -2394,6 +3961,10 @@ fn test_validate_cli_writes_summary_baseline_from_report() {
     assert_eq!(baseline.colorspace.neutral_trim_applied, Some(true));
     assert_eq!(baseline.colorspace.candidate_acceptance_signatures.len(), 2);
     assert_eq!(baseline.grain.luma_residual_p95, Some(0.006));
+    assert_eq!(baseline.grain.detail_review_required, Some(false));
+    assert_eq!(baseline.grain.detail_decision_supported, Some(true));
+    assert_eq!(baseline.grain.luminance_p10_retention, Some(0.94));
+    assert_eq!(baseline.grain.chroma_p10_retention, Some(0.92));
 
     let summary: scanstitch::validation::ValidationSummary =
         serde_json::from_str(&std::fs::read_to_string(&summary_json).unwrap()).unwrap();
@@ -2407,6 +3978,7 @@ fn test_validate_cli_reports_fixture_coverage_strict() {
     let tmp = tempfile::TempDir::new().unwrap();
     let path1 = tmp.path().join("left.tiff");
     let path2 = tmp.path().join("right.tiff");
+    let path3 = tmp.path().join("middle.tiff");
     let baseline_path = tmp.path().join("baseline.json");
     let registry_path = tmp.path().join("fixtures.json");
     let summary_json = tmp.path().join("coverage.json");
@@ -2415,8 +3987,10 @@ fn test_validate_cli_reports_fixture_coverage_strict() {
     let component = synthetic::constant_image(4, 4, [12000, 7000, 3000]);
     scanstitch::tiff_io::save_tiff_u16(&component, &path1).unwrap();
     scanstitch::tiff_io::save_tiff_u16(&component, &path2).unwrap();
+    scanstitch::tiff_io::save_tiff_u16(&component, &path3).unwrap();
     let component1_sha256 = file_sha256_hex(&path1);
     let component2_sha256 = file_sha256_hex(&path2);
+    let component3_sha256 = file_sha256_hex(&path3);
     std::fs::write(
         &baseline_path,
         serde_json::to_string_pretty(&fixture_summary_baseline()).unwrap(),
@@ -2432,6 +4006,8 @@ fn test_validate_cli_reports_fixture_coverage_strict() {
                 "min_fixtures": 1,
                 "min_component_pairs": 1,
                 "min_component_sha256_pairs": 1,
+                "min_n_component_fixtures": 1,
+                "min_component_sha256_sets": 1,
                 "min_readable_tiff_pairs": 1,
                 "min_tiff_layout_consistent_pairs": 1,
                 "min_tiff_dimension_matched_pairs": 1,
@@ -2453,6 +4029,15 @@ fn test_validate_cli_reports_fixture_coverage_strict() {
                 "min_reference_patch_fixtures": 1,
                 "min_reference_patch_count": 4,
                 "min_debug_artifact_expectation_fixtures": 1,
+                "min_render_dynamic_range_contract_fixtures": 1,
+                "min_stitch_normalization_contract_fixtures": 1,
+                "min_geometry_preparation_contract_fixtures": 1,
+                "min_geometry_accuracy_contract_fixtures": 1,
+                "min_orientation_accuracy_contract_fixtures": 1,
+                "min_negative_reconstruction_contract_fixtures": 1,
+                "min_grain_reduction_enabled_fixtures": 1,
+                "min_grain_detail_contract_fixtures": 1,
+                "min_grain_reduction_effect_contract_fixtures": 1,
                 "required_film_stocks": ["Synthetic negative"],
                 "required_scene_tags": ["neutral-target"],
                 "required_exposure_tags": ["normal-exposure"],
@@ -2479,7 +4064,17 @@ fn test_validate_cli_reports_fixture_coverage_strict() {
                     "component2": path2,
                     "component1_sha256": component1_sha256.clone(),
                     "component2_sha256": component2_sha256.clone(),
+                    "additional_components": [{
+                        "path": path3,
+                        "sha256": component3_sha256.clone()
+                    }],
                     "output_dir": tmp.path().join("out"),
+                    "input_mode": "negative",
+                    "grain_reduction": "on",
+                    "grain_strength": 0.6,
+                    "grain_scale": 1.0,
+                    "deskew": "manual",
+                    "deskew_angle_degrees": 0.5,
                     "summary_baseline": baseline_path,
                     "summary_baseline_sha256": summary_baseline_sha256.clone(),
                     "calibration_library": library_dir,
@@ -2492,6 +4087,144 @@ fn test_validate_cli_reports_fixture_coverage_strict() {
                     "reference_evidence": ["gray-card", "colorchecker"],
                     "calibration_case": "scanner-roll-library",
                     "expectations": {
+                        "deskew_status": "applied",
+                        "deskew_applied": true,
+                        "deskew_review_required": false,
+                        "deskew_all_components_applied": true,
+                        "deskew_minimum_component_retained_area_ratio_min": 0.9,
+                        "border_crop_all_components_cropped": true,
+                        "border_crop_minimum_removed_edge_count_per_component_min": 4,
+                        "border_crop_retained_area_ratio_min": 0.5,
+                        "border_crop_retained_area_ratio_max": 0.99,
+                        "border_crop_rejected": false,
+                        "deskew_correction_degrees_expected": -0.5,
+                        "deskew_correction_tolerance_degrees": 0.05,
+                        "border_crop_components_expected": [
+                            {
+                                "component_index": 1,
+                                "top_removed": 1,
+                                "bottom_removed": 1,
+                                "left_removed": 1,
+                                "right_removed": 1,
+                                "tolerance_px": 4
+                            },
+                            {
+                                "component_index": 2,
+                                "top_removed": 1,
+                                "bottom_removed": 1,
+                                "left_removed": 1,
+                                "right_removed": 1,
+                                "tolerance_px": 4
+                            },
+                            {
+                                "component_index": 3,
+                                "top_removed": 1,
+                                "bottom_removed": 1,
+                                "left_removed": 1,
+                                "right_removed": 1,
+                                "tolerance_px": 4
+                            }
+                        ],
+                        "orientation_components_expected": [
+                            {
+                                "component_index": 1,
+                                "upright_approved": true,
+                                "decoded_pixel_sha256": "1".repeat(64),
+                                "tag_present": false,
+                                "tag_value": null,
+                                "transform": "identity",
+                                "applied": false,
+                                "source_width": 4,
+                                "source_height": 4,
+                                "output_width": 4,
+                                "output_height": 4
+                            },
+                            {
+                                "component_index": 2,
+                                "upright_approved": true,
+                                "decoded_pixel_sha256": "2".repeat(64),
+                                "tag_present": false,
+                                "tag_value": null,
+                                "transform": "identity",
+                                "applied": false,
+                                "source_width": 4,
+                                "source_height": 4,
+                                "output_width": 4,
+                                "output_height": 4
+                            },
+                            {
+                                "component_index": 3,
+                                "upright_approved": true,
+                                "decoded_pixel_sha256": "3".repeat(64),
+                                "tag_present": false,
+                                "tag_value": null,
+                                "transform": "identity",
+                                "applied": false,
+                                "source_width": 4,
+                                "source_height": 4,
+                                "output_width": 4,
+                                "output_height": 4
+                            }
+                        ],
+                        "stitch_decision": "accepted_sequence",
+                        "inferred_component_order": [1, 3, 2],
+                        "seam_exposure_model": "identity",
+                        "seam_exposure_held_out_validation_passed": false,
+                        "seam_exposure_offset_normalized_abs_max": 0.0,
+                        "seam_blend_required": true,
+                        "seam_blend_mode": "seam_aware_multiband",
+                        "seam_blend_review_required": false,
+                        "seam_detail_review_required": false,
+                        "seam_detail_supported_scale_count_min": 2,
+                        "seam_detail_max_symmetric_energy_ratio_max": 2.0,
+                        "seam_gradient_ratio_max": 1.05,
+                        "seam_overlap_p95_abs_difference_max": 0.99,
+                        "base_estimate_source": "pre_crop_rebate_measurement",
+                        "base_confidence_min": 0.3,
+                        "density_inversion_skipped": false,
+                        "negative_response_model": "measured_nonlinear_dye_separation",
+                        "negative_response_source": "measured_roll_target_with_held_out_validation",
+                        "negative_response_accepted": true,
+                        "negative_response_review_required": false,
+                        "negative_response_crosstalk_model": "measured_3x3_scanner_density_to_film_layers",
+                        "negative_response_characteristic_curve_model": "measured_monotone_pchip_density_to_scene_log_exposure",
+                        "negative_response_measured_model_id": "synthetic-response-v1",
+                        "negative_response_measured_confidence_min": 0.75,
+                        "negative_response_held_out_delta_e00_rms_max": 6.0,
+                        "negative_response_held_out_max_delta_e00_max": 15.0,
+                        "negative_response_held_out_improvement_over_unit_slope_min": 0.25,
+                        "negative_response_density_noise_gain_max": 4.0,
+                        "negative_response_curve_extrapolated_ratio_max": 0.01,
+                        "negative_response_signed_headroom_preserved": true,
+                        "negative_response_curve_interpolation": "monotone_piecewise_cubic_hermite_with_endpoint_tangent_extrapolation",
+                        "render_input_source": "direct_density_transmittance",
+                        "calibration_acceptance_status": "accepted",
+                        "calibration_color_mapping_applied": true,
+                        "candidate_risk": "safe",
+                        "tone_color_trust_state": "trusted",
+                        "neutral_safety_rescue_applied": false,
+                        "output_color_space": "linear_prophoto_rgb_d50",
+                        "grain_reduction_enabled": true,
+                        "grain_reduction_applied_ratio_min": 0.01,
+                        "grain_reduction_structure_excluded_ratio_min": 0.01,
+                        "grain_reduction_flat_luma_p95_reduction_ratio_min": 0.02,
+                        "grain_reduction_flat_chroma_p95_reduction_ratio_min": 0.05,
+                        "grain_detail_review_required": false,
+                        "grain_detail_decision_supported": true,
+                        "grain_detail_luminance_probe_count_min": 64,
+                        "grain_detail_chroma_probe_count_min": 64,
+                        "grain_detail_luminance_p10_retention_min": 0.7,
+                        "grain_detail_chroma_p10_retention_min": 0.7,
+                        "post_scale_preserved_ratio_min": 0.98,
+                        "render_luminance_range_p05_p95_min": 0.4,
+                        "render_review_status": "reviewable",
+                        "render_reviewable": true,
+                        "tone_output_confidence_status": "supported_render_tonal_distribution",
+                        "tone_output_review_required": false,
+                        "tone_output_evidence_confidence_min": 1.0,
+                        "render_to_mapped_luminance_range_ratio_min": 0.08,
+                        "post_chroma_compression_clipped_high_ratio_max": 0.01,
+                        "post_chroma_compression_clipped_low_ratio_max": 0.01,
                         "debug_artifacts_required": true,
                         "debug_artifact_kinds_required": [
                             "candidate_comparison",
@@ -2530,6 +4263,17 @@ fn test_validate_cli_reports_fixture_coverage_strict() {
         serde_json::from_str(&std::fs::read_to_string(&summary_json).unwrap()).unwrap();
     assert_eq!(summary["status"], "passed");
     assert_eq!(summary["fixture_count"], 1);
+    assert_eq!(summary["component_file_count"], 3);
+    assert_eq!(summary["max_component_count"], 3);
+    assert_eq!(summary["n_component_fixture_count"], 1);
+    assert_eq!(summary["n_component_validation_ready_fixture_count"], 1);
+    assert_eq!(summary["component_set_available_count"], 1);
+    assert_eq!(summary["component_sha256_declared_set_count"], 1);
+    assert_eq!(summary["component_sha256_computed_set_count"], 1);
+    assert_eq!(summary["component_sha256_set_count"], 1);
+    assert_eq!(summary["readable_tiff_set_count"], 1);
+    assert_eq!(summary["tiff_layout_consistent_set_count"], 1);
+    assert_eq!(summary["tiff_dimension_matched_set_count"], 1);
     assert_eq!(summary["component_pair_available_count"], 1);
     assert_eq!(summary["component_sha256_declared_pair_count"], 1);
     assert_eq!(summary["component_sha256_computed_pair_count"], 1);
@@ -2537,7 +4281,26 @@ fn test_validate_cli_reports_fixture_coverage_strict() {
     assert_eq!(summary["readable_tiff_pair_count"], 1);
     assert_eq!(summary["tiff_layout_consistent_pair_count"], 1);
     assert_eq!(summary["tiff_dimension_matched_pair_count"], 1);
+    assert_eq!(summary["fixtures"][0]["component_count"], 3);
+    assert_eq!(summary["fixtures"][0]["all_components_exist"], true);
+    assert_eq!(
+        summary["fixtures"][0]["additional_components"][0]["component_number"],
+        3
+    );
+    assert_eq!(
+        summary["fixtures"][0]["additional_components"][0]["sha256"]["matched"],
+        true
+    );
     assert_eq!(summary["validation_ready_fixture_count"], 1);
+    assert_eq!(summary["render_dynamic_range_contract_fixture_count"], 1);
+    assert_eq!(summary["stitch_normalization_contract_fixture_count"], 1);
+    assert_eq!(summary["geometry_preparation_contract_fixture_count"], 1);
+    assert_eq!(summary["geometry_accuracy_contract_fixture_count"], 1);
+    assert_eq!(summary["orientation_accuracy_contract_fixture_count"], 1);
+    assert_eq!(summary["negative_reconstruction_contract_fixture_count"], 1);
+    assert_eq!(summary["grain_reduction_enabled_fixture_count"], 1);
+    assert_eq!(summary["grain_detail_contract_fixture_count"], 1);
+    assert_eq!(summary["grain_reduction_effect_contract_fixture_count"], 1);
     assert_eq!(summary["summary_baseline_declared_count"], 1);
     assert_eq!(summary["summary_baseline_file_count"], 1);
     assert_eq!(summary["summary_baseline_parseable_count"], 1);
@@ -2601,6 +4364,38 @@ fn test_validate_cli_reports_fixture_coverage_strict() {
     assert_eq!(
         summary["coverage_requirements"]["min_debug_artifact_expectation_fixtures"],
         serde_json::json!(1)
+    );
+    assert_eq!(
+        summary["coverage_requirements"]["min_render_dynamic_range_contract_fixtures"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        summary["coverage_requirements"]["min_stitch_normalization_contract_fixtures"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        summary["coverage_requirements"]["min_geometry_accuracy_contract_fixtures"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        summary["coverage_requirements"]["min_orientation_accuracy_contract_fixtures"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        summary["fixtures"][0]["geometry_accuracy_contract_complete"],
+        true
+    );
+    assert_eq!(
+        summary["fixtures"][0]["geometry_accuracy_contract_missing_fields"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        summary["fixtures"][0]["orientation_accuracy_contract_complete"],
+        true
+    );
+    assert_eq!(
+        summary["fixtures"][0]["orientation_accuracy_contract_missing_fields"],
+        serde_json::json!([])
     );
     assert_eq!(
         summary["unique_scanner_profiles"],
@@ -2736,6 +4531,66 @@ fn test_validate_cli_reports_fixture_coverage_strict() {
     );
     assert_eq!(summary["fixtures"][0]["validation_ready"], true);
     assert_eq!(
+        summary["fixtures"][0]["grain_reduction_enabled_declared"],
+        true
+    );
+    assert_eq!(
+        summary["fixtures"][0]["grain_detail_contract_complete"],
+        true
+    );
+    assert_eq!(
+        summary["fixtures"][0]["grain_detail_contract_missing_fields"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        summary["fixtures"][0]["grain_reduction_effect_contract_complete"],
+        true
+    );
+    assert_eq!(
+        summary["fixtures"][0]["grain_reduction_effect_contract_missing_fields"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        summary["fixtures"][0]["render_dynamic_range_contract_declared"],
+        true
+    );
+    assert_eq!(
+        summary["fixtures"][0]["render_dynamic_range_contract_complete"],
+        true
+    );
+    assert_eq!(
+        summary["fixtures"][0]["render_dynamic_range_contract_missing_fields"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        summary["fixtures"][0]["stitch_normalization_contract_declared"],
+        true
+    );
+    assert_eq!(
+        summary["fixtures"][0]["stitch_normalization_contract_complete"],
+        true
+    );
+    assert_eq!(
+        summary["fixtures"][0]["stitch_normalization_contract_missing_fields"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        summary["fixtures"][0]["geometry_preparation_contract_complete"],
+        true
+    );
+    assert_eq!(
+        summary["fixtures"][0]["geometry_preparation_contract_missing_fields"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        summary["fixtures"][0]["negative_reconstruction_contract_complete"],
+        true
+    );
+    assert_eq!(
+        summary["fixtures"][0]["negative_reconstruction_contract_missing_fields"],
+        serde_json::json!([])
+    );
+    assert_eq!(
         summary["fixtures"][0]["component1_tiff"]["status"],
         "readable"
     );
@@ -2821,6 +4676,14 @@ fn test_validate_cli_reports_fixture_coverage_strict() {
     assert!(markdown.contains("reference-patch fixtures"));
     assert!(markdown.contains("reference patches"));
     assert!(markdown.contains("debug-artifact expectation fixtures"));
+    assert!(markdown.contains("complete render-dynamic-range contracts"));
+    assert!(markdown.contains("complete stitch-normalization contracts"));
+    assert!(markdown.contains("contract=complete"));
+    assert!(markdown.contains("grain-reduction-enabled fixtures"));
+    assert!(markdown.contains("complete grain-detail contracts"));
+    assert!(markdown.contains("complete grain-reduction-effect contracts"));
+    assert!(markdown.contains("detail-contract=complete"));
+    assert!(markdown.contains("effect-contract=complete"));
     assert!(markdown.contains("Actions"));
     assert!(markdown.contains("required debug artifact kinds"));
     assert!(markdown.contains("candidate_comparison"));
@@ -2829,6 +4692,539 @@ fn test_validate_cli_reports_fixture_coverage_strict() {
     assert!(markdown.contains("roll-a"));
     assert!(markdown.contains("Synthetic negative|scanner-roll-library"));
     assert!(markdown.contains("synthetic-still-life|normal-exposure"));
+}
+
+#[test]
+fn test_validate_cli_fixture_coverage_requires_complete_grain_detail_contract() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path1 = tmp.path().join("left.tiff");
+    let path2 = tmp.path().join("right.tiff");
+    let baseline_path = tmp.path().join("baseline.json");
+    let registry_path = tmp.path().join("fixtures.json");
+    let summary_json = tmp.path().join("coverage.json");
+    let summary_md = tmp.path().join("coverage.md");
+
+    let component = synthetic::constant_image(4, 4, [12000, 7000, 3000]);
+    scanstitch::tiff_io::save_tiff_u16(&component, &path1).unwrap();
+    scanstitch::tiff_io::save_tiff_u16(&component, &path2).unwrap();
+    std::fs::write(
+        &baseline_path,
+        serde_json::to_string_pretty(&fixture_summary_baseline()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &registry_path,
+        serde_json::json!({
+            "coverage_requirements": {
+                "min_grain_reduction_enabled_fixtures": 1,
+                "min_grain_detail_contract_fixtures": 1,
+                "min_grain_reduction_effect_contract_fixtures": 1
+            },
+            "fixtures": {
+                "logan": {
+                    "component1": path1,
+                    "component2": path2,
+                    "summary_baseline": baseline_path,
+                    "grain_reduction": "on",
+                    "grain_strength": 0.0,
+                    "grain_scale": 1.0,
+                    "film_stock": "Synthetic negative",
+                    "scene_tags": ["fine-texture"],
+                    "exposure_tags": ["normal-exposure"],
+                    "calibration_case": "uncalibrated-image-derived",
+                    "expectations": {
+                        "grain_reduction_enabled": true
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture-coverage")
+        .arg("--strict")
+        .arg("--quiet")
+        .arg("--summary-json")
+        .arg(&summary_json)
+        .arg("--summary-md")
+        .arg(&summary_md)
+        .output()
+        .expect("run scanstitch-validate incomplete grain-detail coverage");
+
+    assert!(
+        !output.status.success(),
+        "an enabled denoise declaration must not substitute for a complete detail contract"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("fixture_coverage_min_grain_detail_contract_fixtures_not_met"));
+    assert!(
+        stderr.contains("fixture_coverage_min_grain_reduction_effect_contract_fixtures_not_met")
+    );
+    assert!(!stderr.contains("fixture_coverage_min_grain_reduction_enabled_fixtures_not_met"));
+
+    let summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&summary_json).unwrap()).unwrap();
+    assert_eq!(summary["validation_ready_fixture_count"], 1);
+    assert_eq!(summary["grain_reduction_enabled_fixture_count"], 1);
+    assert_eq!(summary["grain_detail_contract_fixture_count"], 0);
+    assert_eq!(summary["grain_reduction_effect_contract_fixture_count"], 0);
+    assert_eq!(
+        summary["fixtures"][0]["grain_detail_contract_complete"],
+        false
+    );
+    assert_eq!(
+        summary["fixtures"][0]["grain_detail_contract_missing_fields"],
+        serde_json::json!([
+            "grain_strength>0",
+            "expectations.grain_detail_review_required=false",
+            "expectations.grain_detail_decision_supported=true",
+            "expectations.grain_detail_luminance_probe_count_min>=64",
+            "expectations.grain_detail_chroma_probe_count_min>=64",
+            "expectations.grain_detail_luminance_p10_retention_min>=0.70",
+            "expectations.grain_detail_chroma_p10_retention_min>=0.70"
+        ])
+    );
+    assert_eq!(
+        summary["fixtures"][0]["action_items"],
+        serde_json::json!([
+            "complete_grain_detail_contract_for_fixture:logan",
+            "complete_grain_reduction_effect_contract_for_fixture:logan"
+        ])
+    );
+    assert_eq!(
+        summary["fixtures"][0]["grain_reduction_effect_contract_missing_fields"],
+        serde_json::json!([
+            "grain_detail_contract_complete",
+            "expectations.grain_reduction_applied_ratio_min>0",
+            "expectations.grain_reduction_structure_excluded_ratio_min>0",
+            "expectations.grain_reduction_flat_luma_p95_reduction_ratio_min>0",
+            "expectations.grain_reduction_flat_chroma_p95_reduction_ratio_min>0"
+        ])
+    );
+    assert_eq!(
+        summary["action_items"],
+        serde_json::json!([
+            "add_complete_grain_detail_contracts_for_validation_ready_fixtures:1",
+            "add_complete_grain_reduction_effect_contracts_for_validation_ready_fixtures:1",
+            "complete_grain_detail_contract_for_fixture:logan",
+            "complete_grain_reduction_effect_contract_for_fixture:logan"
+        ])
+    );
+    assert!(summary["fixtures"][0]["repair_plan"][0]["details"]
+        .as_str()
+        .unwrap()
+        .contains("both-channel"));
+    assert!(summary["fixtures"][0]["repair_plan"][1]["details"]
+        .as_str()
+        .unwrap()
+        .contains("exact structure-excluded"));
+
+    let markdown = std::fs::read_to_string(&summary_md).unwrap();
+    assert!(markdown.contains("detail-contract=incomplete"));
+    assert!(markdown.contains("effect-contract=incomplete"));
+    assert!(markdown.contains("complete_grain_detail_contract_for_fixture:logan"));
+    assert!(markdown.contains("complete_grain_reduction_effect_contract_for_fixture:logan"));
+}
+
+#[test]
+fn test_validate_cli_fixture_coverage_requires_complete_render_dynamic_range_contract() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path1 = tmp.path().join("left.tiff");
+    let path2 = tmp.path().join("right.tiff");
+    let baseline_path = tmp.path().join("baseline.json");
+    let registry_path = tmp.path().join("fixtures.json");
+    let summary_json = tmp.path().join("coverage.json");
+    let summary_md = tmp.path().join("coverage.md");
+
+    let component = synthetic::constant_image(4, 4, [12000, 7000, 3000]);
+    scanstitch::tiff_io::save_tiff_u16(&component, &path1).unwrap();
+    scanstitch::tiff_io::save_tiff_u16(&component, &path2).unwrap();
+    std::fs::write(
+        &baseline_path,
+        serde_json::to_string_pretty(&fixture_summary_baseline()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &registry_path,
+        serde_json::json!({
+            "coverage_requirements": {
+                "min_render_dynamic_range_contract_fixtures": 1
+            },
+            "fixtures": {
+                "logan": {
+                    "component1": path1,
+                    "component2": path2,
+                    "summary_baseline": baseline_path,
+                    "film_stock": "Synthetic positive",
+                    "scene_tags": ["wide-latitude"],
+                    "exposure_tags": ["normal-exposure"],
+                    "calibration_case": "uncalibrated-image-derived",
+                    "expectations": {
+                        "post_scale_preserved_ratio_min": 0.98
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture-coverage")
+        .arg("--strict")
+        .arg("--quiet")
+        .arg("--summary-json")
+        .arg(&summary_json)
+        .arg("--summary-md")
+        .arg(&summary_md)
+        .output()
+        .expect("run scanstitch-validate incomplete render-dynamic-range coverage");
+
+    assert!(
+        !output.status.success(),
+        "one preservation floor must not substitute for a complete dynamic-range contract"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("fixture_coverage_min_render_dynamic_range_contract_fixtures_not_met"));
+
+    let summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&summary_json).unwrap()).unwrap();
+    assert_eq!(summary["validation_ready_fixture_count"], 1);
+    assert_eq!(summary["render_dynamic_range_contract_fixture_count"], 0);
+    assert_eq!(
+        summary["fixtures"][0]["render_dynamic_range_contract_declared"],
+        true
+    );
+    assert_eq!(
+        summary["fixtures"][0]["render_dynamic_range_contract_complete"],
+        false
+    );
+    assert_eq!(
+        summary["fixtures"][0]["render_dynamic_range_contract_missing_fields"],
+        serde_json::json!([
+            "expectations.render_luminance_range_p05_p95_min>0",
+            "expectations.render_review_status=reviewable",
+            "expectations.render_reviewable=true",
+            "expectations.tone_output_confidence_status=supported_render_tonal_distribution",
+            "expectations.tone_output_review_required=false",
+            "expectations.tone_output_evidence_confidence_min>0",
+            "expectations.render_to_mapped_luminance_range_ratio_min>0",
+            "expectations.post_chroma_compression_clipped_high_ratio_max<1",
+            "expectations.post_chroma_compression_clipped_low_ratio_max<1"
+        ])
+    );
+    assert!(summary["fixtures"][0]["action_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action == "complete_render_dynamic_range_contract_for_fixture:logan"));
+    assert!(summary["action_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| {
+            action == "add_complete_render_dynamic_range_contracts_for_validation_ready_fixtures:1"
+        }));
+    let repair_detail = summary["fixtures"][0]["repair_plan"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["action"] == "complete_render_dynamic_range_contract_for_fixture:logan")
+        .and_then(|item| item["details"].as_str())
+        .unwrap();
+    assert!(repair_detail.contains("p05-p95"));
+    assert!(repair_detail.contains("render_reviewable"));
+    assert!(repair_detail.contains("tone_output_confidence_status"));
+    assert!(repair_detail.contains("render_to_mapped"));
+    assert!(repair_detail.contains("high/low"));
+
+    let markdown = std::fs::read_to_string(&summary_md).unwrap();
+    assert!(markdown.contains("contract=incomplete"));
+    assert!(markdown.contains("complete_render_dynamic_range_contract_for_fixture:logan"));
+}
+
+#[test]
+fn test_validate_cli_fixture_coverage_requires_complete_stitch_normalization_contract() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path1 = tmp.path().join("left.tiff");
+    let path2 = tmp.path().join("right.tiff");
+    let baseline_path = tmp.path().join("baseline.json");
+    let registry_path = tmp.path().join("fixtures.json");
+    let summary_json = tmp.path().join("coverage.json");
+    let summary_md = tmp.path().join("coverage.md");
+
+    let component = synthetic::constant_image(4, 4, [12000, 7000, 3000]);
+    scanstitch::tiff_io::save_tiff_u16(&component, &path1).unwrap();
+    scanstitch::tiff_io::save_tiff_u16(&component, &path2).unwrap();
+    std::fs::write(
+        &baseline_path,
+        serde_json::to_string_pretty(&fixture_summary_baseline()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &registry_path,
+        serde_json::json!({
+            "coverage_requirements": {
+                "min_stitch_normalization_contract_fixtures": 1
+            },
+            "fixtures": {
+                "logan": {
+                    "component1": path1,
+                    "component2": path2,
+                    "summary_baseline": baseline_path,
+                    "film_stock": "Synthetic positive",
+                    "scene_tags": ["overlap-detail"],
+                    "exposure_tags": ["normal-exposure"],
+                    "calibration_case": "uncalibrated-image-derived",
+                    "expectations": {
+                        "stitch_decision": "accepted"
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture-coverage")
+        .arg("--strict")
+        .arg("--quiet")
+        .arg("--summary-json")
+        .arg(&summary_json)
+        .arg("--summary-md")
+        .arg(&summary_md)
+        .output()
+        .expect("run incomplete stitch-normalization fixture coverage");
+
+    assert!(
+        !output.status.success(),
+        "an accepted decision alone must not substitute for normalized-stitch evidence"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("fixture_coverage_min_stitch_normalization_contract_fixtures_not_met"));
+
+    let summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&summary_json).unwrap()).unwrap();
+    assert_eq!(summary["validation_ready_fixture_count"], 1);
+    assert_eq!(summary["stitch_normalization_contract_fixture_count"], 0);
+    assert_eq!(
+        summary["fixtures"][0]["stitch_normalization_contract_declared"],
+        true
+    );
+    assert_eq!(
+        summary["fixtures"][0]["stitch_normalization_contract_complete"],
+        false
+    );
+    assert_eq!(
+        summary["fixtures"][0]["stitch_normalization_contract_missing_fields"],
+        serde_json::json!([
+            "expectations.seam_exposure_model=known_model",
+            "expectations.seam_exposure_held_out_validation_passed={true|false}",
+            "expectations.seam_exposure_offset_normalized_abs_max<=0.05",
+            "expectations.seam_blend_required=true",
+            "expectations.seam_blend_mode=seam_aware_multiband",
+            "expectations.seam_blend_review_required=false",
+            "expectations.seam_detail_review_required=false",
+            "expectations.seam_detail_supported_scale_count_min>=2",
+            "expectations.seam_detail_max_symmetric_energy_ratio_max<=2.00",
+            "expectations.seam_gradient_ratio_max<=1.05",
+            "expectations.seam_overlap_p95_abs_difference_max<1"
+        ])
+    );
+    assert_eq!(
+        summary["action_items"],
+        serde_json::json!([
+            "add_complete_stitch_normalization_contracts_for_validation_ready_fixtures:1",
+            "complete_stitch_normalization_contract_for_fixture:logan"
+        ])
+    );
+    let repair_detail = summary["fixtures"][0]["repair_plan"][0]["details"]
+        .as_str()
+        .unwrap();
+    assert!(repair_detail.contains("held-out validation"));
+    assert!(repair_detail.contains("seam-aware multiband"));
+    assert!(repair_detail.contains("supported detail scales"));
+    assert!(repair_detail.contains("overlap p95"));
+
+    let markdown = std::fs::read_to_string(&summary_md).unwrap();
+    assert!(markdown.contains("Stitch normalization"));
+    assert!(markdown.contains("contract=incomplete"));
+    assert!(markdown.contains("complete_stitch_normalization_contract_for_fixture:logan"));
+}
+
+#[test]
+fn test_validate_cli_fixture_coverage_requires_complete_geometry_and_negative_contracts() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path1 = tmp.path().join("left.tiff");
+    let path2 = tmp.path().join("right.tiff");
+    let baseline_path = tmp.path().join("baseline.json");
+    let registry_path = tmp.path().join("fixtures.json");
+    let summary_json = tmp.path().join("coverage.json");
+    let summary_md = tmp.path().join("coverage.md");
+
+    let component = synthetic::constant_image(4, 4, [12000, 7000, 3000]);
+    scanstitch::tiff_io::save_tiff_u16(&component, &path1).unwrap();
+    scanstitch::tiff_io::save_tiff_u16(&component, &path2).unwrap();
+    std::fs::write(
+        &baseline_path,
+        serde_json::to_string_pretty(&fixture_summary_baseline()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &registry_path,
+        serde_json::json!({
+            "coverage_requirements": {
+                "min_geometry_preparation_contract_fixtures": 1,
+                "min_geometry_accuracy_contract_fixtures": 1,
+                "min_orientation_accuracy_contract_fixtures": 1,
+                "min_negative_reconstruction_contract_fixtures": 1
+            },
+            "fixtures": {
+                "logan": {
+                    "component1": path1,
+                    "component2": path2,
+                    "input_mode": "negative",
+                    "summary_baseline": baseline_path,
+                    "film_stock": "Synthetic negative",
+                    "scene_tags": ["bordered-negative"],
+                    "exposure_tags": ["normal-exposure"],
+                    "calibration_case": "measured-response",
+                    "expectations": {
+                        "deskew_all_components_applied": true,
+                        "deskew_correction_degrees_expected": -0.5,
+                        "orientation_components_expected": [{
+                            "component_index": 1,
+                            "upright_approved": false,
+                            "decoded_pixel_sha256": "4".repeat(64),
+                            "tag_present": true,
+                            "tag_value": 6,
+                            "transform": "identity",
+                            "applied": false,
+                            "source_width": 4,
+                            "source_height": 3,
+                            "output_width": 4,
+                            "output_height": 3
+                        }],
+                        "density_inversion_skipped": false
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture-coverage")
+        .arg("--strict")
+        .arg("--quiet")
+        .arg("--summary-json")
+        .arg(&summary_json)
+        .arg("--summary-md")
+        .arg(&summary_md)
+        .output()
+        .expect("run incomplete geometry/negative fixture coverage");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("fixture_coverage_min_geometry_preparation_contract_fixtures_not_met"));
+    assert!(stderr.contains("fixture_coverage_min_geometry_accuracy_contract_fixtures_not_met"));
+    assert!(stderr.contains("fixture_coverage_min_orientation_accuracy_contract_fixtures_not_met"));
+    assert!(
+        stderr.contains("fixture_coverage_min_negative_reconstruction_contract_fixtures_not_met")
+    );
+
+    let summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&summary_json).unwrap()).unwrap();
+    assert_eq!(summary["validation_ready_fixture_count"], 1);
+    assert_eq!(summary["geometry_preparation_contract_fixture_count"], 0);
+    assert_eq!(summary["geometry_accuracy_contract_fixture_count"], 0);
+    assert_eq!(summary["orientation_accuracy_contract_fixture_count"], 0);
+    assert_eq!(summary["negative_reconstruction_contract_fixture_count"], 0);
+    let geometry_missing = summary["fixtures"][0]["geometry_preparation_contract_missing_fields"]
+        .as_array()
+        .unwrap();
+    assert!(geometry_missing
+        .iter()
+        .any(|field| field == "expectations.border_crop_all_components_cropped=true"));
+    assert!(geometry_missing.iter().any(|field| {
+        field == "expectations.deskew_minimum_component_retained_area_ratio_min>=0.90"
+    }));
+    let accuracy_missing = summary["fixtures"][0]["geometry_accuracy_contract_missing_fields"]
+        .as_array()
+        .unwrap();
+    assert!(accuracy_missing
+        .iter()
+        .any(|field| { field == "expectations.deskew_correction_tolerance_degrees<=0.05" }));
+    assert!(accuracy_missing
+        .iter()
+        .any(|field| field == "expectations.border_crop_components_expected=all_2_components"));
+    let orientation_missing = summary["fixtures"][0]
+        ["orientation_accuracy_contract_missing_fields"]
+        .as_array()
+        .unwrap();
+    assert!(orientation_missing
+        .iter()
+        .any(|field| field == "expectations.orientation_components_expected=all_2_components"));
+    assert!(orientation_missing.iter().any(|field| {
+        field == "expectations.orientation_components_expected.component_1.upright_approved=true"
+    }));
+    assert!(orientation_missing.iter().any(|field| {
+        field
+            == "expectations.orientation_components_expected.component_1.transform=rotate_90_clockwise"
+    }));
+    assert!(orientation_missing.iter().any(|field| {
+        field == "expectations.orientation_components_expected.component_1.applied=true"
+    }));
+    assert!(orientation_missing.iter().any(|field| {
+        field == "expectations.orientation_components_expected.component_1.output_dimensions=3x4"
+    }));
+    let negative_missing = summary["fixtures"][0]
+        ["negative_reconstruction_contract_missing_fields"]
+        .as_array()
+        .unwrap();
+    assert!(negative_missing.iter().any(|field| {
+        field == "expectations.negative_response_model=measured_nonlinear_dye_separation"
+    }));
+    assert!(negative_missing.iter().any(|field| {
+        field == "expectations.negative_response_curve_extrapolated_ratio_max<=0.01"
+    }));
+    assert!(summary["action_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action == "complete_geometry_preparation_contract_for_fixture:logan"));
+    assert!(summary["action_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action == "complete_geometry_accuracy_contract_for_fixture:logan"));
+    assert!(summary["action_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action == "complete_orientation_accuracy_contract_for_fixture:logan"));
+    assert!(summary["action_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action == "complete_negative_reconstruction_contract_for_fixture:logan"));
+    let markdown = std::fs::read_to_string(&summary_md).unwrap();
+    assert!(markdown.contains("Geometry preparation / orientation"));
+    assert!(markdown.contains("accuracy=incomplete"));
+    assert!(markdown.contains("orientation=incomplete"));
+    assert!(markdown.contains("Negative reconstruction"));
 }
 
 #[test]
@@ -3533,6 +5929,11 @@ fn test_validate_cli_fixture_coverage_fails_unmet_registry_requirements() {
                 "min_reference_patch_fixtures": 1,
                 "min_reference_patch_count": 4,
                 "min_debug_artifact_expectation_fixtures": 1,
+                "min_render_dynamic_range_contract_fixtures": 1,
+                "min_stitch_normalization_contract_fixtures": 1,
+                "min_grain_reduction_enabled_fixtures": 1,
+                "min_grain_detail_contract_fixtures": 1,
+                "min_grain_reduction_effect_contract_fixtures": 1,
                 "required_film_stocks": ["Synthetic negative", "Kodak Gold 200"],
                 "required_scene_tags": ["neutral-target", "skin-tone"],
                 "required_exposure_tags": ["normal-exposure", "underexposed-negative"],
@@ -3598,6 +5999,13 @@ fn test_validate_cli_fixture_coverage_fails_unmet_registry_requirements() {
     assert!(stderr.contains("fixture_coverage_min_reference_patch_fixtures_not_met"));
     assert!(stderr.contains("fixture_coverage_min_reference_patch_count_not_met"));
     assert!(stderr.contains("fixture_coverage_min_debug_artifact_expectation_fixtures_not_met"));
+    assert!(stderr.contains("fixture_coverage_min_render_dynamic_range_contract_fixtures_not_met"));
+    assert!(stderr.contains("fixture_coverage_min_stitch_normalization_contract_fixtures_not_met"));
+    assert!(stderr.contains("fixture_coverage_min_grain_reduction_enabled_fixtures_not_met"));
+    assert!(stderr.contains("fixture_coverage_min_grain_detail_contract_fixtures_not_met"));
+    assert!(
+        stderr.contains("fixture_coverage_min_grain_reduction_effect_contract_fixtures_not_met")
+    );
     let summary: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&summary_json).unwrap()).unwrap();
     assert_eq!(summary["status"], "review_required");
@@ -3633,6 +6041,11 @@ fn test_validate_cli_fixture_coverage_fails_unmet_registry_requirements() {
     assert_eq!(summary["reference_patch_count"], 0);
     assert_eq!(summary["reference_evidence"], serde_json::json!([]));
     assert_eq!(summary["debug_artifact_expectation_fixture_count"], 0);
+    assert_eq!(summary["render_dynamic_range_contract_fixture_count"], 0);
+    assert_eq!(summary["stitch_normalization_contract_fixture_count"], 0);
+    assert_eq!(summary["grain_reduction_enabled_fixture_count"], 0);
+    assert_eq!(summary["grain_detail_contract_fixture_count"], 0);
+    assert_eq!(summary["grain_reduction_effect_contract_fixture_count"], 0);
     assert_eq!(
         summary["debug_artifact_kinds_required"],
         serde_json::json!([])
@@ -3656,6 +6069,11 @@ fn test_validate_cli_fixture_coverage_fails_unmet_registry_requirements() {
     assert_eq!(
         summary["action_items"],
         serde_json::json!([
+            "add_complete_render_dynamic_range_contracts_for_validation_ready_fixtures:1",
+            "add_complete_stitch_normalization_contracts_for_validation_ready_fixtures:1",
+            "add_validation_ready_grain_reduction_enabled_fixtures:1",
+            "add_complete_grain_detail_contracts_for_validation_ready_fixtures:1",
+            "add_complete_grain_reduction_effect_contracts_for_validation_ready_fixtures:1",
             "add_unique_scanner_profile_coverage:1",
             "add_unique_roll_profile_coverage:1",
             "add_unique_film_stock_coverage:1",
@@ -3722,6 +6140,9 @@ fn test_validate_cli_fixture_coverage_fails_unmet_registry_requirements() {
     assert!(markdown.contains("min reference-patch fixtures"));
     assert!(markdown.contains("min reference patches"));
     assert!(markdown.contains("min debug-artifact expectation fixtures"));
+    assert!(markdown.contains("min grain-reduction-enabled fixtures"));
+    assert!(markdown.contains("min complete grain-detail-contract fixtures"));
+    assert!(markdown.contains("min complete grain-reduction-effect-contract fixtures"));
     assert!(markdown.contains("missing required scanner profiles"));
     assert!(markdown.contains("scanner-b"));
     assert!(markdown.contains("missing required roll profiles"));
@@ -4135,6 +6556,12 @@ fn test_validate_cli_roll_inventory_writes_fixture_registry_scaffold() {
         .arg("--quiet")
         .arg("--bit-depth")
         .arg("14")
+        .arg("--grain-reduction")
+        .arg("on")
+        .arg("--grain-strength")
+        .arg("0.61")
+        .arg("--grain-scale")
+        .arg("1.8")
         .arg("--roll-suite-frame")
         .arg("RAW_0000")
         .arg("--film-stock")
@@ -4164,9 +6591,17 @@ fn test_validate_cli_roll_inventory_writes_fixture_registry_scaffold() {
     assert_eq!(fixtures.len(), 1);
     let fixture = &registry["fixtures"]["testroll-raw-0000"];
     assert_eq!(fixture["component1"], frame0.display().to_string());
-    assert_eq!(fixture["component2"], frame0.display().to_string());
+    assert!(
+        fixture.get("component2").is_none(),
+        "single-frame scaffolds must not invent a duplicate second component"
+    );
     assert_eq!(fixture["input_mode"], "negative");
     assert_eq!(fixture["bit_depth"], 14);
+    assert_eq!(fixture["grain_reduction"], "on");
+    assert_eq!(fixture["grain_strength"], 0.61);
+    assert_eq!(fixture["grain_scale"], 1.8);
+    assert_eq!(fixture["deskew"], "auto");
+    assert!(fixture.get("deskew_angle_degrees").is_none());
     assert_eq!(fixture["force_no_stitch"], true);
     assert_eq!(
         fixture["summary_baseline"],
@@ -4178,7 +6613,7 @@ fn test_validate_cli_roll_inventory_writes_fixture_registry_scaffold() {
     );
     assert_eq!(
         fixture["expectations"]["stitch_decision"],
-        "skipped_pre_score"
+        "skipped_single_input"
     );
     assert_eq!(
         fixture["expectations"]["output_color_space"],
@@ -4487,8 +6922,9 @@ fn test_validate_cli_roll_inventory_applies_fixture_metadata_sidecar() {
     );
     assert_eq!(
         fixture["expectations"]["stitch_decision"],
-        "skipped_pre_score"
+        "skipped_single_input"
     );
+    assert!(fixture.get("component2").is_none());
     assert_eq!(fixture["expectations"]["candidate_risk"], "safe");
     assert_eq!(fixture["expectations"]["debug_artifacts_required"], true);
     assert_eq!(
@@ -4747,6 +7183,12 @@ fn test_validate_cli_roll_suite_applies_roll_consensus_base_source() {
         .arg("--roll-dir")
         .arg(&roll_dir)
         .arg("--roll-suite")
+        .arg("--grain-reduction")
+        .arg("on")
+        .arg("--grain-strength")
+        .arg("0.6")
+        .arg("--grain-scale")
+        .arg("1.5")
         .arg("--quiet")
         .arg("--bit-depth")
         .arg("16")
@@ -4795,6 +7237,25 @@ fn test_validate_cli_roll_suite_applies_roll_consensus_base_source() {
     );
     assert_eq!(summary["quality"]["frame_count"], 4);
     assert_eq!(summary["review"]["frame_count"], 4);
+    assert_eq!(summary["review"]["tone_output_unknown_count"], 0);
+    assert!(
+        summary["review"]["render_review_status_counts"]
+            .as_array()
+            .is_some_and(|counts| !counts.is_empty()),
+        "roll suite should aggregate the authoritative final render decision"
+    );
+    assert!(
+        summary["review"]["tone_output_confidence_status_counts"]
+            .as_array()
+            .is_some_and(|counts| !counts.is_empty()),
+        "roll suite should aggregate rendered-tone confidence states"
+    );
+    assert!(
+        summary["review"]["tone_output_review_reason_counts"]
+            .as_array()
+            .is_some_and(|counts| !counts.is_empty()),
+        "roll suite should aggregate rendered-tone decision reasons"
+    );
     assert!(
         summary["review"]["candidate_risk_counts"]
             .as_array()
@@ -4879,6 +7340,38 @@ fn test_validate_cli_roll_suite_applies_roll_consensus_base_source() {
             > 0,
         "roll suite should aggregate final render denoise diagnostics"
     );
+    assert_eq!(
+        summary["quality"]["grain_detail_evaluated_count"], 4,
+        "every grain-on frame should contribute an evaluated detail decision"
+    );
+    assert_eq!(summary["quality"]["grain_detail_review_required_count"], 0);
+    assert!(
+        summary["quality"]["grain_detail_decision_supported_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "the detail-bearing roll must provide supported grain evidence: {}",
+        summary["quality"]
+    );
+    assert!(
+        summary["quality"]["grain_detail_luminance_supported_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+            && summary["quality"]["grain_detail_chroma_supported_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+        "the roll must independently support luminance and opponent-colour retention: {}",
+        summary["quality"]
+    );
+    assert!(
+        summary["quality"]["grain_detail_luminance_p10_retention_min"]
+            .as_f64()
+            .is_some_and(|retention| retention >= 0.70)
+            && summary["quality"]["grain_detail_chroma_p10_retention_min"]
+                .as_f64()
+                .is_some_and(|retention| retention >= 0.70),
+        "supported roll detail must clear the automatic p10 retention floor: {}",
+        summary["quality"]
+    );
     assert!(
         summary["frames"]
             .as_array()
@@ -4896,6 +7389,24 @@ fn test_validate_cli_roll_suite_applies_roll_consensus_base_source() {
                     && frame.get("render_luminance_p50").is_some()
                     && frame.get("render_luminance_p95").is_some()
                     && frame.get("render_luminance_range_p05_p95").is_some()
+                    && frame["tone_output_evidence_evaluated"].as_bool().is_some()
+                    && frame["tone_output_evidence_confidence"].as_f64().is_some()
+                    && frame["tone_output_confidence_status"].as_str().is_some()
+                    && frame["tone_output_review_required"].as_bool().is_some()
+                    && frame["tone_output_review_reason"].as_str().is_some()
+                    && frame
+                        .get("confidence_limited_by_tone_output_evidence")
+                        .and_then(serde_json::Value::as_bool)
+                        .is_some()
+                    && frame["input_luminance_range_p05_p95"].as_f64().is_some()
+                    && frame["mapped_luminance_range_p05_p95"].as_f64().is_some()
+                    && frame
+                        .get("render_to_mapped_luminance_range_ratio")
+                        .is_some()
+                    && frame["maximum_post_tone_high_clip_ratio"]
+                        .as_f64()
+                        .is_some()
+                    && frame["maximum_post_tone_low_clip_ratio"].as_f64().is_some()
                     && frame.get("shadow_saturation_p95").is_some()
                     && frame.get("midtone_neutral_pixel_count").is_some()
                     && frame.get("midtone_neutral_saturation_p95").is_some()
@@ -4909,13 +7420,45 @@ fn test_validate_cli_roll_suite_applies_roll_consensus_base_source() {
                     && frame.get("midtone_neutral_rgb_balance_delta").is_some()
                     && frame.get("bright_neutral_rgb_balance_delta").is_some()
                     && frame.get("noise_reduction_applied_ratio").is_some()
+                    && frame["grain_detail_evaluated"] == true
+                    && frame["grain_detail_review_required"] == false
+                    && frame.get("grain_detail_decision_supported").is_some()
+                    && frame.get("grain_detail_luminance_probe_count").is_some()
+                    && frame.get("grain_detail_chroma_probe_count").is_some()
+                    && frame.get("grain_detail_luminance_p10_retention").is_some()
+                    && frame.get("grain_detail_chroma_p10_retention").is_some()
                     && frame.get("colorspace_post_scale_preserved_ratio").is_some()
             ),
-        "each roll-suite frame should expose quality diagnostics for roll-level audit"
+        "each roll-suite frame should expose quality diagnostics for roll-level audit: {}",
+        summary["frames"]
     );
+    for frame in summary["frames"].as_array().unwrap() {
+        let mapped_range = frame["mapped_luminance_range_p05_p95"]
+            .as_f64()
+            .expect("mapped luminance range");
+        if mapped_range > 0.0 {
+            assert!(
+                frame["render_to_mapped_luminance_range_ratio"]
+                    .as_f64()
+                    .is_some(),
+                "a measurable fitted range must retain a numeric render:mapped ratio: {frame}"
+            );
+        } else {
+            assert!(frame["render_to_mapped_luminance_range_ratio"].is_null());
+            assert_eq!(frame["tone_output_review_required"], true);
+            assert_eq!(
+                frame["tone_output_confidence_status"],
+                "review_required_insufficient_scene_tonal_range"
+            );
+        }
+    }
     let summary_md = std::fs::read_to_string(&summary_md).unwrap();
     assert!(summary_md.contains("Roll Base Clusters"));
     assert!(summary_md.contains("Roll Review Audit"));
+    assert!(summary_md.contains("Final render reviewable/not reviewable/unknown"));
+    assert!(summary_md.contains("Tone output evaluated/review required/unknown"));
+    assert!(summary_md.contains("Frame Tone Output Evidence"));
+    assert!(summary_md.contains("Render:Mapped"));
     assert!(summary_md.contains("Candidate risk counts"));
     assert!(summary_md.contains("Review issue counts"));
     assert!(summary_md.contains("Roll Quality Diagnostics"));
@@ -4928,6 +7471,8 @@ fn test_validate_cli_roll_suite_applies_roll_consensus_base_source() {
     assert!(summary_md.contains("RGB Delta"));
     assert!(summary_md.contains("Bright Neutral RGB"));
     assert!(summary_md.contains("Frame Quality Diagnostics"));
+    assert!(summary_md.contains("Grain detail evaluated/supported/review frames"));
+    assert!(summary_md.contains("Frame Grain Detail Diagnostics"));
 
     let subset_summary_json = tmp.path().join("roll-suite-subset.json");
     let subset_summary_md = tmp.path().join("roll-suite-subset.md");
@@ -4938,6 +7483,12 @@ fn test_validate_cli_roll_suite_applies_roll_consensus_base_source() {
         .arg("--roll-suite")
         .arg("--roll-suite-frame")
         .arg("RAW_0001.tif,raw-0003")
+        .arg("--grain-reduction")
+        .arg("on")
+        .arg("--grain-strength")
+        .arg("0.6")
+        .arg("--grain-scale")
+        .arg("1.5")
         .arg("--quiet")
         .arg("--bit-depth")
         .arg("16")
@@ -4987,6 +7538,12 @@ fn test_validate_cli_roll_suite_applies_roll_consensus_base_source() {
         .arg("--roll-suite")
         .arg("--roll-suite-frame")
         .arg("RAW_0001.tif,raw-0003")
+        .arg("--grain-reduction")
+        .arg("on")
+        .arg("--grain-strength")
+        .arg("0.6")
+        .arg("--grain-scale")
+        .arg("1.5")
         .arg("--quiet")
         .arg("--bit-depth")
         .arg("16")
@@ -5037,6 +7594,24 @@ fn test_validate_cli_roll_suite_applies_roll_consensus_base_source() {
     let legacy_quality = legacy_summary["quality"].as_object_mut().unwrap();
     legacy_quality.remove("midtone_luminance_p50_max");
     legacy_quality.remove("midtone_luminance_p50_range");
+    for frame in legacy_summary["frames"].as_array_mut().unwrap() {
+        let frame = frame.as_object_mut().unwrap();
+        for field in [
+            "tone_output_evidence_evaluated",
+            "tone_output_evidence_confidence",
+            "tone_output_confidence_status",
+            "tone_output_review_required",
+            "tone_output_review_reason",
+            "confidence_limited_by_tone_output_evidence",
+            "input_luminance_range_p05_p95",
+            "mapped_luminance_range_p05_p95",
+            "render_to_mapped_luminance_range_ratio",
+            "maximum_post_tone_high_clip_ratio",
+            "maximum_post_tone_low_clip_ratio",
+        ] {
+            frame.remove(field);
+        }
+    }
     std::fs::write(
         &legacy_summary_json,
         serde_json::to_string_pretty(&legacy_summary).unwrap(),
@@ -5050,6 +7625,12 @@ fn test_validate_cli_roll_suite_applies_roll_consensus_base_source() {
         .arg("--roll-dir")
         .arg(&roll_dir)
         .arg("--roll-suite")
+        .arg("--grain-reduction")
+        .arg("on")
+        .arg("--grain-strength")
+        .arg("0.6")
+        .arg("--grain-scale")
+        .arg("1.5")
         .arg("--quiet")
         .arg("--bit-depth")
         .arg("16")
@@ -5102,6 +7683,17 @@ fn test_validate_cli_roll_suite_applies_roll_consensus_base_source() {
         0.0
     );
     assert_eq!(
+        compared["comparison"]["quality"]["grain_detail_decision_supported_count_delta"],
+        0
+    );
+    assert_eq!(
+        compared["comparison"]["quality"]["grain_detail_luminance_p10_retention_min_delta"]
+            .as_f64()
+            .unwrap()
+            .abs(),
+        0.0
+    );
+    assert_eq!(
         compared["comparison"]["frames"].as_array().unwrap().len(),
         4
     );
@@ -5115,12 +7707,30 @@ fn test_validate_cli_roll_suite_applies_roll_consensus_base_source() {
                 .is_some()
                 && frame.get("render_luminance_range_p05_p95_delta").is_some()
                 && frame
+                    .get("grain_detail_luminance_p10_retention_delta")
+                    .is_some()
+                && frame
+                    .get("grain_detail_chroma_p10_retention_delta")
+                    .is_some()
+                && frame
                     .get("colorspace_post_scale_preserved_ratio_delta")
+                    .is_some()
+                && frame.get("render_review_status_changed").is_some()
+                && frame.get("render_reviewable_changed").is_some()
+                && frame.get("tone_output_confidence_status_changed").is_some()
+                && frame.get("tone_output_review_required_changed").is_some()
+                && frame.get("tone_output_evidence_confidence_delta").is_some()
+                && frame
+                    .get("tone_output_render_to_mapped_luminance_range_ratio_delta")
                     .is_some()),
-        "roll comparison should expose per-frame quality and gamut deltas"
+        "roll comparison should expose per-frame quality, gamut, and tone-decision evidence"
     );
     let compare_md = std::fs::read_to_string(&compare_summary_md).unwrap();
     assert!(compare_md.contains("Roll Suite Comparison"));
+    assert!(compare_md.contains("Frame Tone Output Comparison"));
+    assert!(compare_md.contains("Render:Mapped d"));
+    assert!(compare_md.contains("grain luma p10 retention min"));
+    assert!(compare_md.contains("Grain Support (all/L/C)"));
     assert!(compare_md.contains("render luminance range mean"));
     assert!(compare_md.contains("Render Range d"));
     assert!(compare_md.contains("midtone p50 range"));
@@ -5129,7 +7739,7 @@ fn test_validate_cli_roll_suite_applies_roll_consensus_base_source() {
 }
 
 #[test]
-fn test_validate_cli_roll_suite_positive_skips_negative_base_workflow() {
+fn test_validate_cli_roll_suite_positive_skips_negative_base_but_requires_profiled_color() {
     let tmp = tempfile::TempDir::new().unwrap();
     let roll_dir = tmp.path().join("TESTROLL");
     std::fs::create_dir_all(&roll_dir).unwrap();
@@ -5178,22 +7788,21 @@ fn test_validate_cli_roll_suite_positive_skips_negative_base_workflow() {
 
     let summary: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&summary_json).unwrap()).unwrap();
-    assert_eq!(
-        summary["status"], "passed",
-        "positive roll suite should pass without negative-base or colour-trust review issues"
-    );
+    assert_eq!(summary["status"], "review_required");
     assert_eq!(summary["roll_base_color"], serde_json::Value::Null);
     assert_eq!(summary["roll_base_source"], serde_json::Value::Null);
     assert_eq!(summary["roll_base_frame_count"], 0);
     assert_eq!(summary["frame_count"], 3);
     assert_eq!(summary["frames"].as_array().unwrap().len(), 3);
-    assert_eq!(summary["review"]["candidate_safe_count"], 3);
-    assert_eq!(summary["review"]["candidate_review_required_count"], 0);
-    assert_eq!(summary["review"]["tone_color_trusted_count"], 3);
-    assert_eq!(summary["review"]["tone_color_review_required_count"], 0);
+    assert_eq!(summary["review"]["candidate_safe_count"], 0);
+    assert_eq!(summary["review"]["candidate_review_required_count"], 3);
+    assert_eq!(summary["review"]["tone_color_trusted_count"], 0);
+    assert_eq!(summary["review"]["tone_color_review_required_count"], 3);
+    assert_eq!(summary["review"]["render_not_reviewable_count"], 3);
+    assert_eq!(summary["review"]["tone_output_review_required_count"], 0);
     assert_eq!(
         summary["review"]["issue_counts"].as_array().unwrap().len(),
-        0
+        3
     );
 
     let issues = summary["issues"]
@@ -5207,14 +7816,33 @@ fn test_validate_cli_roll_suite_positive_skips_negative_base_workflow() {
         "base_estimate_fallback",
         "calibration_not_applied",
         "reference_patch_evaluation_missing",
-        "candidate_risk_review_required",
-        "tone_color_trust_review_required",
     ] {
         assert!(
             issues.iter().all(|issue| !issue.contains(forbidden)),
             "positive roll suite emitted negative precondition issue `{forbidden}`: {issues:?}"
         );
     }
+    assert_eq!(
+        issues
+            .iter()
+            .filter(|issue| issue.contains("candidate_risk_review_required"))
+            .count(),
+        3
+    );
+    assert_eq!(
+        issues
+            .iter()
+            .filter(|issue| issue.contains("tone_color_trust_review_required"))
+            .count(),
+        3
+    );
+    assert_eq!(
+        issues
+            .iter()
+            .filter(|issue| issue.contains("render_review_not_supported"))
+            .count(),
+        3
+    );
 
     for frame in summary["frames"].as_array().unwrap() {
         assert!(Path::new(frame["output_path"].as_str().unwrap()).exists());
@@ -5225,8 +7853,10 @@ fn test_validate_cli_roll_suite_positive_skips_negative_base_workflow() {
             frame["render_input_reason"],
             "already-positive input normalized without density inversion"
         );
-        assert_eq!(frame["candidate_risk"], "safe");
-        assert_eq!(frame["tone_color_trust_state"], "trusted");
+        assert_eq!(frame["candidate_risk"], "review_unprofiled_input");
+        assert_eq!(frame["tone_color_trust_state"], "review_required");
+        assert_eq!(frame["render_reviewable"], false);
+        assert_eq!(frame["tone_output_review_required"], false);
 
         let report: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(report_path).unwrap()).unwrap();
@@ -5324,12 +7954,16 @@ fn test_validate_cli_roll_suite_positive_flags_negative_like_input() {
         .iter()
         .filter_map(|issue| issue.as_str())
         .collect::<Vec<_>>();
-    assert!(
-        issues
-            .iter()
-            .all(|issue| issue.contains("positive_input_negative_like")),
-        "unexpected roll-suite issues: {issues:?}"
-    );
+    for required in [
+        "positive_input_negative_like",
+        "candidate_risk_review_required",
+        "tone_color_trust_review_required",
+    ] {
+        assert!(
+            issues.iter().any(|issue| issue.contains(required)),
+            "missing `{required}` roll-suite issue: {issues:?}"
+        );
+    }
     let markdown = std::fs::read_to_string(&summary_md).unwrap();
     assert!(markdown.contains("positive_input_negative_like"));
 
@@ -5561,19 +8195,299 @@ fn test_validate_cli_fixture_coverage_rejects_component_hash_mismatch() {
 }
 
 #[test]
+fn test_validate_cli_require_reviewable_retains_non_reviewable_summary_and_artifacts() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let input = tmp.path().join("unprofiled-positive.tiff");
+    let image = textured_positive_panorama(48, 64);
+    write_rgb16_tiff_with_orientation(&input, &image, 1);
+    let output_dir = tmp.path().join("output");
+    let summary_json = tmp.path().join("summary.json");
+    let summary_md = tmp.path().join("summary.md");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--component1")
+        .arg(&input)
+        .arg("--fixture")
+        .arg("unprofiled-positive")
+        .arg("--input-mode")
+        .arg("positive")
+        .arg("--bit-depth")
+        .arg("14")
+        .arg("--quality-mode")
+        .arg("fast")
+        .arg("--force-no-stitch")
+        .arg("--deskew")
+        .arg("off")
+        .arg("--technical-white-balance")
+        .arg("off")
+        .arg("--require-reviewable")
+        .arg("--quiet")
+        .arg("--output-dir")
+        .arg(&output_dir)
+        .arg("--summary-json")
+        .arg(&summary_json)
+        .arg("--summary-md")
+        .arg(&summary_md)
+        .output()
+        .expect("run gated validation render");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--require-reviewable rejected validation output")
+            && stderr.contains("report and validation summary artifacts were retained"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(output_dir.join("output.tiff").is_file());
+    assert!(output_dir.join("report.json").is_file());
+    assert!(summary_json.is_file());
+    assert!(summary_md.is_file());
+    let summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(summary_json).unwrap()).unwrap();
+    assert_eq!(summary["render"]["render_reviewable"], false);
+    assert_ne!(summary["render"]["render_review_status"], "reviewable");
+
+    let tracked_baseline_path = tmp.path().join("tracked-baseline.json");
+    let compact_summary: scanstitch::validation::ValidationSummary =
+        serde_json::from_value(summary).unwrap();
+    std::fs::write(
+        &tracked_baseline_path,
+        serde_json::to_string_pretty(&scanstitch::validation::tracked_baseline_from_summary(
+            &compact_summary,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let registry_path = tmp.path().join("fixtures.json");
+    let mut registry = serde_json::json!({
+        "coverage_requirements": {
+            "min_fixtures": 1,
+            "min_summary_baselines": 1,
+            "min_uncalibrated_fixtures": 1,
+            "min_unique_film_stocks": 1,
+            "min_scene_tags": 1,
+            "min_exposure_tags": 1,
+            "min_calibration_cases": 1
+        },
+        "fixtures": {
+            "unprofiled-positive": {
+                "component1": input,
+                "input_mode": "positive",
+                "bit_depth": 14,
+                "deskew": "off",
+                "force_no_stitch": true,
+                "summary_baseline": tracked_baseline_path,
+                "film_stock": "Synthetic positive",
+                "scene_tags": ["unprofiled-positive"],
+                "exposure_tags": ["normal-exposure"],
+                "calibration_case": "uncalibrated-image-derived"
+            }
+        }
+    });
+    std::fs::write(
+        &registry_path,
+        serde_json::to_string_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+    let undeclared_suite_json = tmp.path().join("undeclared-fixture-suite.json");
+    let undeclared_suite = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture-suite")
+        .arg("--fixture-suite-fixture")
+        .arg("unprofiled-positive")
+        .arg("--strict")
+        .arg("--quality-mode")
+        .arg("fast")
+        .arg("--technical-white-balance")
+        .arg("off")
+        .arg("--quiet")
+        .arg("--output-dir")
+        .arg(tmp.path().join("undeclared-suite-output"))
+        .arg("--summary-json")
+        .arg(&undeclared_suite_json)
+        .output()
+        .expect("run strict fixture suite with undeclared diagnostic delivery");
+    assert!(!undeclared_suite.status.success());
+    assert!(String::from_utf8_lossy(&undeclared_suite.stderr).contains(
+        "fixture_suite:unprofiled-positive:non_reviewable_render_not_explicitly_expected"
+    ));
+    let undeclared_summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&undeclared_suite_json).unwrap()).unwrap();
+    assert_eq!(undeclared_summary["status"], "review_required");
+
+    registry["fixtures"]["unprofiled-positive"]["expectations"] =
+        serde_json::json!({"render_reviewable": false});
+    std::fs::write(
+        &registry_path,
+        serde_json::to_string_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+    let declared_suite_json = tmp.path().join("declared-fixture-suite.json");
+    let declared_suite = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture-suite")
+        .arg("--fixture-suite-fixture")
+        .arg("unprofiled-positive")
+        .arg("--strict")
+        .arg("--quality-mode")
+        .arg("fast")
+        .arg("--technical-white-balance")
+        .arg("off")
+        .arg("--quiet")
+        .arg("--output-dir")
+        .arg(tmp.path().join("declared-suite-output"))
+        .arg("--summary-json")
+        .arg(&declared_suite_json)
+        .output()
+        .expect("run strict fixture suite with declared diagnostic delivery");
+    assert!(
+        declared_suite.status.success(),
+        "declared diagnostic fixture should pass strict suite: stderr={} summary={}",
+        String::from_utf8_lossy(&declared_suite.stderr),
+        std::fs::read_to_string(&declared_suite_json).unwrap_or_default()
+    );
+    let declared_summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&declared_suite_json).unwrap()).unwrap();
+    assert_eq!(declared_summary["status"], "passed");
+    assert_eq!(
+        declared_summary["fixtures"][0]["expected_render_reviewable"],
+        false
+    );
+    let declared_coverage_fixture = declared_summary["coverage"]["fixtures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|fixture| fixture["name"] == "unprofiled-positive")
+        .unwrap();
+    assert_eq!(
+        declared_coverage_fixture["render_dynamic_range_contract_declared"],
+        false
+    );
+    assert!(!declared_coverage_fixture["action_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action
+            .as_str()
+            .is_some_and(|action| action.starts_with("complete_render_dynamic_range_contract"))));
+
+    let gated_suite_json = tmp.path().join("gated-fixture-suite.json");
+    let gated_suite = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture-suite")
+        .arg("--fixture-suite-fixture")
+        .arg("unprofiled-positive")
+        .arg("--strict")
+        .arg("--require-reviewable")
+        .arg("--quality-mode")
+        .arg("fast")
+        .arg("--technical-white-balance")
+        .arg("off")
+        .arg("--quiet")
+        .arg("--output-dir")
+        .arg(tmp.path().join("gated-suite-output"))
+        .arg("--summary-json")
+        .arg(&gated_suite_json)
+        .output()
+        .expect("run production-gated diagnostic fixture suite");
+    assert!(!gated_suite.status.success());
+    assert!(String::from_utf8_lossy(&gated_suite.stderr)
+        .contains("--require-reviewable rejected fixture-suite output(s): unprofiled-positive"));
+    let gated_summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&gated_suite_json).unwrap()).unwrap();
+    assert!(
+        gated_summary["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue
+                == "fixture_suite:unprofiled-positive:require_reviewable_not_satisfied")
+    );
+
+    let mut reported_reviewable: PipelineReport =
+        serde_json::from_str(&std::fs::read_to_string(output_dir.join("report.json")).unwrap())
+            .unwrap();
+    let save = reported_reviewable
+        .phases
+        .iter_mut()
+        .find(|phase| phase.name == "save")
+        .unwrap();
+    save.metrics["render_review_status"] = serde_json::json!("reviewable");
+    save.metrics["render_reviewable"] = serde_json::json!(true);
+    save.metrics["render_review_reason"] = serde_json::json!("synthetic gate probe");
+    let reported_reviewable_path = tmp.path().join("reported-reviewable.json");
+    reported_reviewable.save(&reported_reviewable_path).unwrap();
+    std::fs::remove_file(output_dir.join("output.tiff")).unwrap();
+    let missing_output_summary_json = tmp.path().join("missing-output-summary.json");
+    let missing_output_gate = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--report")
+        .arg(&reported_reviewable_path)
+        .arg("--fixture")
+        .arg("unprofiled-positive")
+        .arg("--require-reviewable")
+        .arg("--quiet")
+        .arg("--summary-json")
+        .arg(&missing_output_summary_json)
+        .arg("--summary-md")
+        .arg(tmp.path().join("missing-output-summary.md"))
+        .output()
+        .expect("gate report whose saved output disappeared");
+    assert!(!missing_output_gate.status.success());
+    let missing_output_stderr = String::from_utf8_lossy(&missing_output_gate.stderr);
+    assert!(
+        missing_output_stderr.contains("delivery_artifact_issues=")
+            && missing_output_stderr.contains("output_icc_profile_mismatch"),
+        "unexpected missing-output gate error: {missing_output_stderr}"
+    );
+    let missing_output_summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&missing_output_summary_json).unwrap())
+            .unwrap();
+    assert_eq!(
+        missing_output_summary["render"]["render_review_status"],
+        "reviewable"
+    );
+    assert_eq!(missing_output_summary["render"]["render_reviewable"], true);
+    assert_eq!(
+        missing_output_summary["render"]["output_file_icc_profile_matches_report"],
+        false
+    );
+}
+
+#[test]
 fn test_validate_cli_runs_fixture_suite_strict() {
     let tmp = tempfile::TempDir::new().unwrap();
     let input_dir = tmp.path().join("input");
     std::fs::create_dir_all(&input_dir).unwrap();
 
-    let comp =
-        synthetic::film_negative_image(160, 300, 10, 30, [12000, 7000, 3000], [5400, 4300, 3500]);
+    let mut comp =
+        synthetic::film_negative_image(160, 300, 10, 30, [12000, 7000, 3000], [4800, 2500, 1200]);
+    // A spatial mosaic of four neutral exposure levels supplies independent neutral support
+    // across both position and luminance. Each triplet inverts the measured 3x3 dye-separation
+    // matrix and three characteristic curves at a shared scene-log-exposure target.
+    let neutral_levels = [
+        [6455, 3727, 1655],
+        [3067, 1750, 811],
+        [1287, 724, 353],
+        [612, 340, 173],
+    ];
+    for y in 10..150 {
+        for x in 30..270 {
+            let level = ((x - 30) / 40 + (y - 10) / 35) % neutral_levels.len();
+            for channel in 0..3 {
+                comp[[y, x, channel]] = neutral_levels[level][channel];
+            }
+        }
+    }
     let path1 = input_dir.join("left.tiff");
     let path2 = input_dir.join("right.tiff");
     scanstitch::tiff_io::save_tiff_u16(&comp, &path1).unwrap();
     scanstitch::tiff_io::save_tiff_u16(&comp, &path2).unwrap();
 
-    let library_dir = write_validation_fixture_library(tmp.path());
+    let library_dir = write_validation_fixture_library_with_measured_negative_response(tmp.path());
     let baseline_path = tmp.path().join("baseline.json");
     let baseline_output_dir = tmp.path().join("baseline-output");
     write_fixture_suite_tracked_baseline(
@@ -5599,6 +8513,7 @@ fn test_validate_cli_runs_fixture_suite_strict() {
                 "min_scene_tags": 1,
                 "min_exposure_tags": 1,
                 "min_calibration_cases": 1,
+                "min_negative_reconstruction_contract_fixtures": 1,
                 "required_scanner_profiles": ["scanner-a"],
                 "required_roll_profiles": ["roll-a"],
                 "required_film_stocks": ["Synthetic negative"],
@@ -5613,6 +8528,10 @@ fn test_validate_cli_runs_fixture_suite_strict() {
                     "output_dir": tmp.path().join("registry-output"),
                     "input_mode": "negative",
                     "bit_depth": 14,
+                    "grain_reduction": "off",
+                    "grain_strength": 0.42,
+                    "grain_scale": 1.3,
+                    "deskew": "off",
                     "force_no_stitch": true,
                     "summary_baseline": baseline_path,
                     "calibration_library": library_dir,
@@ -5624,8 +8543,37 @@ fn test_validate_cli_runs_fixture_suite_strict() {
                     "reference_evidence": ["gray-card"],
                     "calibration_case": "scanner-roll-library",
                     "expectations": {
+                        "deskew_status": "disabled",
+                        "deskew_applied": false,
+                        "deskew_review_required": false,
+                        "deskew_retained_area_ratio_min": 1.0,
                         "stitch_decision": "skipped_pre_score",
-                        "base_estimate_source": "working_edges",
+                        "creative_temperature": 0.0,
+                        "creative_tint": 0.0,
+                        "base_estimate_source": "pre_crop_rebate_measurement",
+                        "base_confidence_min": 0.3,
+                        "density_inversion_skipped": false,
+                        "negative_response_model": "measured_nonlinear_dye_separation",
+                        "negative_response_source": "measured_roll_target_with_held_out_validation",
+                        "negative_response_accepted": true,
+                        "negative_response_review_required": false,
+                        "negative_response_crosstalk_model": "measured_3x3_scanner_density_to_film_layers",
+                        "negative_response_characteristic_curve_model": "measured_monotone_pchip_density_to_scene_log_exposure",
+                        "negative_response_measured_model_id": "synthetic-validation-response-v1",
+                        "negative_response_measured_confidence_min": 0.94,
+                        "negative_response_held_out_delta_e00_rms_max": 1.8,
+                        "negative_response_held_out_max_delta_e00_max": 4.9,
+                        "negative_response_held_out_improvement_over_unit_slope_min": 6.0,
+                        "negative_response_density_noise_gain_max": 4.0,
+                        "negative_response_curve_extrapolated_ratio_max": 0.01,
+                        "negative_response_signed_headroom_preserved": true,
+                        "negative_response_curve_interpolation": "monotone_piecewise_cubic_hermite_with_endpoint_tangent_extrapolation",
+                        "render_input_source": "direct_density_transmittance",
+                        "calibration_acceptance_status": "accepted",
+                        "calibration_color_mapping_applied": true,
+                        "candidate_risk": "safe",
+                        "tone_color_trust_state": "trusted",
+                        "neutral_safety_rescue_applied": false,
                         "output_color_space": "linear_prophoto_rgb_d50",
                         "selected_candidate_rank": 1,
                         "calibration_confidence_min": 0.0,
@@ -5637,6 +8585,11 @@ fn test_validate_cli_runs_fixture_suite_strict() {
                         "highlight_chroma_compressed_ratio_max": 1.0,
                         "highlight_neutral_chroma_compressed_ratio_max": 1.0,
                         "shadow_chroma_compressed_ratio_max": 1.0,
+                        "grain_reduction_enabled": false,
+                        "grain_detail_review_required": false,
+                        "grain_detail_decision_supported": true,
+                        "grain_detail_luminance_p10_retention_min": 1.0,
+                        "grain_detail_chroma_p10_retention_min": 1.0,
                         "memory_color_penalty_max": 10.0,
                         "spatial_consistency_penalty_max": 10.0,
                         "density_monotonicity_score_min": 0.0,
@@ -5663,8 +8616,16 @@ fn test_validate_cli_runs_fixture_suite_strict() {
         .arg("--fixture-registry")
         .arg(&registry_path)
         .arg("--fixture-suite")
+        .arg("--fixture-suite-fixture")
+        .arg("logan")
         .arg("--strict")
         .arg("--debug")
+        .arg("--grain-reduction")
+        .arg("on")
+        .arg("--grain-strength")
+        .arg("0.9")
+        .arg("--grain-scale")
+        .arg("3.0")
         .arg("--ica-max-iter")
         .arg("20")
         .arg("--ica-tol")
@@ -5681,10 +8642,12 @@ fn test_validate_cli_runs_fixture_suite_strict() {
 
     assert!(
         output.status.success(),
-        "fixture suite CLI failed: status={} stderr={} stdout={}",
+        "fixture suite CLI failed: status={} stderr={} stdout={} suite_summary={}",
         output.status,
         String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&output.stdout)
+        String::from_utf8_lossy(&output.stdout),
+        std::fs::read_to_string(&suite_json)
+            .unwrap_or_else(|err| format!("<failed to read {}: {err}>", suite_json.display()))
     );
 
     let suite: serde_json::Value =
@@ -5702,10 +8665,47 @@ fn test_validate_cli_runs_fixture_suite_strict() {
         serde_json::json!(["roll-a"])
     );
     assert_eq!(suite["coverage"]["scene_tag_count"], 1);
+    assert_eq!(
+        suite["coverage"]["negative_reconstruction_contract_fixture_count"],
+        1
+    );
     assert_eq!(suite["fixtures"][0]["name"], "logan");
     assert_eq!(suite["fixtures"][0]["status"], "passed");
+    assert_eq!(suite["fixtures"][0]["creative_temperature"], 0.0);
+    assert_eq!(suite["fixtures"][0]["expected_creative_temperature"], 0.0);
+    assert_eq!(suite["fixtures"][0]["creative_tint"], 0.0);
+    assert_eq!(suite["fixtures"][0]["deskew_status"], "disabled");
+    assert_eq!(suite["fixtures"][0]["expected_deskew_status"], "disabled");
+    assert_eq!(suite["fixtures"][0]["deskew_applied"], false);
+    assert_eq!(suite["fixtures"][0]["deskew_review_required"], false);
+    assert_eq!(suite["fixtures"][0]["deskew_retained_area_ratio"], 1.0);
+    assert_eq!(suite["fixtures"][0]["effective_grain_reduction"], "off");
+    assert_eq!(suite["fixtures"][0]["effective_grain_strength"], 0.42);
+    assert_eq!(suite["fixtures"][0]["effective_grain_scale"], 1.3);
+    assert_eq!(suite["fixtures"][0]["grain_reduction_enabled"], false);
+    assert_eq!(
+        suite["fixtures"][0]["expected_grain_reduction_enabled"],
+        false
+    );
+    assert_eq!(suite["fixtures"][0]["grain_detail_review_required"], false);
+    assert_eq!(
+        suite["fixtures"][0]["grain_detail_decision_supported"],
+        true
+    );
+    assert_eq!(
+        suite["fixtures"][0]["grain_detail_luminance_p10_retention"],
+        1.0
+    );
+    assert_eq!(
+        suite["fixtures"][0]["grain_detail_chroma_p10_retention"],
+        1.0
+    );
     assert_eq!(suite["coverage"]["fixtures"][0]["input_mode"], "negative");
     assert_eq!(suite["coverage"]["fixtures"][0]["bit_depth"], 14);
+    assert_eq!(suite["coverage"]["fixtures"][0]["grain_reduction"], "off");
+    assert_eq!(suite["coverage"]["fixtures"][0]["grain_strength"], 0.42);
+    assert_eq!(suite["coverage"]["fixtures"][0]["grain_scale"], 1.3);
+    assert_eq!(suite["coverage"]["fixtures"][0]["deskew"], "off");
     assert_eq!(suite["coverage"]["fixtures"][0]["force_no_stitch"], true);
     assert_eq!(suite["fixtures"][0]["coverage_validation_ready"], true);
     assert_eq!(
@@ -5738,11 +8738,32 @@ fn test_validate_cli_runs_fixture_suite_strict() {
     );
     assert_eq!(
         suite["fixtures"][0]["base_estimate_source"],
-        "working_edges"
+        "pre_crop_rebate_measurement"
     );
     assert_eq!(
         suite["fixtures"][0]["expected_base_estimate_source"],
-        "working_edges"
+        "pre_crop_rebate_measurement"
+    );
+    assert_eq!(
+        suite["fixtures"][0]["negative_reconstruction"]["response_model"],
+        "measured_nonlinear_dye_separation"
+    );
+    assert_eq!(
+        suite["fixtures"][0]["negative_reconstruction"]["measured_model_id"],
+        "synthetic-validation-response-v1"
+    );
+    assert_eq!(
+        suite["fixtures"][0]["negative_reconstruction"]["response_review_required"],
+        false
+    );
+    assert_eq!(
+        suite["fixtures"][0]["negative_reconstruction"]["signed_headroom_preserved"],
+        true
+    );
+    assert!(
+        suite["fixtures"][0]["negative_reconstruction"]["curve_extrapolated_any_ratio"]
+            .as_f64()
+            .is_some_and(|ratio| ratio <= 0.01)
     );
     assert_eq!(
         suite["fixtures"][0]["output_color_space"],
@@ -5921,6 +8942,15 @@ fn test_validate_cli_runs_fixture_suite_strict() {
         suite["fixtures"][0]["tone_color_trust_state"].is_string(),
         "fixture suite should expose tone-color trust state"
     );
+    assert_eq!(
+        suite["fixtures"][0]["neutral_safety_rescue_applied"], false,
+        "fixture={}",
+        suite["fixtures"][0]
+    );
+    assert_eq!(
+        suite["fixtures"][0]["expected_neutral_safety_rescue_applied"],
+        false
+    );
     assert!(
         suite["fixtures"][0]["highlight_chroma_compressed_ratio"].is_number(),
         "fixture suite should expose highlight chroma compression"
@@ -5991,10 +9021,13 @@ fn test_validate_cli_runs_fixture_suite_strict() {
     assert!(markdown.contains("Coverage"));
     assert!(markdown.contains("Coverage actions"));
     assert!(markdown.contains("Render input"));
+    assert!(markdown.contains("Geometry preparation"));
+    assert!(markdown.contains("Negative reconstruction"));
     assert!(markdown.contains("Tone trust"));
     assert!(markdown.contains("Tone protection"));
     assert!(markdown.contains("expected skipped_pre_score; actual skipped_pre_score"));
-    assert!(markdown.contains("expected working_edges; actual working_edges"));
+    assert!(markdown
+        .contains("expected pre_crop_rebate_measurement; actual pre_crop_rebate_measurement"));
     assert!(markdown.contains("expected linear_prophoto_rgb_d50; actual linear_prophoto_rgb_d50"));
     assert!(markdown.contains("rank expected 1; actual 1"));
     assert!(markdown.contains("acceptance signatures"));
@@ -6007,6 +9040,7 @@ fn test_validate_cli_runs_fixture_suite_strict() {
     assert!(markdown.contains("highlight chroma max 1.000000"));
     assert!(markdown.contains("neutral highlight max 1.000000"));
     assert!(markdown.contains("shadow chroma max 1.000000"));
+    assert!(markdown.contains("grain config off, strength 0.420, scale 1.300"));
     assert!(markdown.contains("density min 0.000000"));
     assert!(markdown.contains("hue min 0.000000"));
     assert!(markdown.contains("spatial neutral max 10.000000"));
@@ -6023,7 +9057,1473 @@ fn test_validate_cli_runs_fixture_suite_strict() {
     assert!(markdown.contains("condition max 100.000000"));
     assert!(markdown.contains("scanner scanner-a (expected scanner-a)"));
     assert!(markdown.contains("roll roll-a (expected roll-a)"));
+    assert!(markdown.contains(
+        "response model expected measured_nonlinear_dye_separation; actual measured_nonlinear_dye_separation"
+    ));
+    assert!(markdown.contains("held-out dE00 RMS max 1.800000; actual 1.800000"));
     assert!(markdown.contains("logan"));
+
+    let adversarial_registry_path = tmp.path().join("fixtures-adversarial.json");
+    let mut adversarial_registry: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&registry_path).unwrap()).unwrap();
+    adversarial_registry["fixtures"]["logan"]["expectations"]
+        ["negative_response_measured_confidence_min"] = serde_json::json!(0.95);
+    std::fs::write(
+        &adversarial_registry_path,
+        serde_json::to_string_pretty(&adversarial_registry).unwrap(),
+    )
+    .unwrap();
+    let adversarial_output_dir = tmp.path().join("suite-adversarial-output");
+    let adversarial_json = tmp.path().join("fixture-suite-adversarial.json");
+    let adversarial_output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&adversarial_registry_path)
+        .arg("--fixture-suite")
+        .arg("--fixture-suite-fixture")
+        .arg("logan")
+        .arg("--strict")
+        .arg("--debug")
+        .arg("--ica-max-iter")
+        .arg("20")
+        .arg("--ica-tol")
+        .arg("0.0001")
+        .arg("--quiet")
+        .arg("--output-dir")
+        .arg(&adversarial_output_dir)
+        .arg("--summary-json")
+        .arg(&adversarial_json)
+        .output()
+        .expect("run adversarial measured-response confidence fixture suite");
+    assert!(
+        !adversarial_output.status.success(),
+        "a stricter-than-measured confidence floor must fail the strict suite"
+    );
+    assert!(String::from_utf8_lossy(&adversarial_output.stderr)
+        .contains("fixture_suite:logan:negative_response_measured_confidence_below_expected"));
+    let adversarial: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&adversarial_json).unwrap()).unwrap();
+    assert_eq!(
+        adversarial["coverage"]["negative_reconstruction_contract_fixture_count"], 1,
+        "the registry contract remains structurally complete while runtime evidence fails"
+    );
+    assert_eq!(
+        adversarial["fixtures"][0]["negative_reconstruction"]["measured_confidence"],
+        0.94
+    );
+    assert_eq!(
+        adversarial["fixtures"][0]["negative_reconstruction"]["expected_measured_confidence_min"],
+        0.95
+    );
+}
+
+#[test]
+fn test_validate_cli_direct_fixture_honors_registry_pipeline_overrides() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let input = tmp.path().join("positive.tiff");
+    let image = synthetic::image_with_borders(96, 144, 12, [7_000, 8_000, 9_000]);
+    scanstitch::tiff_io::save_tiff_u16(&image, &input).unwrap();
+    let output_dir = tmp.path().join("direct-output");
+    let registry_path = tmp.path().join("fixtures.json");
+    std::fs::write(
+        &registry_path,
+        serde_json::json!({
+            "fixtures": {
+                "direct-positive": {
+                    "component1": input.clone(),
+                    "output_dir": output_dir,
+                    "input_mode": "positive",
+                    "bit_depth": 16,
+                    "grain_reduction": "on",
+                    "grain_strength": 0.37,
+                    "grain_scale": 1.7,
+                    "deskew": "manual",
+                    "deskew_angle_degrees": 0.5,
+                    "force_no_stitch": true
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture")
+        .arg("direct-positive")
+        .arg("--quality-mode")
+        .arg("fast")
+        .arg("--quiet")
+        .output()
+        .expect("run direct fixture");
+    assert!(
+        output.status.success(),
+        "direct fixture failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(output_dir.join("report.json")).unwrap())
+            .unwrap();
+    let phase = |name: &str| {
+        report["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|phase| phase["name"] == name)
+            .unwrap()
+    };
+    assert_eq!(phase("load")["metrics"]["preserved_working_bit_depth"], 16);
+    assert_eq!(phase("deskew")["metrics"]["requested_mode"], "manual");
+    assert_eq!(phase("deskew")["metrics"]["status"], "applied");
+    assert_eq!(phase("load")["metrics"]["input_count"], 1);
+    assert_eq!(
+        phase("stitch")["metrics"]["decision"],
+        "skipped_single_input"
+    );
+    assert_eq!(
+        phase("density_inversion")["metrics"]["input_mode"],
+        "positive"
+    );
+    assert_eq!(phase("density_inversion")["metrics"]["skipped"], true);
+    assert_eq!(
+        phase("tone_mapping")["metrics"]["grain_reduction"]["requested"]["enabled"],
+        true
+    );
+    assert_eq!(
+        phase("tone_mapping")["metrics"]["grain_reduction"]["requested"]["strength"],
+        0.37
+    );
+    assert_eq!(
+        phase("tone_mapping")["metrics"]["grain_reduction"]["requested"]["scale"],
+        1.7
+    );
+
+    let override_output_dir = tmp.path().join("single-override-output");
+    let override_output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--component1")
+        .arg(&input)
+        .arg("--input-mode")
+        .arg("positive")
+        .arg("--bit-depth")
+        .arg("16")
+        .arg("--force-no-stitch")
+        .arg("--quality-mode")
+        .arg("fast")
+        .arg("--output-dir")
+        .arg(&override_output_dir)
+        .arg("--quiet")
+        .output()
+        .expect("run direct single-component override");
+    assert!(
+        override_output.status.success(),
+        "single-component override failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&override_output.stderr),
+        String::from_utf8_lossy(&override_output.stdout)
+    );
+    let override_report: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(override_output_dir.join("report.json")).unwrap(),
+    )
+    .unwrap();
+    let override_stitch = override_report["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|phase| phase["name"] == "stitch")
+        .unwrap();
+    assert_eq!(
+        override_stitch["metrics"]["decision"],
+        "skipped_single_input"
+    );
+}
+
+#[test]
+fn test_validate_cli_single_component_fixture_is_a_set_but_not_a_pair() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let input = tmp.path().join("single.tiff");
+    let baseline_path = tmp.path().join("baseline.json");
+    let registry_path = tmp.path().join("fixtures.json");
+    let summary_json = tmp.path().join("coverage.json");
+    let summary_md = tmp.path().join("coverage.md");
+    let image = synthetic::constant_image(4, 5, [12_000, 7_000, 3_000]);
+    scanstitch::tiff_io::save_tiff_u16(&image, &input).unwrap();
+    let component1_sha256 = file_sha256_hex(&input);
+    std::fs::write(
+        &baseline_path,
+        serde_json::to_string_pretty(&fixture_summary_baseline()).unwrap(),
+    )
+    .unwrap();
+    let summary_baseline_sha256 = file_sha256_hex(&baseline_path);
+    std::fs::write(
+        &registry_path,
+        serde_json::json!({
+            "coverage_requirements": {
+                "min_fixtures": 1,
+                "min_component_sha256_sets": 1,
+                "min_tiff_bits_per_sample": 14,
+                "min_summary_baselines": 1,
+                "min_summary_baseline_sha256_fixtures": 1,
+                "min_uncalibrated_fixtures": 1
+            },
+            "fixtures": {
+                "logan": {
+                    "component1": input,
+                    "component1_sha256": component1_sha256.clone(),
+                    "summary_baseline": baseline_path,
+                    "summary_baseline_sha256": summary_baseline_sha256,
+                    "film_stock": "Synthetic positive",
+                    "scene_tags": ["single-frame"],
+                    "exposure_tags": ["normal-exposure"],
+                    "calibration_case": "uncalibrated-image-derived"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture-coverage")
+        .arg("--strict")
+        .arg("--quiet")
+        .arg("--summary-json")
+        .arg(&summary_json)
+        .arg("--summary-md")
+        .arg(&summary_md)
+        .output()
+        .expect("run single-component fixture coverage");
+    assert!(
+        output.status.success(),
+        "single-component coverage failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&summary_json).unwrap()).unwrap();
+    assert_eq!(summary["status"], "passed");
+    assert_eq!(summary["fixture_count"], 1);
+    assert_eq!(summary["component_file_count"], 1);
+    assert_eq!(summary["max_component_count"], 1);
+    assert_eq!(summary["component_set_available_count"], 1);
+    assert_eq!(summary["component_sha256_declared_set_count"], 1);
+    assert_eq!(summary["component_sha256_computed_set_count"], 1);
+    assert_eq!(summary["component_sha256_set_count"], 1);
+    assert_eq!(summary["readable_tiff_set_count"], 1);
+    assert_eq!(summary["tiff_layout_consistent_set_count"], 1);
+    assert_eq!(summary["tiff_dimension_matched_set_count"], 1);
+    assert_eq!(summary["component_pair_available_count"], 0);
+    assert_eq!(summary["component_sha256_declared_pair_count"], 0);
+    assert_eq!(summary["component_sha256_computed_pair_count"], 0);
+    assert_eq!(summary["component_sha256_pair_count"], 0);
+    assert_eq!(summary["readable_tiff_pair_count"], 0);
+    assert_eq!(summary["tiff_layout_consistent_pair_count"], 0);
+    assert_eq!(summary["tiff_dimension_matched_pair_count"], 0);
+    assert_eq!(summary["validation_ready_fixture_count"], 1);
+    let fixture = &summary["fixtures"][0];
+    assert_eq!(fixture["component_count"], 1);
+    assert!(fixture["component2"].is_null());
+    assert_eq!(fixture["component2_exists"], false);
+    assert!(fixture["component2_sha256"].is_null());
+    assert!(fixture["component2_tiff"].is_null());
+    assert!(fixture["tiff_pair"].is_null());
+    assert_eq!(fixture["all_components_exist"], true);
+    assert_eq!(fixture["all_component_sha256_matched"], true);
+    assert_eq!(fixture["all_components_readable_tiff"], true);
+    assert_eq!(fixture["all_component_layouts_consistent"], true);
+    assert_eq!(fixture["all_component_dimensions_matched"], true);
+    assert_eq!(fixture["component1_sha256"]["matched"], true);
+    assert_eq!(
+        fixture["component1_sha256"]["actual_sha256"],
+        component1_sha256
+    );
+    assert_eq!(fixture["validation_ready"], true);
+    assert_eq!(fixture["action_items"], serde_json::json!([]));
+    let markdown = std::fs::read_to_string(&summary_md).unwrap();
+    assert!(markdown.contains("| logan | yes |"));
+    assert!(markdown.contains("RGB16 5x4 16bpc"));
+}
+
+#[test]
+fn test_validate_cli_fixture_suite_proves_geometry_preparation_contract() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let input = tmp.path().join("four-edge-board-positive.tiff");
+    let mut image = synthetic::constant_image(160, 220, [0, 0, 0]);
+    for y in 16..144 {
+        for x in 16..204 {
+            let checker = if ((x / 6) + (y / 6)) % 2 == 0 {
+                1_u16
+            } else {
+                0_u16
+            };
+            image[[y, x, 0]] = 14_000 + ((x * 71 + y * 29) % 18_000) as u16;
+            image[[y, x, 1]] = 12_000 + ((x * 41 + y * 53) % 16_000) as u16;
+            image[[y, x, 2]] = 10_000 + ((x * 37 + y * 23) % 14_000) as u16 + checker * 1_200;
+        }
+    }
+    write_rgb16_tiff_with_orientation(&input, &image, 6);
+
+    let registry_path = tmp.path().join("geometry-fixtures.json");
+    let direct_output_dir = tmp.path().join("geometry-direct-output");
+    let baseline_path = tmp.path().join("geometry-summary-baseline.json");
+    let mut registry = serde_json::json!({
+        "fixtures": {
+            "logan": {
+                "component1": input,
+                "component2": input,
+                "output_dir": direct_output_dir,
+                "input_mode": "positive",
+                "bit_depth": 16,
+                "deskew": "manual",
+                "deskew_angle_degrees": 0.5,
+                "orientation_correction": "rotate-180",
+                "force_no_stitch": true,
+                "film_stock": "Synthetic positive",
+                "scene_tags": ["four-edge-scanner-board"],
+                "exposure_tags": ["normal-exposure"],
+                "calibration_case": "uncalibrated-image-derived"
+            }
+        }
+    });
+    std::fs::write(
+        &registry_path,
+        serde_json::to_string_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+    let orientation_review_dir = tmp.path().join("geometry-orientation-review");
+    let orientation_review = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture")
+        .arg("logan")
+        .arg("--write-orientation-review")
+        .arg(&orientation_review_dir)
+        .arg("--quiet")
+        .output()
+        .expect("write orientation review package");
+    assert!(
+        orientation_review.status.success(),
+        "orientation review package failed: {}",
+        String::from_utf8_lossy(&orientation_review.stderr)
+    );
+    let orientation_review: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(orientation_review_dir.join("orientation-review.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(orientation_review["schema_version"], 1);
+    assert_eq!(
+        orientation_review["review_status"],
+        "requires_human_approval"
+    );
+    assert_eq!(orientation_review["input_mode"], "positive");
+    assert_eq!(orientation_review["working_bit_depth"], 16);
+    assert_eq!(orientation_review["orientation_correction"], "rotate-180");
+    assert_eq!(
+        orientation_review["orientation_components_expected"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let orientation_draft = &orientation_review["orientation_components_expected"][0];
+    assert_eq!(orientation_draft["upright_approved"], false);
+    assert_eq!(orientation_draft["tag_value"], 6);
+    assert_eq!(orientation_draft["transform"], "rotate_270_clockwise");
+    assert_eq!(orientation_draft["source_width"], 220);
+    assert_eq!(orientation_draft["source_height"], 160);
+    assert_eq!(orientation_draft["output_width"], 160);
+    assert_eq!(orientation_draft["output_height"], 220);
+    let reviewed_decoded_pixel_sha256 = orientation_draft["decoded_pixel_sha256"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(reviewed_decoded_pixel_sha256.len(), 64);
+    let preview_path = orientation_review_dir.join(
+        orientation_review["previews"][0]["preview_path"]
+            .as_str()
+            .unwrap(),
+    );
+    let (preview_width, preview_height) = image::image_dimensions(&preview_path).unwrap();
+    assert!(preview_height > preview_width);
+    let orientation_review_markdown =
+        std::fs::read_to_string(orientation_review_dir.join("orientation-review.md")).unwrap();
+    assert!(orientation_review_markdown.contains("never approves its own output"));
+    assert!(orientation_review_markdown.contains("upright_approved` value `false"));
+    assert!(orientation_review_markdown.contains("orientation correction: `rotate-180`"));
+
+    let single_orientation_review_dir = tmp.path().join("single-orientation-review");
+    let single_orientation_review = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture")
+        .arg("single-positive")
+        .arg("--component1")
+        .arg(&input)
+        .arg("--input-mode")
+        .arg("positive")
+        .arg("--bit-depth")
+        .arg("16")
+        .arg("--orientation-correction")
+        .arg("rotate-180")
+        .arg("--write-orientation-review")
+        .arg(&single_orientation_review_dir)
+        .arg("--quiet")
+        .output()
+        .expect("write single-component orientation review package");
+    assert!(
+        single_orientation_review.status.success(),
+        "single orientation review package failed: {}",
+        String::from_utf8_lossy(&single_orientation_review.stderr)
+    );
+    let single_orientation_review: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(single_orientation_review_dir.join("orientation-review.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        single_orientation_review["orientation_components_expected"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        single_orientation_review["orientation_correction"],
+        "rotate-180"
+    );
+    assert_eq!(
+        single_orientation_review["orientation_components_expected"][0]["decoded_pixel_sha256"],
+        reviewed_decoded_pixel_sha256
+    );
+
+    let direct = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture")
+        .arg("logan")
+        .arg("--quality-mode")
+        .arg("fast")
+        .arg("--quiet")
+        .arg("--write-summary-baseline")
+        .arg(&baseline_path)
+        .output()
+        .expect("run direct geometry fixture and write baseline");
+    assert!(
+        direct.status.success(),
+        "direct geometry fixture failed: {}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+    let direct_summary: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(direct_output_dir.join("summary.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(direct_summary["input_orientation"]["input_count"], 2);
+    assert_eq!(
+        direct_summary["input_orientation"]["all_components_reported"],
+        true
+    );
+    let orientation_components = direct_summary["input_orientation"]["components"]
+        .as_array()
+        .unwrap();
+    let decoded_pixel_sha256 = orientation_components[0]["decoded_pixel_sha256"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(decoded_pixel_sha256.len(), 64);
+    assert_eq!(decoded_pixel_sha256, reviewed_decoded_pixel_sha256);
+    for component in orientation_components {
+        assert_eq!(component["decoded_pixel_sha256"], decoded_pixel_sha256);
+        assert_eq!(component["tag_value"], 6);
+        assert_eq!(component["metadata_transform"], "rotate_90_clockwise");
+        assert_eq!(component["orientation_correction_requested"], "rotate-180");
+        assert_eq!(component["orientation_correction_transform"], "rotate_180");
+        assert_eq!(component["orientation_correction_applied"], true);
+        assert_eq!(component["effective_tag_value"], 8);
+        assert_eq!(component["transform"], "rotate_270_clockwise");
+        assert_eq!(component["applied"], true);
+        assert_eq!(component["source_width"], 220);
+        assert_eq!(component["source_height"], 160);
+        assert_eq!(component["output_width"], 160);
+        assert_eq!(component["output_height"], 220);
+    }
+    assert_eq!(direct_summary["deskew"]["all_components_applied"], true);
+    assert!(
+        direct_summary["deskew"]["minimum_component_retained_area_ratio"]
+            .as_f64()
+            .is_some_and(|ratio| ratio >= 0.9)
+    );
+    assert_eq!(
+        direct_summary["border_crop"]["all_components_cropped"],
+        true
+    );
+    assert_eq!(
+        direct_summary["border_crop"]["minimum_removed_edge_count_per_component"],
+        4
+    );
+    assert!(direct_summary["border_crop"]["minimum_retained_area_ratio"]
+        .as_f64()
+        .is_some_and(|ratio| ratio >= 0.5));
+    assert!(direct_summary["border_crop"]["maximum_retained_area_ratio"]
+        .as_f64()
+        .is_some_and(|ratio| ratio < 0.99));
+    assert!(direct_summary["deskew"]["correction_degrees"]
+        .as_f64()
+        .is_some_and(|angle| (angle + 0.5).abs() <= 1e-9));
+    let crop_components = direct_summary["border_crop"]["components"]
+        .as_array()
+        .unwrap();
+    assert_eq!(crop_components.len(), 2);
+    for component in crop_components {
+        for edge in [
+            "top_removed",
+            "bottom_removed",
+            "left_removed",
+            "right_removed",
+        ] {
+            assert!(component[edge]
+                .as_u64()
+                .is_some_and(|removed| removed.abs_diff(16) <= 4));
+        }
+    }
+    let border_crop_components_expected = serde_json::json!([
+        {
+            "component_index": 1,
+            "top_removed": 16,
+            "bottom_removed": 16,
+            "left_removed": 16,
+            "right_removed": 16,
+            "tolerance_px": 4
+        },
+        {
+            "component_index": 2,
+            "top_removed": 16,
+            "bottom_removed": 16,
+            "left_removed": 16,
+            "right_removed": 16,
+            "tolerance_px": 4
+        }
+    ]);
+
+    registry["coverage_requirements"] = serde_json::json!({
+        "min_geometry_preparation_contract_fixtures": 1,
+        "min_geometry_accuracy_contract_fixtures": 1,
+        "min_orientation_accuracy_contract_fixtures": 1
+    });
+    registry["fixtures"]["logan"]["summary_baseline"] = serde_json::json!(baseline_path);
+    registry["fixtures"]["logan"]["expectations"] = serde_json::json!({
+        "deskew_status": "applied",
+        "deskew_applied": true,
+        "deskew_review_required": false,
+        "deskew_all_components_applied": true,
+        "deskew_minimum_component_retained_area_ratio_min": 0.9,
+        "border_crop_all_components_cropped": true,
+        "border_crop_minimum_removed_edge_count_per_component_min": 4,
+        "border_crop_retained_area_ratio_min": 0.5,
+        "border_crop_retained_area_ratio_max": 0.99,
+        "border_crop_rejected": false,
+        "render_review_status": "review_required_color",
+        "render_reviewable": false,
+        "deskew_correction_degrees_expected": -0.5,
+        "deskew_correction_tolerance_degrees": 0.001,
+        "border_crop_components_expected": border_crop_components_expected,
+        "orientation_components_expected": [
+            {
+                "component_index": 1,
+                "upright_approved": true,
+                "decoded_pixel_sha256": decoded_pixel_sha256.clone(),
+                "tag_present": true,
+                "tag_value": 6,
+                "transform": "rotate_270_clockwise",
+                "applied": true,
+                "source_width": 220,
+                "source_height": 160,
+                "output_width": 160,
+                "output_height": 220
+            },
+            {
+                "component_index": 2,
+                "upright_approved": true,
+                "decoded_pixel_sha256": decoded_pixel_sha256.clone(),
+                "tag_present": true,
+                "tag_value": 6,
+                "transform": "rotate_270_clockwise",
+                "applied": true,
+                "source_width": 220,
+                "source_height": 160,
+                "output_width": 160,
+                "output_height": 220
+            }
+        ]
+    });
+    std::fs::write(
+        &registry_path,
+        serde_json::to_string_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+
+    let suite_output_dir = tmp.path().join("geometry-suite-output");
+    let suite_json = tmp.path().join("geometry-suite.json");
+    let suite = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture-suite")
+        .arg("--fixture-suite-fixture")
+        .arg("logan")
+        .arg("--strict")
+        .arg("--quality-mode")
+        .arg("fast")
+        .arg("--quiet")
+        .arg("--output-dir")
+        .arg(&suite_output_dir)
+        .arg("--summary-json")
+        .arg(&suite_json)
+        .output()
+        .expect("run strict geometry fixture suite");
+    assert!(
+        suite.status.success(),
+        "strict geometry fixture failed: {} {}",
+        String::from_utf8_lossy(&suite.stderr),
+        std::fs::read_to_string(&suite_json).unwrap_or_default()
+    );
+    let suite: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&suite_json).unwrap()).unwrap();
+    assert_eq!(suite["status"], "passed");
+    assert_eq!(
+        suite["coverage"]["geometry_preparation_contract_fixture_count"],
+        1
+    );
+    assert_eq!(
+        suite["coverage"]["geometry_accuracy_contract_fixture_count"],
+        1
+    );
+    assert_eq!(
+        suite["coverage"]["orientation_accuracy_contract_fixture_count"],
+        1
+    );
+    assert_eq!(
+        suite["fixtures"][0]["input_orientation"]["components"][0]["tag_value"],
+        6
+    );
+    assert_eq!(
+        suite["fixtures"][0]["geometry_preparation"]["all_border_crop_components_cropped"],
+        true
+    );
+    assert_eq!(
+        suite["fixtures"][0]["geometry_preparation"]["minimum_removed_edge_count_per_component"],
+        4
+    );
+    let suite_markdown =
+        std::fs::read_to_string(suite_output_dir.join("fixture-suite.md")).unwrap();
+    assert!(suite_markdown.contains("Geometry preparation / orientation"));
+    assert!(suite_markdown.contains("deskew all components expected true; actual true"));
+    assert!(suite_markdown.contains("removed edges minimum expected 4; actual 4"));
+    assert!(suite_markdown
+        .contains("deskew correction expected -0.500000 +/- 0.001000; actual -0.500000"));
+    assert!(suite_markdown.contains("crop component 1 top/bottom/left/right expected"));
+    assert!(suite_markdown
+        .contains("orientation component 1 upright approved true; decoded pixel SHA-256 expected"));
+    assert!(suite_markdown
+        .contains("tag expected 6; actual 6; transform expected rotate_270_clockwise"));
+
+    let adversarial_registry_path = tmp.path().join("geometry-fixtures-adversarial.json");
+    let expected_top = registry["fixtures"]["logan"]["expectations"]
+        ["border_crop_components_expected"][0]["top_removed"]
+        .as_u64()
+        .unwrap();
+    let actual_top = crop_components[0]["top_removed"].as_u64().unwrap();
+    registry["fixtures"]["logan"]["expectations"]["border_crop_components_expected"][0]
+        ["top_removed"] = serde_json::json!(actual_top + 5);
+    assert_ne!(expected_top, actual_top + 5);
+    registry["fixtures"]["logan"]["expectations"]["orientation_components_expected"][0]
+        ["tag_value"] = serde_json::json!(8);
+    registry["fixtures"]["logan"]["expectations"]["orientation_components_expected"][0]
+        ["transform"] = serde_json::json!("rotate_90_clockwise");
+    registry["fixtures"]["logan"]["expectations"]["orientation_components_expected"][0]
+        ["decoded_pixel_sha256"] = serde_json::json!("f".repeat(64));
+    std::fs::write(
+        &adversarial_registry_path,
+        serde_json::to_string_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+    let adversarial_json = tmp.path().join("geometry-suite-adversarial.json");
+    let adversarial = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&adversarial_registry_path)
+        .arg("--fixture-suite")
+        .arg("--fixture-suite-fixture")
+        .arg("logan")
+        .arg("--strict")
+        .arg("--quality-mode")
+        .arg("fast")
+        .arg("--quiet")
+        .arg("--output-dir")
+        .arg(tmp.path().join("geometry-suite-adversarial-output"))
+        .arg("--summary-json")
+        .arg(&adversarial_json)
+        .output()
+        .expect("run adversarial geometry fixture suite");
+    assert!(!adversarial.status.success());
+    assert!(String::from_utf8_lossy(&adversarial.stderr)
+        .contains("fixture_suite:logan:border_crop_component1_top_outside_tolerance"));
+    assert!(String::from_utf8_lossy(&adversarial.stderr)
+        .contains("fixture_suite:logan:orientation_component1_tag_value_mismatch"));
+    assert!(String::from_utf8_lossy(&adversarial.stderr)
+        .contains("fixture_suite:logan:orientation_component1_transform_mismatch"));
+    assert!(String::from_utf8_lossy(&adversarial.stderr)
+        .contains("fixture_suite:logan:orientation_component1_decoded_pixel_sha256_mismatch"));
+    let adversarial: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&adversarial_json).unwrap()).unwrap();
+    assert_eq!(
+        adversarial["coverage"]["geometry_preparation_contract_fixture_count"], 1,
+        "the structurally complete registry must remain distinct from failed runtime evidence"
+    );
+    assert_eq!(
+        adversarial["coverage"]["geometry_accuracy_contract_fixture_count"], 1,
+        "a complete factual declaration must remain distinct from failed runtime accuracy"
+    );
+    assert_eq!(
+        adversarial["coverage"]["orientation_accuracy_contract_fixture_count"], 1,
+        "a coherent but factually wrong orientation declaration must fail only at runtime"
+    );
+}
+
+#[test]
+fn test_validate_cli_fixture_suite_proves_dynamic_range_and_grain_contracts() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let input = tmp.path().join("grain-detail-positive.tiff");
+    let mut image = synthetic::constant_image(128, 192, [24_900, 24_900, 24_900]);
+    for y in 0..128 {
+        for x in 0..192 {
+            let checker = if (x + y) % 2 == 0 { 1_i32 } else { -1_i32 };
+            if x < 32 {
+                let neutral_base = if x < 16 { 10_000 } else { 46_000 };
+                let neutral = (neutral_base + checker * 800).clamp(0, u16::MAX as i32) as u16;
+                image[[y, x, 0]] = neutral;
+                image[[y, x, 1]] = neutral;
+                image[[y, x, 2]] = neutral;
+                continue;
+            }
+            let luma_step = if (48..96).contains(&x) { 7_000 } else { 0 };
+            let chroma_step = if (112..160).contains(&x) { 3_500 } else { 0 };
+            let base = 24_900 + luma_step;
+            image[[y, x, 0]] =
+                (base + checker * 5_200 + chroma_step).clamp(0, u16::MAX as i32) as u16;
+            image[[y, x, 1]] = base.clamp(0, u16::MAX as i32) as u16;
+            image[[y, x, 2]] =
+                (base - checker * 5_200 - chroma_step).clamp(0, u16::MAX as i32) as u16;
+        }
+    }
+    scanstitch::tiff_io::save_tiff_u16(&image, &input).unwrap();
+
+    let registry_path = tmp.path().join("fixtures.json");
+    let baseline_path = tmp.path().join("grain-summary-baseline.json");
+    let direct_output_dir = tmp.path().join("direct-output");
+    let calibration_profile = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("docs")
+        .join("color-calibration-profile.example.json");
+    std::fs::write(
+        &registry_path,
+        serde_json::json!({
+            "fixtures": {
+                "logan": {
+                    "component1": input,
+                    "component2": input,
+                    "output_dir": direct_output_dir,
+                    "input_mode": "positive",
+                    "bit_depth": 16,
+                    "grain_reduction": "on",
+                    "grain_strength": 0.4,
+                    "grain_scale": 1.0,
+                    "force_no_stitch": true,
+                    "calibration_profile": calibration_profile,
+                    "film_stock": "Synthetic positive",
+                    "scene_tags": ["fine-texture", "isoluminant-edge"],
+                    "exposure_tags": ["normal-exposure"],
+                    "calibration_case": "external-profile"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let direct = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture")
+        .arg("logan")
+        .arg("--color-mode")
+        .arg("calibrated")
+        .arg("--quality-mode")
+        .arg("fast")
+        .arg("--quiet")
+        .arg("--write-summary-baseline")
+        .arg(&baseline_path)
+        .output()
+        .expect("run direct grain-effect fixture baseline");
+    assert!(
+        direct.status.success(),
+        "direct grain-effect fixture failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&direct.stderr),
+        String::from_utf8_lossy(&direct.stdout)
+    );
+
+    let report: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(direct_output_dir.join("report.json")).unwrap(),
+    )
+    .unwrap();
+    let tone = report["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|phase| phase["name"] == "tone_mapping")
+        .map(|phase| &phase["metrics"])
+        .unwrap();
+    let applied_ratio = tone["noise_reduction_applied_ratio"].as_f64().unwrap();
+    let structure_excluded_ratio = tone["noise_reduction_structure_excluded_ratio"]
+        .as_f64()
+        .unwrap();
+    let flat_luma_reduction = tone["noise_reduction_flat_luma_p95_reduction_ratio"]
+        .as_f64()
+        .unwrap();
+    let flat_chroma_reduction = tone["noise_reduction_flat_chroma_p95_reduction_ratio"]
+        .as_f64()
+        .unwrap();
+    let detail = &tone["grain_reduction"]["detail_retention"];
+    let direct_summary: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(direct_output_dir.join("summary.json")).unwrap(),
+    )
+    .unwrap();
+    let post_scale_preserved_ratio = direct_summary["colorspace"]["post_scale_preserved_ratio"]
+        .as_f64()
+        .unwrap();
+    let render_luminance_range = direct_summary["tone"]["render_luminance_range_p05_p95"]
+        .as_f64()
+        .unwrap();
+    let tone_output_evidence_confidence = direct_summary["tone"]["tone_output_evidence_confidence"]
+        .as_f64()
+        .unwrap();
+    let render_to_mapped_luminance_range_ratio = direct_summary["tone"]
+        ["render_to_mapped_luminance_range_ratio"]
+        .as_f64()
+        .unwrap();
+    let maximum_ratio = |value: &serde_json::Value| {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|ratio| ratio.as_f64().unwrap())
+            .fold(0.0, f64::max)
+    };
+    let high_clipping_ratio =
+        maximum_ratio(&direct_summary["tone"]["post_chroma_compression_clipped_high_ratio"]);
+    let low_clipping_ratio =
+        maximum_ratio(&direct_summary["tone"]["post_chroma_compression_clipped_low_ratio"]);
+    assert!(
+        applied_ratio > 0.0,
+        "grain pass must change supported pixels"
+    );
+    assert!(
+        structure_excluded_ratio > 0.0,
+        "grain pass must exactly exclude structured or unsupported pixels"
+    );
+    assert!(
+        flat_luma_reduction > 0.0,
+        "grain pass must reduce flat-area luma residuals: {flat_luma_reduction}"
+    );
+    assert!(
+        flat_chroma_reduction > 0.0,
+        "grain pass must reduce flat-area chroma residuals: {flat_chroma_reduction}"
+    );
+    assert_eq!(detail["review_required"], false);
+    assert_eq!(detail["decision_supported"], true);
+    assert!(detail["luminance_probe_count"].as_u64().unwrap() >= 64);
+    assert!(detail["chroma_probe_count"].as_u64().unwrap() >= 64);
+    assert!(detail["luminance_p10_retention"].as_f64().unwrap() >= 0.70);
+    assert!(detail["chroma_p10_retention"].as_f64().unwrap() >= 0.70);
+    assert!(post_scale_preserved_ratio > 0.0);
+    assert!(render_luminance_range > 0.0 && render_luminance_range < 1.0);
+    assert_eq!(
+        direct_summary["render"]["render_review_status"], "reviewable",
+        "trusted dynamic-range fixture diagnostics: {}",
+        direct_summary["colorspace"]
+    );
+    assert_eq!(direct_summary["render"]["render_reviewable"], true);
+    assert_eq!(
+        direct_summary["tone"]["tone_output_confidence_status"],
+        "supported_render_tonal_distribution"
+    );
+    assert_eq!(direct_summary["tone"]["tone_output_review_required"], false);
+    assert!(tone_output_evidence_confidence > 0.0);
+    assert!(render_to_mapped_luminance_range_ratio > 0.0);
+    assert!(high_clipping_ratio < 1.0);
+    assert!(low_clipping_ratio < 1.0);
+
+    let applied_floor = applied_ratio * 0.5;
+    let structure_excluded_floor = structure_excluded_ratio * 0.5;
+    let flat_luma_floor = flat_luma_reduction * 0.5;
+    let flat_chroma_floor = flat_chroma_reduction * 0.5;
+    let post_scale_preserved_floor = post_scale_preserved_ratio * 0.5;
+    let render_luminance_range_floor = render_luminance_range * 0.5;
+    let tone_output_evidence_confidence_floor = tone_output_evidence_confidence * 0.5;
+    let render_to_mapped_luminance_range_ratio_floor = render_to_mapped_luminance_range_ratio * 0.5;
+    let high_clipping_ceiling = (high_clipping_ratio + 1.0) * 0.5;
+    let low_clipping_ceiling = (low_clipping_ratio + 1.0) * 0.5;
+    let accepting_registry = serde_json::json!({
+        "coverage_requirements": {
+            "min_render_dynamic_range_contract_fixtures": 1,
+            "min_grain_reduction_enabled_fixtures": 1,
+            "min_grain_detail_contract_fixtures": 1,
+            "min_grain_reduction_effect_contract_fixtures": 1
+        },
+        "fixtures": {
+            "logan": {
+                "component1": input,
+                "component2": input,
+                "input_mode": "positive",
+                "bit_depth": 16,
+                "grain_reduction": "on",
+                "grain_strength": 0.4,
+                "grain_scale": 1.0,
+                "force_no_stitch": true,
+                "summary_baseline": baseline_path,
+                "calibration_profile": calibration_profile,
+                "film_stock": "Synthetic positive",
+                "scene_tags": ["fine-texture", "isoluminant-edge"],
+                "exposure_tags": ["normal-exposure"],
+                "calibration_case": "external-profile",
+                "expectations": {
+                    "grain_reduction_enabled": true,
+                    "grain_reduction_applied_ratio_min": applied_floor,
+                    "grain_reduction_structure_excluded_ratio_min": structure_excluded_floor,
+                    "grain_reduction_flat_luma_p95_reduction_ratio_min": flat_luma_floor,
+                    "grain_reduction_flat_chroma_p95_reduction_ratio_min": flat_chroma_floor,
+                    "grain_detail_review_required": false,
+                    "grain_detail_decision_supported": true,
+                    "grain_detail_luminance_probe_count_min": 64,
+                    "grain_detail_chroma_probe_count_min": 64,
+                    "grain_detail_luminance_p10_retention_min": 0.70,
+                    "grain_detail_chroma_p10_retention_min": 0.70,
+                    "post_scale_preserved_ratio_min": post_scale_preserved_floor,
+                    "render_luminance_range_p05_p95_min": render_luminance_range_floor,
+                    "render_review_status": "reviewable",
+                    "render_reviewable": true,
+                    "tone_output_confidence_status": "supported_render_tonal_distribution",
+                    "tone_output_review_required": false,
+                    "tone_output_evidence_confidence_min": tone_output_evidence_confidence_floor,
+                    "render_to_mapped_luminance_range_ratio_min": render_to_mapped_luminance_range_ratio_floor,
+                    "post_chroma_compression_clipped_high_ratio_max": high_clipping_ceiling,
+                    "post_chroma_compression_clipped_low_ratio_max": low_clipping_ceiling
+                }
+            }
+        }
+    });
+    std::fs::write(&registry_path, accepting_registry.to_string()).unwrap();
+
+    let suite_output_dir = tmp.path().join("suite-output");
+    let suite_json = tmp.path().join("fixture-suite.json");
+    let suite_md = tmp.path().join("fixture-suite.md");
+    let suite_run = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture-suite")
+        .arg("--fixture-suite-fixture")
+        .arg("logan")
+        .arg("--color-mode")
+        .arg("calibrated")
+        .arg("--quality-mode")
+        .arg("fast")
+        .arg("--strict")
+        .arg("--quiet")
+        .arg("--output-dir")
+        .arg(&suite_output_dir)
+        .arg("--summary-json")
+        .arg(&suite_json)
+        .arg("--summary-md")
+        .arg(&suite_md)
+        .output()
+        .expect("run strict grain-effect fixture suite");
+    assert!(
+        suite_run.status.success(),
+        "strict grain-effect fixture suite failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&suite_run.stderr),
+        String::from_utf8_lossy(&suite_run.stdout)
+    );
+
+    let suite: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&suite_json).unwrap()).unwrap();
+    assert_eq!(
+        suite["coverage"]["grain_reduction_enabled_fixture_count"],
+        1
+    );
+    assert_eq!(suite["coverage"]["grain_detail_contract_fixture_count"], 1);
+    assert_eq!(
+        suite["coverage"]["grain_reduction_effect_contract_fixture_count"],
+        1
+    );
+    assert_eq!(
+        suite["coverage"]["render_dynamic_range_contract_fixture_count"],
+        1
+    );
+    assert!(suite["fixtures"][0]["grain_reduction_applied_ratio"]
+        .as_f64()
+        .is_some_and(|value| value >= applied_floor));
+    assert!(
+        suite["fixtures"][0]["grain_reduction_structure_excluded_ratio"]
+            .as_f64()
+            .is_some_and(|value| value >= structure_excluded_floor)
+    );
+    assert!(
+        suite["fixtures"][0]["grain_reduction_flat_luma_p95_reduction_ratio"]
+            .as_f64()
+            .is_some_and(|value| value >= flat_luma_floor)
+    );
+    assert!(
+        suite["fixtures"][0]["grain_reduction_flat_chroma_p95_reduction_ratio"]
+            .as_f64()
+            .is_some_and(|value| value >= flat_chroma_floor)
+    );
+    assert!(suite["fixtures"][0]["post_scale_preserved_ratio"]
+        .as_f64()
+        .is_some_and(|value| value >= post_scale_preserved_floor));
+    assert!(suite["fixtures"][0]["render_luminance_range_p05_p95"]
+        .as_f64()
+        .is_some_and(|value| value >= render_luminance_range_floor));
+    assert_eq!(suite["fixtures"][0]["render_review_status"], "reviewable");
+    assert_eq!(suite["fixtures"][0]["render_reviewable"], true);
+    assert_eq!(
+        suite["fixtures"][0]["tone_output_confidence_status"],
+        "supported_render_tonal_distribution"
+    );
+    assert_eq!(suite["fixtures"][0]["tone_output_review_required"], false);
+    assert!(suite["fixtures"][0]["tone_output_evidence_confidence"]
+        .as_f64()
+        .is_some_and(|value| value >= tone_output_evidence_confidence_floor));
+    assert!(
+        suite["fixtures"][0]["render_to_mapped_luminance_range_ratio"]
+            .as_f64()
+            .is_some_and(|value| value >= render_to_mapped_luminance_range_ratio_floor)
+    );
+    assert!(
+        suite["fixtures"][0]["post_chroma_compression_clipped_high_ratio_max"]
+            .as_f64()
+            .is_some_and(|value| value <= high_clipping_ceiling)
+    );
+    assert!(
+        suite["fixtures"][0]["post_chroma_compression_clipped_low_ratio_max"]
+            .as_f64()
+            .is_some_and(|value| value <= low_clipping_ceiling)
+    );
+    assert!(suite["issues"].as_array().unwrap().is_empty());
+
+    let markdown = std::fs::read_to_string(&suite_md).unwrap();
+    assert!(markdown.contains("grain applied ratio min"));
+    assert!(markdown.contains("grain exact structure-excluded ratio min"));
+    assert!(markdown.contains("grain flat-luma reduction min"));
+    assert!(markdown.contains("grain flat-chroma reduction min"));
+    assert!(markdown.contains("luma p05-p95 min"));
+    assert!(markdown.contains("render status expected reviewable; actual reviewable"));
+    assert!(markdown.contains("tone status expected supported_render_tonal_distribution"));
+    assert!(markdown.contains("tone evidence min"));
+    assert!(markdown.contains("render:mapped min"));
+    assert!(markdown.contains("high clip max"));
+    assert!(markdown.contains("low clip max"));
+
+    let (expectation_field, issue_metric, measured_value) = [
+        (
+            "grain_reduction_applied_ratio_min",
+            "grain_reduction_applied_ratio",
+            applied_ratio,
+        ),
+        (
+            "grain_reduction_structure_excluded_ratio_min",
+            "grain_reduction_structure_excluded_ratio",
+            structure_excluded_ratio,
+        ),
+        (
+            "grain_reduction_flat_luma_p95_reduction_ratio_min",
+            "grain_reduction_flat_luma_p95_reduction_ratio",
+            flat_luma_reduction,
+        ),
+        (
+            "grain_reduction_flat_chroma_p95_reduction_ratio_min",
+            "grain_reduction_flat_chroma_p95_reduction_ratio",
+            flat_chroma_reduction,
+        ),
+    ]
+    .into_iter()
+    .find(|(_, _, value)| *value < 1.0 - 1e-9)
+    .expect("at least one measured grain-effect ratio must leave headroom for a rejecting floor");
+    let mut rejecting_registry = accepting_registry.clone();
+    rejecting_registry["fixtures"]["logan"]["expectations"][expectation_field] =
+        serde_json::json!((measured_value + 1.0) * 0.5);
+    std::fs::write(&registry_path, rejecting_registry.to_string()).unwrap();
+
+    let rejecting_json = tmp.path().join("fixture-suite-rejecting.json");
+    let rejecting_run = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture-suite")
+        .arg("--fixture-suite-fixture")
+        .arg("logan")
+        .arg("--color-mode")
+        .arg("calibrated")
+        .arg("--quality-mode")
+        .arg("fast")
+        .arg("--strict")
+        .arg("--quiet")
+        .arg("--output-dir")
+        .arg(tmp.path().join("suite-output-rejecting"))
+        .arg("--summary-json")
+        .arg(&rejecting_json)
+        .output()
+        .expect("run rejecting grain-effect fixture suite");
+    assert!(
+        !rejecting_run.status.success(),
+        "a grain-effect minimum above the measured result must fail"
+    );
+    let expected_issue = format!("fixture_suite:logan:{issue_metric}_below_expected");
+    assert!(
+        String::from_utf8_lossy(&rejecting_run.stderr).contains(&expected_issue),
+        "rejecting suite should report {expected_issue}: {}",
+        String::from_utf8_lossy(&rejecting_run.stderr)
+    );
+    let rejecting_summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&rejecting_json).unwrap()).unwrap();
+    assert!(rejecting_summary["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|issue| issue == &expected_issue));
+
+    let mut dynamic_range_rejecting_registry = accepting_registry;
+    dynamic_range_rejecting_registry["fixtures"]["logan"]["expectations"]
+        ["render_luminance_range_p05_p95_min"] =
+        serde_json::json!((render_luminance_range + 1.0) * 0.5);
+    dynamic_range_rejecting_registry["fixtures"]["logan"]["expectations"]
+        ["render_to_mapped_luminance_range_ratio_min"] =
+        serde_json::json!(render_to_mapped_luminance_range_ratio + 0.1);
+    dynamic_range_rejecting_registry["fixtures"]["logan"]["expectations"]["render_review_status"] =
+        serde_json::json!("review_required_tone_output");
+    dynamic_range_rejecting_registry["fixtures"]["logan"]["expectations"]["render_reviewable"] =
+        serde_json::json!(false);
+    dynamic_range_rejecting_registry["fixtures"]["logan"]["expectations"]
+        ["tone_output_confidence_status"] =
+        serde_json::json!("review_required_collapsed_render_luminance_range");
+    dynamic_range_rejecting_registry["fixtures"]["logan"]["expectations"]
+        ["tone_output_review_required"] = serde_json::json!(true);
+    std::fs::write(&registry_path, dynamic_range_rejecting_registry.to_string()).unwrap();
+    let dynamic_range_rejecting_json = tmp
+        .path()
+        .join("fixture-suite-dynamic-range-rejecting.json");
+    let dynamic_range_rejecting_run = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture-suite")
+        .arg("--fixture-suite-fixture")
+        .arg("logan")
+        .arg("--color-mode")
+        .arg("calibrated")
+        .arg("--quality-mode")
+        .arg("fast")
+        .arg("--strict")
+        .arg("--quiet")
+        .arg("--output-dir")
+        .arg(tmp.path().join("suite-output-dynamic-range-rejecting"))
+        .arg("--summary-json")
+        .arg(&dynamic_range_rejecting_json)
+        .output()
+        .expect("run rejecting dynamic-range fixture suite");
+    assert!(
+        !dynamic_range_rejecting_run.status.success(),
+        "a luminance-range minimum above the measured result must fail"
+    );
+    let dynamic_range_issue = "fixture_suite:logan:render_luminance_range_p05_p95_below_expected";
+    let relative_range_issue =
+        "fixture_suite:logan:render_to_mapped_luminance_range_ratio_below_expected";
+    let decision_issues = [
+        "fixture_suite:logan:render_review_status_mismatch",
+        "fixture_suite:logan:render_reviewable_mismatch",
+        "fixture_suite:logan:tone_output_confidence_status_mismatch",
+        "fixture_suite:logan:tone_output_review_required_mismatch",
+    ];
+    assert!(
+        String::from_utf8_lossy(&dynamic_range_rejecting_run.stderr).contains(dynamic_range_issue),
+        "rejecting suite should report {dynamic_range_issue}: {}",
+        String::from_utf8_lossy(&dynamic_range_rejecting_run.stderr)
+    );
+    let dynamic_range_rejecting_summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&dynamic_range_rejecting_json).unwrap())
+            .unwrap();
+    assert!(dynamic_range_rejecting_summary["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|issue| issue == dynamic_range_issue));
+    assert!(dynamic_range_rejecting_summary["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|issue| issue == relative_range_issue));
+    for issue in decision_issues {
+        assert!(
+            dynamic_range_rejecting_summary["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|actual| actual == issue),
+            "missing dynamic-range decision issue {issue}: {}",
+            dynamic_range_rejecting_summary["issues"]
+        );
+    }
+}
+
+#[test]
+fn test_validate_cli_fixture_suite_proves_three_scan_stitch_normalization_contract() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let input_dir = tmp.path().join("inputs");
+    std::fs::create_dir_all(&input_dir).unwrap();
+    let panorama = textured_positive_panorama(180, 1_000);
+    let left = panorama.slice(s![.., 0..420, ..]).to_owned();
+    let middle = panorama.slice(s![.., 290..710, ..]).to_owned();
+    let right = panorama.slice(s![.., 580..1_000, ..]).to_owned();
+    let right_path = input_dir.join("right.tiff");
+    let left_path = input_dir.join("left.tiff");
+    let middle_path = input_dir.join("middle.tiff");
+    scanstitch::tiff_io::save_tiff_u16(&right, &right_path).unwrap();
+    scanstitch::tiff_io::save_tiff_u16(&left, &left_path).unwrap();
+    scanstitch::tiff_io::save_tiff_u16(&middle, &middle_path).unwrap();
+
+    let registry_path = tmp.path().join("fixtures.json");
+    let baseline_path = tmp.path().join("stitch-summary-baseline.json");
+    let direct_output_dir = tmp.path().join("direct-output");
+    std::fs::write(
+        &registry_path,
+        serde_json::json!({
+            "fixtures": {
+                "logan": {
+                    "component1": right_path,
+                    "component2": left_path,
+                    "additional_components": [{"path": middle_path}],
+                    "output_dir": direct_output_dir,
+                    "input_mode": "positive",
+                    "bit_depth": 14,
+                    "force_stitch": true,
+                    "film_stock": "Synthetic positive",
+                    "scene_tags": ["panorama", "overlap-detail"],
+                    "exposure_tags": ["normal-exposure"],
+                    "calibration_case": "uncalibrated-image-derived"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let direct = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture")
+        .arg("logan")
+        .arg("--quality-mode")
+        .arg("fast")
+        .arg("--quiet")
+        .arg("--write-summary-baseline")
+        .arg(&baseline_path)
+        .output()
+        .expect("run direct three-scan fixture baseline");
+    assert!(
+        direct.status.success(),
+        "direct three-scan fixture failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&direct.stderr),
+        String::from_utf8_lossy(&direct.stdout)
+    );
+
+    let direct_summary: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(direct_output_dir.join("summary.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(direct_summary["stitch"]["decision"], "accepted_sequence");
+    assert_eq!(
+        direct_summary["stitch"]["inferred_order"],
+        serde_json::json!([2, 3, 1])
+    );
+    let exposure = &direct_summary["stitch"]["seam_exposure_correction"];
+    let exposure_model = exposure["model"].as_str().unwrap();
+    assert!(matches!(
+        exposure_model,
+        "sequence_mixed"
+            | "identity"
+            | "gain_only_scalar"
+            | "gain_only_rgb"
+            | "gain_offset_rgb"
+            | "gain_spatial_y_rgb"
+            | "gain_offset_spatial_y_rgb"
+            | "gain_spatial_xy_rgb"
+            | "gain_offset_spatial_xy_rgb"
+            | "gain_spatial_quadratic_xy_rgb"
+            | "gain_offset_spatial_quadratic_xy_rgb"
+    ));
+    let expected_held_out_validation = exposure_model != "identity";
+    assert_eq!(
+        exposure["held_out_validation_passed"].as_bool(),
+        Some(expected_held_out_validation)
+    );
+    let offset_abs_max = exposure["offset_rgb_normalized"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_f64().unwrap().abs())
+        .fold(0.0, f64::max);
+    assert!(offset_abs_max <= 0.05);
+
+    let blend = &direct_summary["stitch"]["seam_blend"];
+    assert_eq!(blend["mode"], "seam_aware_multiband");
+    assert_eq!(blend["applied"], true);
+    assert_eq!(blend["review_required"], false);
+    let detail = &blend["detail_consistency"];
+    assert_eq!(detail["review_required"], false);
+    let supported_scale_count = detail["minimum_supported_scale_count"].as_u64().unwrap() as usize;
+    let maximum_energy_ratio = detail["maximum_symmetric_energy_ratio"].as_f64().unwrap();
+    let gradient_ratio = blend["output_to_source_seam_gradient_ratio"]
+        .as_f64()
+        .unwrap();
+    let overlap_p95 = blend["overlap_p95_abs_difference"].as_f64().unwrap();
+    assert!(supported_scale_count >= 2);
+    assert!((1.0..=2.0).contains(&maximum_energy_ratio));
+    assert!((0.0..=1.05).contains(&gradient_ratio));
+    assert!((0.0..1.0).contains(&overlap_p95));
+
+    let accepting_registry = serde_json::json!({
+        "coverage_requirements": {
+            "min_n_component_fixtures": 1,
+            "min_stitch_normalization_contract_fixtures": 1
+        },
+        "fixtures": {
+            "logan": {
+                "component1": right_path,
+                "component2": left_path,
+                "additional_components": [{"path": middle_path}],
+                "input_mode": "positive",
+                "bit_depth": 14,
+                "force_stitch": true,
+                "summary_baseline": baseline_path,
+                "film_stock": "Synthetic positive",
+                "scene_tags": ["panorama", "overlap-detail"],
+                "exposure_tags": ["normal-exposure"],
+                "calibration_case": "uncalibrated-image-derived",
+                "expectations": {
+                    "stitch_decision": "accepted_sequence",
+                    "inferred_component_order": [2, 3, 1],
+                    "seam_exposure_model": exposure_model,
+                    "seam_exposure_held_out_validation_passed": expected_held_out_validation,
+                    "seam_exposure_offset_normalized_abs_max": 0.05,
+                    "seam_blend_required": true,
+                    "seam_blend_mode": "seam_aware_multiband",
+                    "seam_blend_review_required": false,
+                    "seam_detail_review_required": false,
+                    "seam_detail_supported_scale_count_min": 2,
+                    "seam_detail_max_symmetric_energy_ratio_max": 2.0,
+                    "seam_gradient_ratio_max": 1.05,
+                    "seam_overlap_p95_abs_difference_max": 0.99,
+                    "render_review_status": "review_required_color",
+                    "render_reviewable": false
+                }
+            }
+        }
+    });
+    std::fs::write(&registry_path, accepting_registry.to_string()).unwrap();
+
+    let suite_json = tmp.path().join("fixture-suite.json");
+    let suite_run = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture-suite")
+        .arg("--fixture-suite-fixture")
+        .arg("logan")
+        .arg("--quality-mode")
+        .arg("fast")
+        .arg("--strict")
+        .arg("--quiet")
+        .arg("--output-dir")
+        .arg(tmp.path().join("suite-output"))
+        .arg("--summary-json")
+        .arg(&suite_json)
+        .output()
+        .expect("run strict three-scan stitch-normalization fixture suite");
+    assert!(
+        suite_run.status.success(),
+        "strict three-scan fixture suite failed: stderr={} stdout={}",
+        String::from_utf8_lossy(&suite_run.stderr),
+        String::from_utf8_lossy(&suite_run.stdout)
+    );
+    let suite: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&suite_json).unwrap()).unwrap();
+    assert_eq!(
+        suite["coverage"]["n_component_validation_ready_fixture_count"],
+        1
+    );
+    assert_eq!(
+        suite["coverage"]["stitch_normalization_contract_fixture_count"],
+        1
+    );
+    assert_eq!(
+        suite["coverage"]["fixtures"][0]["stitch_normalization_contract_complete"],
+        true
+    );
+    assert_eq!(suite["fixtures"][0]["stitch_decision"], "accepted_sequence");
+    assert_eq!(
+        suite["fixtures"][0]["inferred_component_order"],
+        serde_json::json!([2, 3, 1])
+    );
+    assert_eq!(suite["fixtures"][0]["seam_exposure_model"], exposure_model);
+    assert_eq!(
+        suite["fixtures"][0]["seam_blend_mode"],
+        "seam_aware_multiband"
+    );
+    assert_eq!(suite["fixtures"][0]["seam_blend_review_required"], false);
+    assert_eq!(suite["fixtures"][0]["seam_detail_review_required"], false);
+    assert!(suite["issues"].as_array().unwrap().is_empty());
+
+    let mut rejecting_registry = accepting_registry;
+    rejecting_registry["fixtures"]["logan"]["expectations"]
+        ["seam_detail_supported_scale_count_min"] = serde_json::json!(supported_scale_count + 1);
+    std::fs::write(&registry_path, rejecting_registry.to_string()).unwrap();
+    let rejecting_json = tmp.path().join("fixture-suite-rejecting.json");
+    let rejecting_run = Command::new(env!("CARGO_BIN_EXE_scanstitch-validate"))
+        .arg("--fixture-registry")
+        .arg(&registry_path)
+        .arg("--fixture-suite")
+        .arg("--fixture-suite-fixture")
+        .arg("logan")
+        .arg("--quality-mode")
+        .arg("fast")
+        .arg("--strict")
+        .arg("--quiet")
+        .arg("--output-dir")
+        .arg(tmp.path().join("suite-output-rejecting"))
+        .arg("--summary-json")
+        .arg(&rejecting_json)
+        .output()
+        .expect("run rejecting three-scan stitch-normalization fixture suite");
+    assert!(
+        !rejecting_run.status.success(),
+        "a detail-scale floor above the measured N-scan result must fail"
+    );
+    let expected_issue = "fixture_suite:logan:seam_detail_supported_scale_count_below_expected";
+    assert!(
+        String::from_utf8_lossy(&rejecting_run.stderr).contains(expected_issue),
+        "rejecting suite should report {expected_issue}: {}",
+        String::from_utf8_lossy(&rejecting_run.stderr)
+    );
+    let rejecting_summary: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&rejecting_json).unwrap()).unwrap();
+    assert!(rejecting_summary["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|issue| issue == expected_issue));
 }
 
 #[test]
@@ -6402,6 +10902,10 @@ fn test_validate_cli_fixture_suite_fails_unmet_coverage_requirements() {
                         "spatial_neutral_delta_p95_max": 0.0,
                         "candidate_risk": "not-the-candidate-risk",
                         "tone_color_trust_state": "not-the-tone-trust-state",
+                        "neutral_safety_rescue_applied": true,
+                        "neutral_safety_rescue_preserved_ratio_gain_min": 1.0,
+                        "neutral_safety_rescue_midtone_saturation_p95_reduction_min": 1.0,
+                        "neutral_safety_rescue_reason_contains": "missing-neutral-rescue-reason",
                         "reference_patch_evaluation_required": true,
                         "reference_patch_count_min": 4,
                         "reference_patch_hue_family_regression_count_max": 0,
@@ -6578,6 +11082,21 @@ fn test_validate_cli_fixture_suite_fails_unmet_coverage_requirements() {
         .unwrap()
         .iter()
         .any(|issue| issue == "fixture_suite:logan:tone_color_trust_state_mismatch"));
+    assert!(suite["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|issue| { issue == "fixture_suite:logan:neutral_safety_rescue_applied_mismatch" }));
+    assert!(suite["issues"].as_array().unwrap().iter().any(|issue| {
+        issue == "fixture_suite:logan:neutral_safety_rescue_preserved_ratio_gain_below_expected"
+    }));
+    assert!(suite["issues"].as_array().unwrap().iter().any(|issue| {
+        issue
+            == "fixture_suite:logan:neutral_safety_rescue_midtone_saturation_p95_reduction_below_expected"
+    }));
+    assert!(suite["issues"].as_array().unwrap().iter().any(|issue| {
+        issue == "fixture_suite:logan:neutral_safety_rescue_reason_missing_expected_text"
+    }));
     assert!(suite["issues"].as_array().unwrap().iter().any(|issue| {
         issue == "fixture_suite:logan:highlight_chroma_compressed_ratio_below_expected"
     }));
@@ -7065,6 +11584,30 @@ fn test_render_comparison_reports_key_deltas() {
         .find(|phase| phase.name == "colorspace_mapping")
         .unwrap()
         .metrics["render_input_source"] = serde_json::json!("fastica_separated_transmittance");
+    let tone = current_report
+        .phases
+        .iter_mut()
+        .find(|phase| phase.name == "tone_mapping")
+        .unwrap();
+    tone.metrics["tone_output_confidence_status"] =
+        serde_json::json!("review_required_collapsed_render_luminance_range");
+    tone.metrics["tone_output_review_required"] = serde_json::json!(true);
+    tone.metrics["tone_output_evidence_confidence"] = serde_json::json!(0.0);
+    tone.metrics["render_luminance_range_p05_p95"] = serde_json::json!(0.01);
+    tone.metrics["render_to_mapped_luminance_range_ratio"] = serde_json::json!(0.01);
+    tone.metrics["maximum_post_tone_high_clip_ratio"] = serde_json::json!(0.60);
+    tone.metrics["maximum_post_tone_low_clip_ratio"] = serde_json::json!(0.55);
+    let save = current_report
+        .phases
+        .iter_mut()
+        .find(|phase| phase.name == "save")
+        .unwrap();
+    save.metrics["render_review_status"] = serde_json::json!("review_required_tone_output");
+    save.metrics["render_reviewable"] = serde_json::json!(false);
+    save.metrics["tone_output_review_required"] = serde_json::json!(true);
+    save.metrics["tone_output_confidence_status"] =
+        serde_json::json!("review_required_collapsed_render_luminance_range");
+    save.metrics["tone_output_evidence_confidence"] = serde_json::json!(0.0);
 
     let baseline = scanstitch::validation::summarize_report("baseline", &baseline_report);
     let current = scanstitch::validation::summarize_report("current", &current_report);
@@ -7078,13 +11621,30 @@ fn test_render_comparison_reports_key_deltas() {
     assert_eq!(comparison.output_dimensions_match, Some(true));
     assert_eq!(comparison.status, "review_required");
     assert!(comparison.render_input_source_changed);
-    assert_eq!(comparison.issues, vec!["render_input_source_changed"]);
+    for issue in [
+        "render_input_source_changed",
+        "render_review_status_changed",
+        "render_reviewable_changed",
+        "tone_output_confidence_status_changed",
+        "tone_output_review_required_changed",
+        "tone_output_evidence_confidence_regressed",
+        "tone_output_render_luminance_range_regressed",
+        "tone_output_range_retention_regressed",
+        "tone_output_high_clipping_regressed",
+        "tone_output_low_clipping_regressed",
+    ] {
+        assert!(comparison.issues.iter().any(|actual| actual == issue));
+    }
     assert_eq!(comparison.luma_residual_p95_ratio, Some(1.0));
 }
 
 #[test]
 fn test_render_comparison_marks_identical_reports_comparable() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let output_path = tmp.path().join("output.tiff");
+    scanstitch::tiff_io::save_tiff_f64_linear_prophoto(&small_rgb_image(), &output_path).unwrap();
     let mut report = fixture_report();
+    set_report_output_path(&mut report, &output_path);
     clear_stale_artifacts(&mut report);
     let baseline = scanstitch::validation::summarize_report("baseline", &report);
     let current = scanstitch::validation::summarize_report("current", &report);
@@ -7095,7 +11655,11 @@ fn test_render_comparison_marks_identical_reports_comparable() {
         &current.render,
     );
 
-    assert_eq!(comparison.status, "comparable");
+    assert_eq!(
+        comparison.status, "comparable",
+        "unexpected issues: {:?}",
+        comparison.issues
+    );
     assert!(comparison.issues.is_empty());
 }
 
@@ -7269,6 +11833,48 @@ fn write_validation_fixture_library_with_reference_patches(root: &Path) -> std::
     library_dir
 }
 
+fn write_validation_fixture_library_with_measured_negative_response(
+    root: &Path,
+) -> std::path::PathBuf {
+    let library_dir = root.join("calibration");
+    std::fs::create_dir_all(library_dir.join("scanners")).unwrap();
+    std::fs::create_dir_all(library_dir.join("rolls")).unwrap();
+    std::fs::write(
+        library_dir.join("scanners/scanner.json"),
+        validation_fixture_scanner_profile_json(),
+    )
+    .unwrap();
+    let mut roll: serde_json::Value =
+        serde_json::from_str(&validation_fixture_roll_profile_json()).unwrap();
+    roll["negative_response"] = serde_json::json!({
+        "model_id": "synthetic-validation-response-v1",
+        "scanner_density_to_layer_density": [
+            [1.0, -0.08, 0.01],
+            [-0.04, 1.0, -0.05],
+            [0.01, -0.04, 1.0]
+        ],
+        "characteristic_curves": {
+            "red": [[-2.0, -2.0], [0.0, 0.0], [0.25, 0.18], [0.70, 0.78], [1.30, 1.55], [5.0, 5.0]],
+            "green": [[-2.0, -2.0], [0.0, 0.0], [0.25, 0.18], [0.70, 0.78], [1.30, 1.55], [5.0, 5.0]],
+            "blue": [[-2.0, -2.0], [0.0, 0.0], [0.25, 0.18], [0.70, 0.78], [1.30, 1.55], [5.0, 5.0]]
+        },
+        "white_anchor_percentile": 0.995,
+        "confidence": 0.94,
+        "validation": {
+            "held_out_patch_count": 24,
+            "delta_e00_rms": 1.8,
+            "delta_e00_max": 4.9,
+            "unit_slope_delta_e00_rms": 8.2
+        }
+    });
+    std::fs::write(
+        library_dir.join("rolls/roll.json"),
+        serde_json::to_string_pretty(&roll).unwrap(),
+    )
+    .unwrap();
+    library_dir
+}
+
 fn write_fixture_suite_tracked_baseline(
     baseline_path: &Path,
     component1: &Path,
@@ -7277,8 +11883,7 @@ fn write_fixture_suite_tracked_baseline(
     library_dir: &Path,
 ) {
     let pipeline_cli = scanstitch::cli::Cli {
-        component1: component1.to_path_buf(),
-        component2: component2.to_path_buf(),
+        inputs: vec![component1.to_path_buf(), component2.to_path_buf()],
         output_dir: output_dir.to_path_buf(),
         calibration_profile: None,
         calibration_library: Some(library_dir.to_path_buf()),
@@ -7294,6 +11899,9 @@ fn write_fixture_suite_tracked_baseline(
         input_mode: scanstitch::cli::InputMode::Negative,
         render_intent: scanstitch::cli::RenderIntent::ModernClean,
         quality_mode: scanstitch::cli::QualityMode::Perfect,
+        white_balance: scanstitch::cli::WhiteBalanceArgs::default(),
+        geometry: scanstitch::cli::GeometryArgs::default(),
+        grain: scanstitch::cli::GrainReductionArgs::default(),
         write_master: false,
         review_sidecar: None,
         write_review_sidecar: None,
@@ -7305,6 +11913,7 @@ fn write_fixture_suite_tracked_baseline(
         ica_tol: 0.0001,
         bit_depth: 14,
         use_opencv: false,
+        require_reviewable: false,
     };
     let report = scanstitch::pipeline::run(&pipeline_cli)
         .expect("fixture suite baseline pipeline should run");
@@ -7393,7 +12002,9 @@ fn fixture_summary_baseline() -> scanstitch::validation::TrackedValidationBaseli
             "raw_base_proxy_confidence": 0.12,
             "raw_base_support_fraction": 0.014,
             "render_input_source": "direct_density_transmittance",
-            "colorspace_mapping_strategy": "neutral_balance_weak_anchor_fallback"
+            "colorspace_mapping_strategy": "neutral_balance_weak_anchor_fallback",
+            "render_review_status": "reviewable",
+            "render_reviewable": true
         },
         "colorspace": {
             "calibration_status": "applied",
@@ -7410,7 +12021,8 @@ fn fixture_summary_baseline() -> scanstitch::validation::TrackedValidationBaseli
             "calibration_rejection_details": [],
             "selected_candidate": "neutral_balance_fallback",
             "selected_candidate_rank": 1,
-            "calibration_acceptance_status": "accepted",
+            "calibration_acceptance_status": "rejected_reference_fit",
+            "calibration_color_mapping_applied": false,
             "calibration_acceptance_preferred_candidate": "calibrated_direct_profile",
             "calibration_acceptance_beats_image_derived": true,
             "candidate_risk": "review_reference_fit",
@@ -7471,7 +12083,14 @@ fn fixture_summary_baseline() -> scanstitch::validation::TrackedValidationBaseli
         "tone": {
             "highlight_chroma_compressed_ratio": 0.004,
             "highlight_neutral_chroma_compressed_ratio": 0.003,
-            "shadow_chroma_compressed_ratio": 0.002
+            "shadow_chroma_compressed_ratio": 0.002,
+            "tone_output_confidence_status": "supported_render_tonal_distribution",
+            "tone_output_review_required": false,
+            "tone_output_evidence_confidence": 1.0,
+            "render_luminance_range_p05_p95": 0.90,
+            "render_to_mapped_luminance_range_ratio": 1.0588235294117647,
+            "maximum_post_tone_high_clip_ratio": 0.002,
+            "maximum_post_tone_low_clip_ratio": 0.001
         },
         "grain": {
             "luma_residual_p95": 0.006,
@@ -7520,6 +12139,7 @@ fn test_summary_baseline_comparison_marks_matching_tracked_fields_comparable() {
     assert!(!comparison.selected_candidate_changed);
     assert!(!comparison.selected_candidate_rank_changed);
     assert!(!comparison.calibration_acceptance_status_changed);
+    assert!(!comparison.calibration_color_mapping_applied_changed);
     assert_eq!(
         comparison.colorspace_technical_safety_score_delta,
         Some(0.0)
@@ -7576,10 +12196,72 @@ fn test_summary_baseline_comparison_marks_matching_tracked_fields_comparable() {
 }
 
 #[test]
-fn test_summary_baseline_comparison_flags_tracked_color_tone_and_grain_drift() {
+fn test_summary_baseline_comparison_flags_seam_model_and_spatial_acceptance_drift() {
     let mut report = fixture_report();
     let _debug_artifacts = write_report_color_debug_artifacts(&mut report);
     let summary = scanstitch::validation::summarize_report("logan", &report);
+    let mut baseline = scanstitch::validation::tracked_baseline_from_summary(&summary);
+    baseline.stitch.seam_exposure_model = Some("identity".to_string());
+    baseline.stitch.seam_exposure_spatial_2d_gain_accepted = Some(true);
+    baseline
+        .stitch
+        .seam_exposure_spatial_2d_gain_offset_accepted = Some(true);
+    baseline
+        .stitch
+        .seam_exposure_spatial_quadratic_gain_accepted = Some(true);
+    baseline
+        .stitch
+        .seam_exposure_spatial_quadratic_gain_offset_accepted = Some(true);
+    baseline.stitch.seam_blend_review_required = Some(true);
+    baseline.stitch.seam_detail_review_required = Some(true);
+    baseline.stitch.seam_detail_max_symmetric_energy_ratio = Some(1.50);
+
+    let comparison =
+        scanstitch::validation::compare_summary_baseline("baseline.json", &baseline, &summary);
+
+    assert_eq!(comparison.status, "review_required");
+    assert!(comparison.seam_exposure_model_changed);
+    assert!(comparison.seam_exposure_spatial_2d_gain_acceptance_changed);
+    assert!(comparison.seam_exposure_spatial_2d_gain_offset_acceptance_changed);
+    assert!(comparison.seam_exposure_spatial_quadratic_gain_acceptance_changed);
+    assert!(comparison.seam_exposure_spatial_quadratic_gain_offset_acceptance_changed);
+    assert!(comparison.seam_blend_review_required_changed);
+    assert!(comparison.seam_detail_review_required_changed);
+    assert_eq!(
+        comparison.seam_detail_max_symmetric_energy_ratio_delta,
+        Some(1.08 - 1.50)
+    );
+    assert!(comparison
+        .issues
+        .contains(&"seam_exposure_model_changed".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"seam_exposure_spatial_2d_gain_acceptance_changed".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"seam_exposure_spatial_2d_gain_offset_acceptance_changed".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"seam_exposure_spatial_quadratic_gain_acceptance_changed".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"seam_exposure_spatial_quadratic_gain_offset_acceptance_changed".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"seam_blend_review_required_changed".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"seam_detail_review_required_changed".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"seam_detail_energy_ratio_changed_materially".to_string()));
+}
+
+#[test]
+fn test_summary_baseline_comparison_flags_tracked_color_tone_and_grain_drift() {
+    let mut report = fixture_report();
+    let _debug_artifacts = write_report_color_debug_artifacts(&mut report);
+    let mut summary = scanstitch::validation::summarize_report("logan", &report);
     let mut baseline = fixture_summary_baseline();
     baseline.render.raw_base_proxy_confidence = Some(0.20);
     baseline.render.raw_base_support_fraction = Some(0.05);
@@ -7600,6 +12282,7 @@ fn test_summary_baseline_comparison_flags_tracked_color_tone_and_grain_drift() {
     baseline.colorspace.calibration_rejection_details =
         vec!["old rejected calibration detail".to_string()];
     baseline.colorspace.calibration_acceptance_status = Some("rejected_quality".to_string());
+    baseline.colorspace.calibration_color_mapping_applied = Some(true);
     baseline.colorspace.selected_candidate_rank = Some(2);
     baseline.colorspace.selected_quality_score = Some(0.90);
     baseline.colorspace.technical_safety_score = Some(-0.50);
@@ -7648,7 +12331,53 @@ fn test_summary_baseline_comparison_flags_tracked_color_tone_and_grain_drift() {
         "image_derived_matrix|kind=image_derived|strategy=image_derived_matrix|status=selected|rank=1|selected=true|eligible=true|rejected=false".to_string(),
     ];
     baseline.tone.highlight_chroma_compressed_ratio = Some(0.050);
+    baseline
+        .tone
+        .adaptive_vibrance_skin_memory_protection_enabled = Some(false);
+    baseline.tone.adaptive_vibrance_skin_memory_protection_space =
+        Some("legacy_rgb_rule".to_string());
+    baseline.tone.adaptive_vibrance_skin_memory_protected_ratio = Some(0.90);
+    baseline.tone.adaptive_vibrance_skin_memory_mean_protection = Some(0.10);
+    baseline
+        .tone
+        .adaptive_vibrance_preferred_memory_color_guard_enabled = Some(false);
+    baseline
+        .tone
+        .adaptive_vibrance_preferred_memory_color_guard_space = Some("legacy_rgb_rule".to_string());
+    baseline
+        .tone
+        .adaptive_vibrance_preferred_memory_color_guard_reference =
+        Some("legacy_reference".to_string());
+    baseline
+        .tone
+        .adaptive_vibrance_preferred_memory_color_matched_ratio = Some(0.90);
+    baseline
+        .tone
+        .adaptive_vibrance_preferred_memory_color_limited_ratio = Some(0.70);
+    baseline
+        .tone
+        .adaptive_vibrance_preferred_memory_color_mean_scale_reduction = Some(0.20);
+    baseline.tone.preferred_skin_rendering_enabled = Some(false);
+    baseline.tone.preferred_skin_rendering_space = Some("legacy_rgb_rule".to_string());
+    baseline.tone.preferred_skin_rendering_preference_reference =
+        Some("legacy_reference".to_string());
+    baseline.tone.preferred_skin_rendering_adjusted_ratio = Some(0.90);
+    baseline.tone.preferred_skin_rendering_mean_delta_e_ab = Some(2.5);
     baseline.grain.luma_residual_p95 = Some(0.003);
+    baseline.grain.detail_review_required = Some(true);
+    baseline.grain.detail_decision_supported = Some(false);
+    baseline.grain.luminance_p10_retention = Some(1.20);
+    baseline.grain.chroma_p10_retention = Some(1.20);
+    summary.render.render_review_status = Some("review_required_tone_output".to_string());
+    summary.render.render_reviewable = Some(false);
+    summary.tone.tone_output_confidence_status =
+        Some("review_required_collapsed_render_luminance_range".to_string());
+    summary.tone.tone_output_review_required = Some(true);
+    summary.tone.tone_output_evidence_confidence = Some(0.0);
+    summary.tone.render_luminance_range_p05_p95 = Some(0.01);
+    summary.tone.render_to_mapped_luminance_range_ratio = Some(0.01);
+    summary.tone.maximum_post_tone_high_clip_ratio = Some(0.60);
+    summary.tone.maximum_post_tone_low_clip_ratio = Some(0.55);
 
     let comparison =
         scanstitch::validation::compare_summary_baseline("baseline.json", &baseline, &summary);
@@ -7704,6 +12433,9 @@ fn test_summary_baseline_comparison_flags_tracked_color_tone_and_grain_drift() {
         .contains(&"calibration_acceptance_status_changed".to_string()));
     assert!(comparison
         .issues
+        .contains(&"calibration_color_mapping_applied_changed".to_string()));
+    assert!(comparison
+        .issues
         .contains(&"colorspace_selected_candidate_rank_changed".to_string()));
     assert!(comparison
         .issues
@@ -7729,6 +12461,52 @@ fn test_summary_baseline_comparison_flags_tracked_color_tone_and_grain_drift() {
     assert!(comparison
         .issues
         .contains(&"colorspace_spatial_consistency_penalty_regressed".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"adaptive_vibrance_skin_memory_protection_enabled_changed".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"adaptive_vibrance_skin_memory_protection_space_changed".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"adaptive_vibrance_skin_memory_protected_ratio_changed_materially".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"adaptive_vibrance_skin_memory_mean_protection_changed_materially".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"adaptive_vibrance_preferred_memory_color_guard_enabled_changed".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"adaptive_vibrance_preferred_memory_color_guard_space_changed".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"adaptive_vibrance_preferred_memory_color_guard_reference_changed".to_string()));
+    assert!(comparison.issues.contains(
+        &"adaptive_vibrance_preferred_memory_color_matched_ratio_changed_materially".to_string()
+    ));
+    assert!(comparison.issues.contains(
+        &"adaptive_vibrance_preferred_memory_color_limited_ratio_changed_materially".to_string()
+    ));
+    assert!(comparison.issues.contains(
+        &"adaptive_vibrance_preferred_memory_color_mean_scale_reduction_changed_materially"
+            .to_string()
+    ));
+    assert!(comparison
+        .issues
+        .contains(&"preferred_skin_rendering_enabled_changed".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"preferred_skin_rendering_space_changed".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"preferred_skin_rendering_preference_reference_changed".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"preferred_skin_rendering_adjusted_ratio_changed_materially".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"preferred_skin_rendering_mean_delta_e_ab_changed_materially".to_string()));
     assert!(comparison
         .issues
         .contains(&"colorspace_reference_delta_e_regressed".to_string()));
@@ -7804,9 +12582,34 @@ fn test_summary_baseline_comparison_flags_tracked_color_tone_and_grain_drift() {
     assert!(comparison
         .issues
         .contains(&"highlight_chroma_compression_changed_materially".to_string()));
+    for issue in [
+        "render_review_status_changed",
+        "render_reviewable_changed",
+        "tone_output_confidence_status_changed",
+        "tone_output_review_required_changed",
+        "tone_output_evidence_confidence_regressed",
+        "tone_output_render_luminance_range_regressed",
+        "tone_output_range_retention_regressed",
+        "tone_output_high_clipping_regressed",
+        "tone_output_low_clipping_regressed",
+    ] {
+        assert!(comparison.issues.iter().any(|actual| actual == issue));
+    }
     assert!(comparison
         .issues
         .contains(&"luma_residual_p95_changed_materially".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"grain_detail_review_required_changed".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"grain_detail_decision_supported_changed".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"grain_detail_luminance_retention_regressed".to_string()));
+    assert!(comparison
+        .issues
+        .contains(&"grain_detail_chroma_retention_regressed".to_string()));
 }
 
 #[test]
@@ -7923,12 +12726,20 @@ fn test_tracked_logan_baseline_has_required_regression_fields() {
         baseline["colorspace"]["calibration_acceptance_status"],
         "not_applicable"
     );
+    assert_eq!(
+        baseline["colorspace"]["calibration_color_mapping_applied"],
+        false
+    );
     assert!(
         baseline["grain"]["luma_residual_p95"]
             .as_f64()
             .expect("luma residual baseline")
             > 0.0
     );
+    assert_eq!(baseline["grain"]["detail_review_required"], false);
+    assert_eq!(baseline["grain"]["detail_decision_supported"], true);
+    assert_eq!(baseline["grain"]["luminance_p10_retention"], 1.0);
+    assert_eq!(baseline["grain"]["chroma_p10_retention"], 1.0);
     assert!(
         baseline["tolerances"]["grain_ratio_abs"]
             .as_f64()
@@ -7969,9 +12780,32 @@ fn test_report_schema_examples_deserialize() {
 
     let schema: serde_json::Value =
         serde_json::from_str(include_str!("../docs/report-schema.schema.json")).unwrap();
+    let current: PipelineReport = serde_json::from_str(include_str!(
+        "../docs/report-examples/current-report-minimal.json"
+    ))
+    .unwrap();
+    let current_metadata = current.metadata.as_ref().unwrap();
+    assert_eq!(current_metadata.report_schema_version, 4);
+    assert_eq!(
+        current_metadata.binary_identity_status.as_deref(),
+        Some("verified_sha256")
+    );
+    assert!(current_metadata.binary_sha256.is_some());
+    let legacy: PipelineReport = serde_json::from_str(include_str!(
+        "../docs/report-examples/old-report-sparse.json"
+    ))
+    .unwrap();
+    assert!(legacy
+        .metadata
+        .as_ref()
+        .is_none_or(|metadata| metadata.binary_sha256.is_none()));
     let report_schema_doc = include_str!("../docs/report-schema.md");
     assert!(report_schema_doc.contains("CIEDE2000"));
     assert_eq!(schema["required"], serde_json::json!(["phases"]));
+    assert_eq!(
+        schema["properties"]["metadata"]["properties"]["binary_sha256"]["pattern"],
+        "^[A-Fa-f0-9]{64}$"
+    );
     assert_eq!(
         schema["properties"]["phases"]["items"]["allOf"][0]["if"]["properties"]["name"]["const"],
         "colorspace_mapping"
@@ -7981,9 +12815,308 @@ fn test_report_schema_examples_deserialize() {
             ["$ref"],
         "#/$defs/colorspaceMappingMetrics"
     );
+    assert_eq!(
+        schema["properties"]["phases"]["items"]["allOf"][3]["if"]["properties"]["name"]["const"],
+        "load"
+    );
+    assert_eq!(
+        schema["properties"]["phases"]["items"]["allOf"][3]["then"]["properties"]["metrics"]
+            ["$ref"],
+        "#/$defs/loadMetrics"
+    );
+    assert_eq!(
+        schema["properties"]["phases"]["items"]["allOf"][4]["if"]["properties"]["name"]["const"],
+        "fastica"
+    );
+    assert_eq!(
+        schema["properties"]["phases"]["items"]["allOf"][4]["then"]["properties"]["metrics"]
+            ["$ref"],
+        "#/$defs/fasticaMetrics"
+    );
+    assert_eq!(
+        schema["properties"]["phases"]["items"]["allOf"][5]["if"]["properties"]["name"]["const"],
+        "density_inversion"
+    );
+    assert_eq!(
+        schema["properties"]["phases"]["items"]["allOf"][5]["then"]["properties"]["metrics"]
+            ["$ref"],
+        "#/$defs/densityInversionMetrics"
+    );
+    assert_eq!(
+        schema["properties"]["phases"]["items"]["allOf"][6]["if"]["properties"]["name"]["const"],
+        "save"
+    );
+    assert_eq!(
+        schema["properties"]["phases"]["items"]["allOf"][6]["then"]["properties"]["metrics"]
+            ["$ref"],
+        "#/$defs/saveMetrics"
+    );
+    assert!(
+        schema["$defs"]["densityInversionMetrics"]["properties"]["operation_status"]["enum"]
+            .as_array()
+            .is_some_and(|statuses| statuses
+                .iter()
+                .any(|status| status == "held_out_measured_response_supported"))
+    );
+    assert_eq!(
+        schema["$defs"]["densityInversionMetrics"]["properties"]
+            ["negative_response_model_confidence"]["maximum"],
+        1
+    );
+    assert_eq!(
+        schema["$defs"]["densityInversionMetrics"]["allOf"][2]["then"]["properties"]
+            ["negative_response_model_confidence"]["const"],
+        0
+    );
+    assert!(
+        schema["$defs"]["fasticaMetrics"]["properties"]["operation_status"]["enum"]
+            .as_array()
+            .is_some_and(|statuses| statuses.iter().any(|status| {
+                status == "numerically_converged_physical_separation_unvalidated"
+            }))
+    );
+    assert_eq!(
+        schema["$defs"]["fasticaMetrics"]["properties"]["numerical_convergence_confidence"]
+            ["maximum"],
+        1
+    );
+    assert_eq!(
+        schema["$defs"]["loadMetrics"]["properties"]["components"]["items"]["$ref"],
+        "#/$defs/loadComponent"
+    );
+    assert_eq!(
+        schema["$defs"]["loadComponent"]["properties"]["decode"]["$ref"],
+        "#/$defs/loadDecodeMetrics"
+    );
+    assert_eq!(
+        schema["$defs"]["loadDecodeMetrics"]["properties"]["orientation"]["$ref"],
+        "#/$defs/inputOrientationDiagnostics"
+    );
+    assert_eq!(
+        schema["$defs"]["loadDecodeMetrics"]["properties"]["orientation_correction"]["$ref"],
+        "#/$defs/orientationCorrectionDiagnostics"
+    );
+    assert_eq!(
+        schema["$defs"]["loadDecodeMetrics"]["properties"]["decode_fidelity"]["$ref"],
+        "#/$defs/loadDecodeFidelity"
+    );
+    assert_eq!(
+        schema["$defs"]["loadDecodeFidelity"]["properties"]["confidence"]["maximum"],
+        1
+    );
+    assert!(
+        schema["$defs"]["loadDecodeFidelity"]["properties"]["status"]["enum"]
+            .as_array()
+            .is_some_and(|statuses| statuses
+                .iter()
+                .any(|status| status == "limited_declared_decode_fidelity"))
+    );
+    assert!(
+        schema["$defs"]["loadMetrics"]["properties"]["decode_fidelity_status"]["enum"]
+            .as_array()
+            .is_some_and(|statuses| statuses
+                .iter()
+                .any(|status| status == "mixed_component_decode_fidelity"))
+    );
+    assert_eq!(
+        schema["$defs"]["loadDecodeMetrics"]["properties"]["decoded_pixel_sha256"]["pattern"],
+        "^[A-Fa-f0-9]{64}$"
+    );
+    for field in ["source_min", "source_max", "working_min", "working_max"] {
+        assert_eq!(
+            schema["$defs"]["loadDecodeMetrics"]["properties"][field]["$ref"],
+            "#/$defs/integerVector3"
+        );
+    }
+    assert_eq!(
+        schema["$defs"]["loadDecodeMetrics"]["properties"]
+            ["source_orientation_materialized_decoded_pixel_sha256"]["pattern"],
+        "^[A-Fa-f0-9]{64}$"
+    );
+    assert!(
+        schema["$defs"]["orientationCorrectionDiagnostics"]["properties"]["requested"]["enum"]
+            .as_array()
+            .is_some_and(|values| values.iter().any(|value| value == "rotate-180"))
+    );
+    assert_eq!(
+        schema["$defs"]["orientationCorrectionDiagnostics"]["properties"]["effective_tag_value"]
+            ["maximum"],
+        8
+    );
+    assert_eq!(
+        schema["$defs"]["inputOrientationDiagnostics"]["properties"]["tag_value"]["type"],
+        serde_json::json!(["integer", "null"])
+    );
+    for field in [
+        "transform",
+        "applied",
+        "source_width",
+        "source_height",
+        "output_width",
+        "output_height",
+        "reason",
+    ] {
+        assert!(schema["$defs"]["inputOrientationDiagnostics"]["properties"][field].is_object());
+    }
     assert!(
         schema["$defs"]["colorspaceMappingMetrics"]["properties"]["candidate_quality_scores"]
             .is_object()
+    );
+    assert_eq!(
+        schema["$defs"]["colorspaceMappingMetrics"]["properties"]["neutral_safety_rescue"]["$ref"],
+        "#/$defs/neutralSafetyRescue"
+    );
+    assert!(
+        schema["$defs"]["colorspaceMappingMetrics"]["properties"]["mapping_strategy"]["enum"]
+            .as_array()
+            .is_some_and(|strategies| strategies
+                .iter()
+                .any(|strategy| strategy == "neutral_balance_evidence_rescue"))
+    );
+    for strategy in [
+        "embedded_icc_to_linear_prophoto",
+        "gamut_stabilized_image_matrix_blend",
+    ] {
+        assert!(
+            schema["$defs"]["colorspaceMappingMetrics"]["properties"]["mapping_strategy"]["enum"]
+                .as_array()
+                .is_some_and(|strategies| strategies.contains(&serde_json::json!(strategy)))
+        );
+    }
+    assert_eq!(
+        schema["$defs"]["neutralSafetyRescue"]["additionalProperties"],
+        false
+    );
+    assert!(schema["$defs"]["neutralSafetyRescue"]["required"]
+        .as_array()
+        .is_some_and(|fields| fields
+            .iter()
+            .any(|field| field == "midtone_saturation_p95_reduction")));
+    assert!(
+        schema["$defs"]["colorspaceMappingMetrics"]["properties"]["color_confidence_status"]
+            ["enum"]
+            .as_array()
+            .is_some_and(|statuses| statuses
+                .iter()
+                .any(|status| status == "review_required_selected_mapping"))
+    );
+    assert!(
+        schema["$defs"]["colorspaceMappingMetrics"]["properties"]["color_confidence_status"]
+            ["enum"]
+            .as_array()
+            .is_some_and(|statuses| statuses
+                .iter()
+                .any(|status| status == "review_required_negative_reconstruction"))
+    );
+    assert!(schema["$defs"]["colorspaceMappingMetrics"]["properties"]
+        ["negative_reconstruction_confidence_status"]["enum"]
+        .as_array()
+        .is_some_and(|statuses| statuses.iter().any(|status| {
+            status == "review_required_measured_response_outside_runtime_curve_support"
+        })));
+    assert_eq!(
+        schema["$defs"]["colorspaceMappingMetrics"]["properties"]
+            ["negative_reconstruction_evidence_confidence"]["maximum"],
+        1
+    );
+    assert_eq!(
+        schema["$defs"]["colorspaceMappingMetrics"]["properties"]
+            ["color_confidence_before_base_limit"]["maximum"],
+        1
+    );
+    assert!(
+        schema["$defs"]["toneMappingMetrics"]["properties"]["tone_confidence_status"]["enum"]
+            .as_array()
+            .is_some_and(|statuses| statuses
+                .iter()
+                .any(|status| status == "review_required_upstream_color"))
+    );
+    assert_eq!(
+        schema["$defs"]["toneMappingMetrics"]["properties"]["requested_grain_evidence_confidence"]
+            ["maximum"],
+        1
+    );
+    assert!(
+        schema["$defs"]["toneMappingMetrics"]["properties"]["tone_confidence_status"]["enum"]
+            .as_array()
+            .is_some_and(|statuses| statuses
+                .iter()
+                .any(|status| status == "review_required_tone_output_evidence"))
+    );
+    assert_eq!(
+        schema["$defs"]["toneMappingMetrics"]["properties"]["tone_output_confidence_status"]
+            ["$ref"],
+        "#/$defs/toneOutputConfidenceStatus"
+    );
+    assert_eq!(
+        schema["$defs"]["toneMappingMetrics"]["properties"]
+            ["adaptive_vibrance_preferred_memory_color_guard"]["$ref"],
+        "#/$defs/adaptiveVibrancePreferredMemoryColorGuard"
+    );
+    assert_eq!(
+        schema["$defs"]["toneMappingMetrics"]["properties"]["preferred_skin_rendering"]["$ref"],
+        "#/$defs/preferredSkinRendering"
+    );
+    assert_eq!(
+        schema["$defs"]["toneMappingMetrics"]["properties"]
+            ["noise_reduction_structure_excluded_ratio"]["maximum"],
+        1
+    );
+    assert_eq!(
+        schema["$defs"]["toneMappingMetrics"]["properties"]["noise_reduction_structure_gate_end"]
+            ["exclusiveMinimum"],
+        0
+    );
+    assert_eq!(
+        schema["$defs"]["adaptiveVibrancePreferredMemoryColorGuard"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        schema["$defs"]["adaptiveVibrancePreferredMemoryColorGuard"]["properties"]["reference"]
+            ["const"],
+        "https://doi.org/10.2352/issn.2169-2629.2021.29.170"
+    );
+    assert_eq!(
+        schema["$defs"]["adaptiveVibrancePreferredMemoryColorGuard"]["properties"]["families"]
+            ["maxItems"],
+        3
+    );
+    assert_eq!(
+        schema["$defs"]["preferredSkinRendering"]["properties"]["maximum_delta_e_ab"]["const"],
+        3
+    );
+    assert_eq!(
+        schema["$defs"]["preferredSkinRendering"]["properties"]["radial_excess_reduction"]["const"],
+        0.35
+    );
+    assert_eq!(
+        schema["$defs"]["preferredSkinRendering"]["properties"]["method"]["const"],
+        "published_skin_preference_ellipse_with_bounded_one_way_excess_chroma_shoulder"
+    );
+    assert_eq!(
+        schema["$defs"]["preferredSkinRendering"]["properties"]["mean_chroma_delta"]["maximum"],
+        0
+    );
+    assert_eq!(
+        schema["$defs"]["preferredSkinRendering"]["properties"]["max_delta_e_ab"]["maximum"],
+        3.000000001
+    );
+    assert!(schema["$defs"]["toneOutputConfidenceStatus"]["enum"]
+        .as_array()
+        .is_some_and(|statuses| statuses
+            .iter()
+            .any(|status| status == "review_required_collapsed_render_luminance_range")));
+    assert_eq!(
+        schema["$defs"]["toneMappingMetrics"]["allOf"][0]["then"]["properties"]
+            ["tone_output_evidence_confidence"]["const"],
+        1
+    );
+    assert!(
+        schema["$defs"]["saveMetrics"]["properties"]["render_review_status"]["enum"]
+            .as_array()
+            .is_some_and(|statuses| statuses
+                .iter()
+                .any(|status| status == "review_required_tone_output"))
     );
     assert_eq!(
         schema["$defs"]["colorspaceMappingMetrics"]["properties"]["candidate_acceptance"]["items"]
@@ -7994,6 +13127,126 @@ fn test_report_schema_examples_deserialize() {
         schema["$defs"]["colorspaceMappingMetrics"]["properties"]["calibration_acceptance"]["$ref"],
         "#/$defs/calibrationAcceptance"
     );
+    assert_eq!(
+        schema["$defs"]["calibrationMetrics"]["properties"]["color_mapping_application"]["$ref"],
+        "#/$defs/calibrationColorMappingApplication"
+    );
+    assert_eq!(
+        schema["$defs"]["calibrationColorMappingApplication"]["additionalProperties"],
+        false
+    );
+    for field in [
+        "evaluated",
+        "applied",
+        "selection_status",
+        "selected_candidate",
+        "preferred_candidate",
+        "reason",
+        "definition",
+    ] {
+        assert!(
+            schema["$defs"]["calibrationColorMappingApplication"]["required"]
+                .as_array()
+                .is_some_and(|fields| fields.contains(&serde_json::json!(field)))
+        );
+    }
+    assert!(
+        schema["$defs"]["calibrationColorMappingApplication"]["properties"]["selection_status"]
+            ["enum"]
+            .as_array()
+            .is_some_and(|statuses| {
+                statuses.contains(&serde_json::json!("accepted"))
+                    && statuses.contains(&serde_json::json!("rejected_unsafe"))
+                    && statuses.contains(&serde_json::json!("not_applicable"))
+            })
+    );
+    assert_eq!(
+        schema["$defs"]["calibrationColorMappingApplication"]["allOf"][2]["then"]["properties"]
+            ["selection_status"]["enum"],
+        serde_json::json!(["accepted", "forced"])
+    );
+    assert_eq!(
+        schema["$defs"]["calibrationColorMappingApplication"]["allOf"][3]["then"]["properties"]
+            ["applied"]["const"],
+        true
+    );
+    assert_eq!(
+        schema["$defs"]["calibrationMetrics"]["properties"]["scanner_profile"]["properties"]
+            ["target_patch_signal_domain"]["enum"],
+        serde_json::json!([
+            "normalized_scanner_signal",
+            "scanner_linearized_transmittance",
+            null
+        ])
+    );
+    assert_eq!(
+        schema["$defs"]["calibrationMetrics"]["properties"]["scanner_profile"]["properties"]
+            ["color_model"]["$ref"],
+        "#/$defs/rootPolynomialColorModel"
+    );
+    assert_eq!(
+        schema["$defs"]["calibrationMetrics"]["properties"]["scanner_profile"]["properties"]
+            ["lut_3d_model"]["$ref"],
+        "#/$defs/residualLut3dColorModel"
+    );
+    assert_eq!(
+        schema["$defs"]["calibrationMetrics"]["properties"]["scanner_profile"]["properties"]
+            ["lut_3d_fit"]["$ref"],
+        "#/$defs/residualLut3dSelectionDiagnostics"
+    );
+    assert_eq!(
+        schema["$defs"]["calibrationMetrics"]["properties"]["roll_profile"]["properties"]
+            ["scanner_color_model_application"]["$ref"],
+        "#/$defs/scannerColorModelApplication"
+    );
+    assert_eq!(
+        schema["$defs"]["scannerColorModelApplication"]["properties"]["output_domain"]["const"],
+        "reference_xyz_d50"
+    );
+    assert_eq!(
+        schema["$defs"]["calibrationMetrics"]["properties"]["external_profile"]["oneOf"][1]
+            ["properties"]["color_model"]["$ref"],
+        "#/$defs/rootPolynomialColorModel"
+    );
+    assert_eq!(
+        schema["$defs"]["calibrationMetrics"]["properties"]["external_profile"]["oneOf"][1]
+            ["properties"]["lut_3d_model"]["$ref"],
+        "#/$defs/residualLut3dColorModel"
+    );
+    assert!(schema["$defs"]["colorspaceMappingMetrics"]["properties"]["mapping_strategy"]
+        ["enum"]
+        .as_array()
+        .is_some_and(|values| values.contains(&serde_json::json!("calibrated_residual_lut_3d"))));
+    assert_eq!(
+        schema["$defs"]["nonlinearColorModelRuntimeDiagnostics"]["properties"]["model_type"]
+            ["enum"],
+        serde_json::json!(["root_polynomial", "residual_lut_3d"])
+    );
+    assert!(
+        schema["$defs"]["colorspaceMappingMetrics"]["properties"]["mapping_strategy"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("calibrated_root_polynomial"))
+    );
+    assert_eq!(
+        schema["$defs"]["colorspaceMappingMetrics"]["properties"]["nonlinear_color_model"]["$ref"],
+        "#/$defs/nonlinearColorModelRuntimeDiagnostics"
+    );
+    assert_eq!(
+        schema["$defs"]["nonlinearColorModelRuntimeDiagnostics"]["properties"]["support_status"]
+            ["enum"],
+        serde_json::json!(["accepted", "rejected"])
+    );
+    assert_eq!(
+        schema["$defs"]["rootPolynomialColorModel"]["properties"]["basis"]["const"],
+        "homogeneous_root_polynomial_rgb"
+    );
+    assert_eq!(
+        schema["$defs"]["rootPolynomialColorModel"]["properties"]["training_patches"]["items"]
+            ["$ref"],
+        "#/$defs/rootPolynomialTrainingPatch"
+    );
+    assert!(report_schema_doc.contains("nonlinear_color_model"));
     assert!(
         schema["$defs"]["candidateAcceptance"]["properties"]["eligible_in_color_mode"].is_object()
     );
@@ -8002,10 +13255,26 @@ fn test_report_schema_examples_deserialize() {
         serde_json::json!([
             "calibrated_direct",
             "scanner_prior",
+            "positive_rgb",
             "image_derived",
             "neutral_fallback"
         ])
     );
+    let candidate_statuses = schema["$defs"]["candidateAcceptance"]["properties"]["status"]["enum"]
+        .as_array()
+        .expect("candidate acceptance status enum");
+    for status in ["selected_evidence_rescue", "rejected_evidence_rescue"] {
+        assert!(candidate_statuses.contains(&serde_json::json!(status)));
+    }
+    for field in [
+        "scene_referred_prophoto_float_artifact_diagnostics",
+        "gamut_clipping_map_diagnostics",
+    ] {
+        assert_eq!(
+            schema["$defs"]["colorspaceMappingMetrics"]["properties"][field]["type"],
+            serde_json::json!(["object", "null"])
+        );
+    }
     assert!(
         schema["$defs"]["candidateQualityScore"]["properties"]["pre_scale_clipped_low_total"]
             .is_object()
@@ -8038,6 +13307,14 @@ fn test_report_schema_examples_deserialize() {
     assert!(
         schema["$defs"]["calibrationMetrics"]["properties"]["matrix_condition_number"].is_object()
     );
+    assert_eq!(
+        schema["$defs"]["calibrationMetrics"]["properties"]["whitepoint"]["oneOf"][0]["$ref"],
+        "#/$defs/numberVector3"
+    );
+    assert_eq!(
+        schema["$defs"]["calibrationMetrics"]["properties"]["whitepoint"]["oneOf"][1]["type"],
+        "null"
+    );
     assert!(
         schema["$defs"]["calibrationMetrics"]["properties"]["profile_schema_version"].is_object()
     );
@@ -8059,6 +13336,21 @@ fn test_validation_summary_baseline_schema_and_logan_baseline_cover_suite_contra
     let parsed: scanstitch::validation::TrackedValidationBaseline =
         serde_json::from_value(baseline.clone()).unwrap();
     assert_eq!(parsed.fixture.as_deref(), Some("logan"));
+    assert_eq!(parsed.render.render_review_status, None);
+    assert_eq!(parsed.render.render_reviewable, None);
+    assert_eq!(parsed.tone.tone_output_confidence_status, None);
+    assert_eq!(parsed.tone.tone_output_review_required, None);
+    assert_eq!(
+        parsed.tone.adaptive_vibrance_skin_memory_protection_enabled,
+        None
+    );
+    assert_eq!(
+        parsed
+            .tone
+            .adaptive_vibrance_preferred_memory_color_guard_enabled,
+        None
+    );
+    assert_eq!(parsed.tone.preferred_skin_rendering_enabled, None);
 
     let schema: serde_json::Value = serde_json::from_str(include_str!(
         "../docs/validation-summary-baseline.schema.json"
@@ -8084,6 +13376,39 @@ fn test_validation_summary_baseline_schema_and_logan_baseline_cover_suite_contra
         schema["$defs"]["colorspaceBaseline"]["properties"]["calibration_scanner_profile_id"]
             .is_object()
     );
+    assert!(schema["$defs"]["stitchBaseline"]["properties"]["seam_exposure_model"].is_object());
+    assert!(schema["$defs"]["stitchBaseline"]["properties"]
+        ["seam_exposure_spatial_2d_gain_accepted"]
+        .is_object());
+    assert!(schema["$defs"]["stitchBaseline"]["properties"]
+        ["seam_exposure_spatial_2d_gain_offset_accepted"]
+        .is_object());
+    assert!(schema["$defs"]["stitchBaseline"]["properties"]
+        ["seam_exposure_spatial_quadratic_gain_accepted"]
+        .is_object());
+    assert!(schema["$defs"]["stitchBaseline"]["properties"]
+        ["seam_exposure_spatial_quadratic_gain_offset_accepted"]
+        .is_object());
+    assert!(
+        schema["$defs"]["stitchBaseline"]["properties"]["seam_blend_review_required"].is_object()
+    );
+    assert!(
+        schema["$defs"]["stitchBaseline"]["properties"]["seam_detail_review_required"].is_object()
+    );
+    assert!(schema["$defs"]["stitchBaseline"]["properties"]
+        ["seam_detail_max_symmetric_energy_ratio"]
+        .is_object());
+    for field in [
+        "detail_review_required",
+        "detail_decision_supported",
+        "luminance_p10_retention",
+        "chroma_p10_retention",
+    ] {
+        assert!(
+            schema["$defs"]["grainBaseline"]["properties"][field].is_object(),
+            "grain baseline schema missing {field}"
+        );
+    }
     assert!(
         schema["$defs"]["colorspaceBaseline"]["properties"]["calibration_roll_profile_id"]
             .is_object()
@@ -8131,10 +13456,50 @@ fn test_validation_summary_baseline_schema_and_logan_baseline_cover_suite_contra
     assert!(
         schema["$defs"]["renderBaseline"]["properties"]["raw_base_support_fraction"].is_object()
     );
+    for field in ["render_review_status", "render_reviewable"] {
+        assert!(
+            schema["$defs"]["renderBaseline"]["properties"][field].is_object(),
+            "render baseline schema missing {field}"
+        );
+    }
     assert_eq!(
         schema["$defs"]["toneBaseline"]["required"],
         serde_json::json!(["highlight_chroma_compressed_ratio"])
     );
+    for field in [
+        "tone_output_confidence_status",
+        "tone_output_review_required",
+        "tone_output_evidence_confidence",
+        "render_luminance_range_p05_p95",
+        "render_to_mapped_luminance_range_ratio",
+        "maximum_post_tone_high_clip_ratio",
+        "maximum_post_tone_low_clip_ratio",
+        "adaptive_vibrance_skin_memory_protection_enabled",
+        "adaptive_vibrance_skin_memory_protection_space",
+        "adaptive_vibrance_skin_memory_protected_ratio",
+        "adaptive_vibrance_skin_memory_mean_protection",
+        "adaptive_vibrance_preferred_memory_color_guard_enabled",
+        "adaptive_vibrance_preferred_memory_color_guard_space",
+        "adaptive_vibrance_preferred_memory_color_guard_reference",
+        "adaptive_vibrance_preferred_memory_color_matched_ratio",
+        "adaptive_vibrance_preferred_memory_color_limited_ratio",
+        "adaptive_vibrance_preferred_memory_color_mean_scale_reduction",
+        "preferred_skin_rendering_enabled",
+        "preferred_skin_rendering_space",
+        "preferred_skin_rendering_preference_reference",
+        "preferred_skin_rendering_adjusted_ratio",
+        "preferred_skin_rendering_mean_delta_e_ab",
+    ] {
+        assert!(
+            schema["$defs"]["toneBaseline"]["properties"][field].is_object(),
+            "tone baseline schema missing {field}"
+        );
+    }
+    assert!(schema["$defs"]["toneOutputStatus"]["anyOf"][0]["enum"]
+        .as_array()
+        .is_some_and(|statuses| statuses
+            .iter()
+            .any(|status| status == "review_required_catastrophic_post_tone_clipping")));
 
     for pointer in [
         "/stitch/decision",
@@ -8148,6 +13513,7 @@ fn test_validation_summary_baseline_schema_and_logan_baseline_cover_suite_contra
         "/colorspace/calibration_status",
         "/colorspace/selected_candidate",
         "/colorspace/calibration_acceptance_status",
+        "/colorspace/calibration_color_mapping_applied",
         "/colorspace/candidate_risk",
         "/colorspace/tone_color_trust_state",
         "/colorspace/selected_quality_score",
@@ -8179,6 +13545,10 @@ fn test_validation_fixture_registry_schema_and_example_cover_color_corpus_fields
         serde_json::from_str(include_str!("../docs/validation-fixtures.example.json")).unwrap();
     let schema: serde_json::Value =
         serde_json::from_str(include_str!("../docs/validation-fixtures.schema.json")).unwrap();
+    let orientation_review_schema: serde_json::Value =
+        serde_json::from_str(include_str!("../docs/orientation-review.schema.json")).unwrap();
+    let render_review_schema: serde_json::Value =
+        serde_json::from_str(include_str!("../docs/render-review.schema.json")).unwrap();
 
     assert_eq!(schema["required"], serde_json::json!(["fixtures"]));
     assert_eq!(
@@ -8187,12 +13557,84 @@ fn test_validation_fixture_registry_schema_and_example_cover_color_corpus_fields
     );
     assert_eq!(schema["$defs"]["pairLabel"]["pattern"], "^[^|]+\\|[^|]+$");
     assert_eq!(schema["$defs"]["sha256Hex"]["pattern"], "^[A-Fa-f0-9]{64}$");
+    assert_eq!(
+        orientation_review_schema["properties"]["schema_version"]["const"],
+        1
+    );
+    assert_eq!(
+        orientation_review_schema["properties"]["review_status"]["const"],
+        "requires_human_approval"
+    );
+    assert_eq!(
+        orientation_review_schema["$defs"]["orientationExpectationDraft"]["properties"]
+            ["upright_approved"]["const"],
+        false
+    );
+    assert_eq!(
+        orientation_review_schema["$defs"]["orientationExpectationDraft"]["properties"]
+            ["decoded_pixel_sha256"]["pattern"],
+        "^[a-f0-9]{64}$"
+    );
+    assert!(
+        orientation_review_schema["properties"]["orientation_correction"]["enum"]
+            .as_array()
+            .is_some_and(|values| values.iter().any(|value| value == "rotate-180"))
+    );
+    assert!(
+        schema["$defs"]["fixtureEntry"]["properties"]["orientation_correction"]["enum"]
+            .as_array()
+            .is_some_and(|values| values.iter().any(|value| value == "rotate-180"))
+    );
+    assert_eq!(
+        render_review_schema["properties"]["schema_version"]["const"],
+        2
+    );
+    assert_eq!(
+        render_review_schema["properties"]["review_status"]["enum"],
+        serde_json::json!(["requires_human_approval", "approved"])
+    );
+    assert_eq!(
+        render_review_schema["$defs"]["artifactBinding"]["properties"]["kind"]["enum"],
+        serde_json::json!(["primary_output", "master_scene_referred", "review_srgb"])
+    );
+    assert_eq!(
+        render_review_schema["$defs"]["inputBinding"]["properties"]["decoded_pixel_sha256"]["$ref"],
+        "#/$defs/sha256Hex"
+    );
+    assert!(render_review_schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field == "grain_reduction_control"));
+    assert_eq!(
+        render_review_schema["$defs"]["grainControlBinding"]["properties"]["purpose"]["const"],
+        "grain_reduction_off_control"
+    );
+    assert_eq!(
+        render_review_schema["$defs"]["grainControlBinding"]["properties"]["artifacts"]["minItems"],
+        3
+    );
+    assert_eq!(
+        render_review_schema["$defs"]["decisions"]["required"]
+            .as_array()
+            .unwrap()
+            .len(),
+        8
+    );
     assert!(
         schema["$defs"]["coverageRequirements"]["properties"]["min_readable_tiff_pairs"]
             .is_object()
     );
     assert!(
         schema["$defs"]["coverageRequirements"]["properties"]["min_component_sha256_pairs"]
+            .is_object()
+    );
+    assert!(
+        schema["$defs"]["coverageRequirements"]["properties"]["min_n_component_fixtures"]
+            .is_object()
+    );
+    assert!(
+        schema["$defs"]["coverageRequirements"]["properties"]["min_component_sha256_sets"]
             .is_object()
     );
     assert!(schema["$defs"]["coverageRequirements"]["properties"]
@@ -8242,7 +13684,37 @@ fn test_validation_fixture_registry_schema_and_example_cover_color_corpus_fields
             .is_object()
     );
     assert!(schema["$defs"]["coverageRequirements"]["properties"]
+        ["min_approved_render_review_fixtures"]
+        .is_object());
+    assert!(schema["$defs"]["coverageRequirements"]["properties"]
         ["min_debug_artifact_expectation_fixtures"]
+        .is_object());
+    assert!(schema["$defs"]["coverageRequirements"]["properties"]
+        ["min_render_dynamic_range_contract_fixtures"]
+        .is_object());
+    assert!(schema["$defs"]["coverageRequirements"]["properties"]
+        ["min_stitch_normalization_contract_fixtures"]
+        .is_object());
+    assert!(schema["$defs"]["coverageRequirements"]["properties"]
+        ["min_geometry_preparation_contract_fixtures"]
+        .is_object());
+    assert!(schema["$defs"]["coverageRequirements"]["properties"]
+        ["min_geometry_accuracy_contract_fixtures"]
+        .is_object());
+    assert!(schema["$defs"]["coverageRequirements"]["properties"]
+        ["min_orientation_accuracy_contract_fixtures"]
+        .is_object());
+    assert!(schema["$defs"]["coverageRequirements"]["properties"]
+        ["min_negative_reconstruction_contract_fixtures"]
+        .is_object());
+    assert!(schema["$defs"]["coverageRequirements"]["properties"]
+        ["min_grain_reduction_enabled_fixtures"]
+        .is_object());
+    assert!(schema["$defs"]["coverageRequirements"]["properties"]
+        ["min_grain_detail_contract_fixtures"]
+        .is_object());
+    assert!(schema["$defs"]["coverageRequirements"]["properties"]
+        ["min_grain_reduction_effect_contract_fixtures"]
         .is_object());
     assert!(schema["$defs"]["coverageRequirements"]["properties"]
         ["required_film_stock_calibration_pairs"]
@@ -8276,7 +13748,7 @@ fn test_validation_fixture_registry_schema_and_example_cover_color_corpus_fields
     );
     assert_eq!(
         schema["$defs"]["fixtureEntry"]["required"],
-        serde_json::json!(["component1", "component2"])
+        serde_json::json!(["component1"])
     );
     assert!(schema["$defs"]["fixtureEntry"]["properties"]["film_stock"].is_object());
     assert_eq!(
@@ -8286,6 +13758,34 @@ fn test_validation_fixture_registry_schema_and_example_cover_color_corpus_fields
     assert_eq!(
         schema["$defs"]["fixtureEntry"]["properties"]["bit_depth"]["enum"],
         serde_json::json!([14, 16])
+    );
+    assert_eq!(
+        schema["$defs"]["fixtureEntry"]["properties"]["grain_reduction"]["enum"],
+        serde_json::json!(["off", "on"])
+    );
+    assert_eq!(
+        schema["$defs"]["fixtureEntry"]["properties"]["grain_strength"]["minimum"],
+        0
+    );
+    assert_eq!(
+        schema["$defs"]["fixtureEntry"]["properties"]["grain_strength"]["maximum"],
+        1
+    );
+    assert_eq!(
+        schema["$defs"]["fixtureEntry"]["properties"]["grain_scale"]["minimum"],
+        0.5
+    );
+    assert_eq!(
+        schema["$defs"]["fixtureEntry"]["properties"]["grain_scale"]["maximum"],
+        4
+    );
+    assert_eq!(
+        schema["$defs"]["fixtureEntry"]["properties"]["deskew"]["enum"],
+        serde_json::json!(["auto", "manual", "off"])
+    );
+    assert_eq!(
+        schema["$defs"]["fixtureEntry"]["properties"]["deskew_angle_degrees"]["minimum"],
+        -3
     );
     assert_eq!(
         schema["$defs"]["fixtureEntry"]["properties"]["force_no_stitch"]["type"],
@@ -8300,7 +13800,19 @@ fn test_validation_fixture_registry_schema_and_example_cover_color_corpus_fields
         "#/$defs/sha256Hex"
     );
     assert_eq!(
+        schema["$defs"]["fixtureEntry"]["properties"]["additional_components"]["items"]["$ref"],
+        "#/$defs/additionalFixtureComponent"
+    );
+    assert_eq!(
+        schema["$defs"]["additionalFixtureComponent"]["required"],
+        serde_json::json!(["path"])
+    );
+    assert_eq!(
         schema["$defs"]["fixtureEntry"]["properties"]["summary_baseline_sha256"]["$ref"],
+        "#/$defs/sha256Hex"
+    );
+    assert_eq!(
+        schema["$defs"]["fixtureEntry"]["properties"]["render_review_sha256"]["$ref"],
         "#/$defs/sha256Hex"
     );
     assert_eq!(
@@ -8321,7 +13833,132 @@ fn test_validation_fixture_registry_schema_and_example_cover_color_corpus_fields
     );
     assert!(schema["$defs"]["fixtureExpectations"]["properties"]["stitch_decision"].is_object());
     assert!(
+        schema["$defs"]["fixtureExpectations"]["properties"]["inferred_component_order"]
+            .is_object()
+    );
+    for field in [
+        "deskew_status",
+        "deskew_applied",
+        "deskew_review_required",
+        "deskew_retained_area_ratio_min",
+        "deskew_all_components_applied",
+        "deskew_minimum_component_retained_area_ratio_min",
+        "border_crop_all_components_cropped",
+        "border_crop_minimum_removed_edge_count_per_component_min",
+        "border_crop_retained_area_ratio_min",
+        "border_crop_retained_area_ratio_max",
+        "border_crop_rejected",
+        "deskew_correction_degrees_expected",
+        "deskew_correction_tolerance_degrees",
+        "border_crop_components_expected",
+        "orientation_components_expected",
+        "base_confidence_min",
+        "density_inversion_skipped",
+        "negative_response_model",
+        "negative_response_source",
+        "negative_response_accepted",
+        "negative_response_review_required",
+        "negative_response_crosstalk_model",
+        "negative_response_characteristic_curve_model",
+        "negative_response_measured_model_id",
+        "negative_response_measured_confidence_min",
+        "negative_response_held_out_delta_e00_rms_max",
+        "negative_response_held_out_max_delta_e00_max",
+        "negative_response_held_out_improvement_over_unit_slope_min",
+        "negative_response_density_noise_gain_max",
+        "negative_response_curve_extrapolated_ratio_max",
+        "negative_response_signed_headroom_preserved",
+        "negative_response_curve_interpolation",
+        "technical_white_balance_status",
+        "technical_white_balance_applied",
+        "technical_white_balance_review_required",
+        "creative_temperature",
+        "creative_tint",
+        "seam_exposure_spatial_2d_gain_accepted",
+        "seam_exposure_spatial_2d_gain_offset_accepted",
+        "seam_exposure_spatial_quadratic_gain_accepted",
+        "seam_exposure_spatial_quadratic_gain_offset_accepted",
+        "seam_exposure_spatial_2d_distinct_columns_min",
+        "seam_exposure_spatial_2d_horizontal_slope_agreement_ratio_min",
+        "seam_exposure_held_out_spatial_2d_improvement_over_best_simpler_min",
+        "seam_blend_review_required",
+        "seam_detail_review_required",
+        "seam_detail_supported_scale_count_min",
+        "seam_detail_max_symmetric_energy_ratio_max",
+        "grain_reduction_enabled",
+        "grain_reduction_applied_ratio_min",
+        "grain_reduction_structure_excluded_ratio_min",
+        "grain_reduction_flat_luma_p95_reduction_ratio_min",
+        "grain_reduction_flat_chroma_p95_reduction_ratio_min",
+        "grain_detail_review_required",
+        "grain_detail_decision_supported",
+        "grain_detail_luminance_probe_count_min",
+        "grain_detail_chroma_probe_count_min",
+        "grain_detail_luminance_p10_retention_min",
+        "grain_detail_chroma_p10_retention_min",
+        "calibration_color_mapping_applied",
+        "neutral_safety_rescue_applied",
+        "neutral_safety_rescue_preserved_ratio_gain_min",
+        "neutral_safety_rescue_midtone_saturation_p95_reduction_min",
+        "neutral_safety_rescue_reason_contains",
+    ] {
+        assert!(
+            schema["$defs"]["fixtureExpectations"]["properties"][field].is_object(),
+            "fixture expectations schema missing {field}"
+        );
+    }
+    assert!(
         schema["$defs"]["fixtureExpectations"]["properties"]["base_estimate_source"].is_object()
+    );
+    assert_eq!(
+        schema["$defs"]["fixtureExpectations"]["properties"]["border_crop_components_expected"]
+            ["items"]["$ref"],
+        "#/$defs/borderCropComponentExpectation"
+    );
+    assert_eq!(
+        schema["$defs"]["borderCropComponentExpectation"]["required"],
+        serde_json::json!([
+            "component_index",
+            "top_removed",
+            "bottom_removed",
+            "left_removed",
+            "right_removed",
+            "tolerance_px"
+        ])
+    );
+    assert_eq!(
+        schema["$defs"]["borderCropComponentExpectation"]["properties"]["tolerance_px"]["maximum"],
+        64
+    );
+    assert_eq!(
+        schema["$defs"]["fixtureExpectations"]["properties"]["orientation_components_expected"]
+            ["items"]["$ref"],
+        "#/$defs/orientationComponentExpectation"
+    );
+    assert_eq!(
+        schema["$defs"]["orientationComponentExpectation"]["required"],
+        serde_json::json!([
+            "component_index",
+            "upright_approved",
+            "decoded_pixel_sha256",
+            "tag_present",
+            "tag_value",
+            "transform",
+            "applied",
+            "source_width",
+            "source_height",
+            "output_width",
+            "output_height"
+        ])
+    );
+    assert_eq!(
+        schema["$defs"]["orientationComponentExpectation"]["properties"]["tag_value"]["maximum"],
+        8
+    );
+    assert_eq!(
+        schema["$defs"]["orientationComponentExpectation"]["properties"]["decoded_pixel_sha256"]
+            ["$ref"],
+        "#/$defs/sha256Hex"
     );
     assert!(schema["$defs"]["fixtureExpectations"]["properties"]["output_color_space"].is_object());
     assert!(
@@ -8377,6 +14014,48 @@ fn test_validation_fixture_registry_schema_and_example_cover_color_corpus_fields
         ["shadow_chroma_compressed_ratio_max"]
         .is_object());
     assert!(
+        schema["$defs"]["fixtureExpectations"]["properties"]["seam_exposure_model"].is_object()
+    );
+    assert!(schema["$defs"]["fixtureExpectations"]["properties"]
+        ["seam_exposure_held_out_validation_passed"]
+        .is_object());
+    assert!(schema["$defs"]["fixtureExpectations"]["properties"]
+        ["seam_exposure_held_out_improvement_over_gain_min"]
+        .is_object());
+    assert!(schema["$defs"]["fixtureExpectations"]["properties"]
+        ["seam_exposure_offset_normalized_abs_max"]
+        .is_object());
+    assert!(schema["$defs"]["fixtureExpectations"]["properties"]
+        ["seam_exposure_spatial_slope_abs_min"]
+        .is_object());
+    assert!(schema["$defs"]["fixtureExpectations"]["properties"]
+        ["seam_exposure_spatial_slope_abs_max"]
+        .is_object());
+    assert!(schema["$defs"]["fixtureExpectations"]["properties"]
+        ["seam_exposure_spatial_slope_agreement_ratio_min"]
+        .is_object());
+    assert!(schema["$defs"]["fixtureExpectations"]["properties"]
+        ["seam_exposure_held_out_spatial_improvement_over_best_constant_min"]
+        .is_object());
+    assert!(schema["$defs"]["fixtureExpectations"]["properties"]
+        ["seam_exposure_spatial_offset_slope_normalized_abs_min"]
+        .is_object());
+    assert!(schema["$defs"]["fixtureExpectations"]["properties"]
+        ["seam_exposure_spatial_offset_slope_normalized_abs_max"]
+        .is_object());
+    assert!(schema["$defs"]["fixtureExpectations"]["properties"]
+        ["seam_exposure_spatial_offset_endpoint_normalized_abs_max"]
+        .is_object());
+    assert!(schema["$defs"]["fixtureExpectations"]["properties"]
+        ["seam_exposure_spatial_affine_slope_agreement_ratio_min"]
+        .is_object());
+    assert!(schema["$defs"]["fixtureExpectations"]["properties"]
+        ["seam_exposure_spatial_affine_center_offset_delta_normalized_max"]
+        .is_object());
+    assert!(schema["$defs"]["fixtureExpectations"]["properties"]
+        ["seam_exposure_held_out_spatial_gain_offset_improvement_over_best_simpler_min"]
+        .is_object());
+    assert!(
         schema["$defs"]["fixtureExpectations"]["properties"]["memory_color_penalty_max"]
             .is_object()
     );
@@ -8404,6 +14083,28 @@ fn test_validation_fixture_registry_schema_and_example_cover_color_corpus_fields
         schema["$defs"]["fixtureExpectations"]["properties"]["post_scale_preserved_ratio_min"]
             .is_object()
     );
+    assert!(schema["$defs"]["fixtureExpectations"]["properties"]
+        ["render_luminance_range_p05_p95_min"]
+        .is_object());
+    for field in [
+        "render_review_status",
+        "render_reviewable",
+        "tone_output_confidence_status",
+        "tone_output_review_required",
+        "tone_output_evidence_confidence_min",
+        "render_to_mapped_luminance_range_ratio_min",
+    ] {
+        assert!(
+            schema["$defs"]["fixtureExpectations"]["properties"][field].is_object(),
+            "fixture expectation schema missing {field}"
+        );
+    }
+    assert!(schema["$defs"]["fixtureExpectations"]["properties"]
+        ["post_chroma_compression_clipped_high_ratio_max"]
+        .is_object());
+    assert!(schema["$defs"]["fixtureExpectations"]["properties"]
+        ["post_chroma_compression_clipped_low_ratio_max"]
+        .is_object());
     assert!(schema["$defs"]["fixtureExpectations"]["properties"]
         ["reference_patch_evaluation_required"]
         .is_object());
@@ -8468,9 +14169,60 @@ fn test_validation_fixture_registry_schema_and_example_cover_color_corpus_fields
         registry["fixtures"]["logan"]["reference_evidence"],
         serde_json::json!(["gray-card"])
     );
+    assert_eq!(registry["fixtures"]["logan"]["grain_reduction"], "off");
+    assert_eq!(registry["fixtures"]["logan"]["grain_strength"], 0.5);
+    assert_eq!(registry["fixtures"]["logan"]["grain_scale"], 1.0);
     assert_eq!(
         registry["fixtures"]["logan"]["expectations"]["debug_artifacts_required"],
         serde_json::json!(true)
+    );
+    assert_eq!(
+        registry["fixtures"]["logan"]["expectations"]["seam_blend_required"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        registry["fixtures"]["logan"]["expectations"]["seam_exposure_model"],
+        "identity"
+    );
+    assert_eq!(
+        registry["fixtures"]["logan"]["expectations"]["seam_exposure_held_out_validation_passed"],
+        false
+    );
+    assert_eq!(
+        registry["fixtures"]["logan"]["expectations"]["seam_blend_mode"],
+        "seam_aware_multiband"
+    );
+    assert_eq!(
+        registry["fixtures"]["logan"]["expectations"]["seam_blend_review_required"],
+        false
+    );
+    assert_eq!(
+        registry["fixtures"]["logan"]["expectations"]["seam_detail_review_required"],
+        false
+    );
+    assert_eq!(
+        registry["fixtures"]["logan"]["expectations"]["seam_detail_supported_scale_count_min"],
+        2
+    );
+    assert_eq!(
+        registry["fixtures"]["logan"]["expectations"]["seam_detail_max_symmetric_energy_ratio_max"],
+        2.0
+    );
+    assert_eq!(
+        registry["fixtures"]["logan"]["expectations"]["grain_reduction_enabled"],
+        false
+    );
+    assert_eq!(
+        registry["fixtures"]["logan"]["expectations"]["grain_detail_review_required"],
+        false
+    );
+    assert_eq!(
+        registry["fixtures"]["logan"]["expectations"]["grain_detail_decision_supported"],
+        true
+    );
+    assert_eq!(
+        registry["fixtures"]["logan"]["expectations"]["seam_gradient_ratio_max"],
+        0.9
     );
     assert_eq!(
         registry["fixtures"]["logan"]["expectations"]["debug_artifact_kinds_required"],
@@ -8481,6 +14233,151 @@ fn test_validation_fixture_registry_schema_and_example_cover_color_corpus_fields
         ])
     );
     assert!(registry["fixtures"]["my-split-frame"]["calibration_profile"].is_string());
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["input_mode"],
+        "negative"
+    );
+    assert_eq!(registry["fixtures"]["my-split-frame"]["deskew"], "manual");
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["additional_components"][0]["path"],
+        "local-fixtures/my-split-middle.tif"
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["grain_reduction"],
+        "on"
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["grain_strength"],
+        0.6
+    );
+    assert_eq!(registry["fixtures"]["my-split-frame"]["grain_scale"], 1.0);
+    for field in [
+        "deskew_all_components_applied",
+        "deskew_minimum_component_retained_area_ratio_min",
+        "border_crop_all_components_cropped",
+        "border_crop_minimum_removed_edge_count_per_component_min",
+        "border_crop_retained_area_ratio_min",
+        "border_crop_retained_area_ratio_max",
+        "border_crop_rejected",
+        "deskew_correction_degrees_expected",
+        "deskew_correction_tolerance_degrees",
+        "border_crop_components_expected",
+        "orientation_components_expected",
+        "base_confidence_min",
+        "density_inversion_skipped",
+        "negative_response_model",
+        "negative_response_source",
+        "negative_response_accepted",
+        "negative_response_review_required",
+        "negative_response_crosstalk_model",
+        "negative_response_characteristic_curve_model",
+        "negative_response_measured_model_id",
+        "negative_response_measured_confidence_min",
+        "negative_response_held_out_delta_e00_rms_max",
+        "negative_response_held_out_max_delta_e00_max",
+        "negative_response_held_out_improvement_over_unit_slope_min",
+        "negative_response_density_noise_gain_max",
+        "negative_response_curve_extrapolated_ratio_max",
+        "negative_response_signed_headroom_preserved",
+        "negative_response_curve_interpolation",
+    ] {
+        assert!(
+            !registry["fixtures"]["my-split-frame"]["expectations"][field].is_null(),
+            "example fixture missing {field}"
+        );
+    }
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["expectations"]
+            ["grain_detail_luminance_probe_count_min"],
+        64
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["expectations"]["grain_reduction_applied_ratio_min"],
+        0.01
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["expectations"]
+            ["grain_reduction_structure_excluded_ratio_min"],
+        0.01
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["expectations"]
+            ["grain_reduction_flat_luma_p95_reduction_ratio_min"],
+        0.02
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["expectations"]
+            ["grain_reduction_flat_chroma_p95_reduction_ratio_min"],
+        0.05
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["expectations"]
+            ["grain_detail_chroma_probe_count_min"],
+        64
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["expectations"]
+            ["grain_detail_luminance_p10_retention_min"],
+        0.7
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["expectations"]
+            ["grain_detail_chroma_p10_retention_min"],
+        0.7
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["expectations"]["post_scale_preserved_ratio_min"],
+        0.98
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["expectations"]["calibration_color_mapping_applied"],
+        true
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["expectations"]
+            ["render_luminance_range_p05_p95_min"],
+        0.45
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["expectations"]["render_review_status"],
+        "reviewable"
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["expectations"]["render_reviewable"],
+        true
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["expectations"]["tone_output_confidence_status"],
+        "supported_render_tonal_distribution"
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["expectations"]["tone_output_review_required"],
+        false
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["expectations"]
+            ["tone_output_evidence_confidence_min"],
+        1.0
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["expectations"]
+            ["render_to_mapped_luminance_range_ratio_min"],
+        0.08
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["expectations"]
+            ["post_chroma_compression_clipped_high_ratio_max"],
+        0.005
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["expectations"]
+            ["post_chroma_compression_clipped_low_ratio_max"],
+        0.005
+    );
+    assert_eq!(
+        registry["fixtures"]["my-split-frame"]["expectations"]["inferred_component_order"],
+        serde_json::json!([1, 3, 2])
+    );
     assert_eq!(
         registry["fixtures"]["my-split-frame"]["reference_evidence"],
         serde_json::json!(["colorchecker"])
@@ -8606,8 +14503,48 @@ fn test_validation_fixture_registry_schema_and_example_cover_color_corpus_fields
         serde_json::json!(24)
     );
     assert_eq!(
+        registry["coverage_requirements"]["min_approved_render_review_fixtures"],
+        serde_json::json!(3)
+    );
+    assert_eq!(
         registry["coverage_requirements"]["min_debug_artifact_expectation_fixtures"],
         serde_json::json!(3)
+    );
+    assert_eq!(
+        registry["coverage_requirements"]["min_render_dynamic_range_contract_fixtures"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        registry["coverage_requirements"]["min_stitch_normalization_contract_fixtures"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        registry["coverage_requirements"]["min_geometry_preparation_contract_fixtures"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        registry["coverage_requirements"]["min_geometry_accuracy_contract_fixtures"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        registry["coverage_requirements"]["min_orientation_accuracy_contract_fixtures"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        registry["coverage_requirements"]["min_negative_reconstruction_contract_fixtures"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        registry["coverage_requirements"]["min_grain_reduction_enabled_fixtures"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        registry["coverage_requirements"]["min_grain_detail_contract_fixtures"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        registry["coverage_requirements"]["min_grain_reduction_effect_contract_fixtures"],
+        serde_json::json!(1)
     );
     assert_eq!(
         registry["coverage_requirements"]["required_scene_tags"],
@@ -8686,6 +14623,8 @@ fn test_validation_roll_fixture_metadata_schema_covers_sidecar_contract() {
         "calibration_case",
         "summary_baseline",
         "summary_baseline_sha256",
+        "render_review",
+        "render_review_sha256",
         "calibration_profile",
         "calibration_profile_sha256",
         "calibration_library",
@@ -8708,7 +14647,7 @@ fn test_validation_roll_fixture_metadata_schema_covers_sidecar_contract() {
             .as_array()
             .expect("roll fixture metadata conditionals")
             .len()
-            >= 4
+            >= 5
     );
     assert!(validation_docs.contains("validation-roll-fixture-metadata.schema.json"));
     assert!(validation_docs.contains("--write-roll-fixture-metadata-template"));
@@ -8739,8 +14678,10 @@ fn test_validation_docs_map_local_corpus_scaffold_to_registry_actions() {
         "local-fixtures/uncalibrated-night-left.tif",
         "local-fixtures/uncalibrated-night-right.tif",
         "local-fixtures/baselines/uncalibrated-night-summary-baseline.json",
+        "local-fixtures/render-reviews/my-split-frame/render-review.json",
         "force_no_stitch: true",
-        "multi-scene CoolScan corpus from single-frame roll scans",
+        "An independent roll frame needs only `component1`",
+        "no duplicate path is needed",
         "repair_component1_tiff_for_fixture:logan",
         "repair_component2_tiff_for_fixture:logan",
         "replace_component1_with_minimum_bit_depth_tiff_for_fixture:logan",
@@ -8775,6 +14716,11 @@ fn test_validation_docs_map_local_corpus_scaffold_to_registry_actions() {
         "--write-roll-contact-sheet",
         "--write-roll-contact-sheet-index",
         "contact sheet",
+        "Hash-Bound Final Render Review",
+        "--write-render-review",
+        "render_review_sha256",
+        "min_approved_render_review_fixtures",
+        "complete_render_review_for_fixture",
         "validation-roll-fixture-metadata.schema.json",
         "testroll-metadata.json",
         "--write-fixture-suite-baselines",
@@ -8809,6 +14755,34 @@ fn test_validation_docs_map_local_corpus_scaffold_to_registry_actions() {
             "validation docs missing local corpus scaffold detail `{required}`"
         );
     }
+}
+
+#[test]
+fn test_ci_mandatorily_builds_and_tests_the_native_opencv_feature() {
+    let workflow = include_str!("../.github/workflows/ci.yml");
+    let cargo_manifest = include_str!("../Cargo.toml");
+
+    assert!(workflow.contains("opencv-native:"));
+    assert!(workflow.contains("runs-on: ubuntu-24.04"));
+    for package in [
+        "clang",
+        "libopencv-dev",
+        "libclang-dev",
+        "llvm-dev",
+        "pkg-config",
+    ] {
+        assert!(
+            workflow.contains(package),
+            "missing native package {package}"
+        );
+    }
+    assert!(workflow.contains("LIBCLANG_PATH=$(llvm-config --libdir)"));
+    assert!(
+        workflow.contains("cargo test --locked --features use-opencv --lib -- --test-threads=1")
+    );
+    assert!(!workflow.contains("Skipping use-opencv build"));
+    assert!(cargo_manifest.contains("default-features = false"));
+    assert!(cargo_manifest.contains("features = [\"calib3d\", \"features2d\", \"imgproc\"]"));
 }
 
 #[test]
@@ -8914,6 +14888,99 @@ fn test_color_calibration_library_record_schema_and_examples_cover_contract() {
         schema["$defs"]["patchFitResidual"]["additionalProperties"],
         serde_json::json!(false)
     );
+    assert_eq!(
+        schema["$defs"]["scannerProfile"]["allOf"][0]["then"]["required"],
+        serde_json::json!(["target_patch_signal_domain"])
+    );
+    assert_eq!(
+        schema["$defs"]["targetPatch"]["properties"]["scanner_xy"]["maxItems"],
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        schema["$defs"]["scannerProfile"]["properties"]["color_model"]["$ref"],
+        "#/$defs/rootPolynomialColorModel"
+    );
+    assert_eq!(
+        schema["$defs"]["scannerProfile"]["properties"]["lut_3d_model"]["$ref"],
+        "#/$defs/residualLut3dColorModel"
+    );
+    assert_eq!(
+        schema["$defs"]["scannerProfile"]["properties"]["lut_3d_fit"]["$ref"],
+        "#/$defs/residualLut3dSelectionDiagnostics"
+    );
+    assert_eq!(
+        schema["$defs"]["rootPolynomialColorModel"]["properties"]["basis"]["const"],
+        "homogeneous_root_polynomial_rgb"
+    );
+    assert_eq!(
+        schema["$defs"]["rootPolynomialColorModel"]["properties"]["training_patches"]["items"]
+            ["$ref"],
+        "#/$defs/retainedRootPolynomialTrainingPatch"
+    );
+    assert_eq!(
+        schema["$defs"]["rootPolynomialColorModel"]["allOf"][0]["then"]["properties"]
+            ["coefficients"]["minItems"],
+        serde_json::json!(6)
+    );
+    assert_eq!(
+        schema["$defs"]["rootPolynomialColorModel"]["allOf"][1]["then"]["properties"]
+            ["coefficients"]["minItems"],
+        serde_json::json!(13)
+    );
+    assert_eq!(
+        schema["$defs"]["rootPolynomialValidation"]["properties"]["held_out_delta_e00_rms"]
+            ["maximum"],
+        serde_json::json!(6)
+    );
+    assert_eq!(
+        schema["$defs"]["residualLut3dColorModel"]["properties"]["interpolation"]["const"],
+        "tetrahedral"
+    );
+    assert_eq!(
+        schema["$defs"]["residualLut3dColorModel"]["allOf"][0]["then"]["properties"]
+            ["residual_nodes_xyz"]["minItems"],
+        serde_json::json!(125)
+    );
+    assert_eq!(
+        schema["$defs"]["residualLut3dValidation"]["properties"]["held_out_inside_domain_fraction"]
+            ["minimum"],
+        serde_json::json!(0.98)
+    );
+    assert_eq!(
+        schema["$defs"]["rollProfile"]["properties"]["scanner_color_model_application"]["$ref"],
+        "#/$defs/scannerColorModelApplication"
+    );
+    assert_eq!(
+        schema["$defs"]["scannerColorModelApplication"]["properties"]["numerical_zero_tolerance"]
+            ["maximum"],
+        serde_json::json!(1e-9)
+    );
+
+    let profile_schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../docs/color-calibration-profile.schema.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        profile_schema["properties"]["color_model"]["$ref"],
+        "#/$defs/rootPolynomialColorModel"
+    );
+    assert_eq!(
+        profile_schema["properties"]["lut_3d_model"]["$ref"],
+        "#/$defs/residualLut3dColorModel"
+    );
+    assert_eq!(
+        profile_schema["properties"]["lut_3d_fit"]["$ref"],
+        "#/$defs/residualLut3dSelectionDiagnostics"
+    );
+    assert_eq!(
+        profile_schema["$defs"]["rootPolynomialColorModel"]["properties"]["training_patches"]
+            ["items"]["$ref"],
+        "#/$defs/retainedRootPolynomialTrainingPatch"
+    );
+    assert_eq!(
+        profile_schema["allOf"][3]["then"]["properties"]["schema_version"]["const"],
+        serde_json::json!(2)
+    );
 
     for key in ["scanner_profile", "roll_profile", "film_hint"] {
         let value = examples
@@ -8940,6 +15007,18 @@ fn test_color_calibration_library_record_schema_and_examples_cover_contract() {
     assert_eq!(
         examples["roll_profile"]["scanner_settings_fingerprint"].as_str(),
         Some(scanner_fingerprint.as_str())
+    );
+    assert_eq!(
+        examples["scanner_profile"]["target_patch_signal_domain"],
+        "scanner_linearized_transmittance"
+    );
+    assert_eq!(
+        examples["roll_profile"]["target_patch_linearization_model_id"],
+        examples["scanner_profile"]["scanner_linearization"]["model_id"]
+    );
+    assert_eq!(
+        examples["roll_profile"]["scanner_color_model_application"]["transform"],
+        "matrix"
     );
 
     let tmp = tempfile::TempDir::new().unwrap();
@@ -9016,7 +15095,9 @@ fn test_color_reconstruction_audit_maps_goal_to_artifacts_and_gap() {
         "src/color_calibration.rs",
         "src/colorspace.rs",
         "src/bin/scanstitch-validate.rs",
+        "src/render_review.rs",
         "docs/validation-fixtures.schema.json",
+        "docs/render-review.schema.json",
         "tests/fixtures/baselines/logan_summary_baseline.json",
         "component*_sha256",
         "summary_baseline_sha256",
@@ -9024,6 +15105,7 @@ fn test_color_reconstruction_audit_maps_goal_to_artifacts_and_gap() {
         "min_component_sha256_pairs",
         "min_summary_baseline_sha256_fixtures",
         "min_calibration_sha256_fixtures",
+        "min_approved_render_review_fixtures",
         "calibration_confidence_min",
         "candidate_acceptance_signatures_required",
         "reference_patch_count_min",
@@ -9048,6 +15130,7 @@ fn test_color_reconstruction_audit_maps_goal_to_artifacts_and_gap() {
         "provide_component1_for_fixture",
         "provide_calibration_library_for_fixture",
         "add_reference_patches_for_fixture",
+        "complete_render_review_for_fixture",
         "gamut-clipping",
         "--fixture-coverage --compute-fixture-hashes",
         "--write-fixture-hash-registry",
@@ -9070,6 +15153,56 @@ fn test_color_reconstruction_audit_maps_goal_to_artifacts_and_gap() {
         "replace_component1_with_minimum_bit_depth_tiff_for_fixture:logan",
         "stitch-compatible by the built-in LOGAN regression gate",
         "RGBA8 5959x3670",
+        "single scan with only `component1`",
+        "counter remains zero",
+        "corner-review-manifest.json",
+        "requires_corner_approval",
+        "chart_corners_sha256",
+        "overlay_pixel_sha256",
+        "reference_patch_sha256",
+        "classification_evidence_evaluated",
+        "not_applicable_positive_input",
+        "applied_crop_evidence_supported",
+        "no_crop_no_convincing_dead_zone",
+        "not_applicable_single_input",
+        "not_evaluated_explicit_direct_density_route",
+        "review_required_negative_like_positive_input",
+        "review_required_input_mode",
+        "accepted_warm_positive_input",
+        "full_declared_decode_fidelity",
+        "source_precision_upscaled_without_added_information",
+        "review_required_selected_mapping",
+        "not_applicable_disabled",
+        "diagnostic_delivery_requires_review",
+        "numerically_converged_physical_separation_unvalidated",
+        "physical_separation_evidence_evaluated=false",
+        "confidence_before_base_limit",
+        "minimum_film_base_and_negative_response_model_evidence",
+        "held_out_measured_response_supported",
+        "review_required_unmeasured_unit_slope_response",
+        "negative_response_model_evidence_evaluated=false",
+        "held_out_measured_response_and_runtime_coverage_supported",
+        "review_required_measured_response_outside_runtime_curve_support",
+        "confidence_limited_by_negative_reconstruction_evidence",
+        "supported_render_tonal_distribution",
+        "review_required_collapsed_render_luminance_range",
+        "review_required_catastrophic_post_tone_clipping",
+        "review_required_tone_output",
+        "confidence_limited_by_tone_output_evidence",
+        "tone_output_confidence_status_changed",
+        "tone_output_evidence_confidence_regressed",
+        "tone_output_range_retention_regressed",
+        "render_review_status=reviewable",
+        "tone_output_evidence_confidence_min",
+        "render_to_mapped_luminance_range_ratio_min",
+        "roll_suite:<frame>:render_review_not_supported",
+        "roll_suite:<frame>:tone_output_review_required",
+        "tone_output_status_regressed",
+        "tone_output_review_newly_required",
+        "tone_output_evidence_confidence_dropped",
+        "tone_output_range_retention_dropped",
+        "--fail-on tone",
+        "tests, including 88 validator",
         "fixture_suite_status=failed",
         "fixture_suite:logan:declared_calibration_not_applied",
         "TESTROLL/` contains 12 readable RGBA16 TIFF frames",

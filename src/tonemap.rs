@@ -1,3 +1,4 @@
+use nalgebra::Vector3;
 use ndarray::parallel::prelude::*;
 use ndarray::{Array3, Axis};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -92,12 +93,111 @@ const ADAPTIVE_VIBRANCE_SATURATION_END: f64 = 0.82;
 const ADAPTIVE_VIBRANCE_TEXTURE_RADIUS: usize = 2;
 const ADAPTIVE_VIBRANCE_TEXTURE_START: f64 = 0.035;
 const ADAPTIVE_VIBRANCE_TEXTURE_END: f64 = 0.12;
+// Van Song et al. measured 2,770 women across four continents and reported a global CIELAB
+// skin-colour range of L*=27.12..73.71, C*=9.01..30.43, h=24.63..79.64 degrees
+// (https://doi.org/10.1002/col.70012). The wider support below deliberately feathers that
+// measured core after conversion into this renderer's D50 working condition. This is a
+// memory-colour protection region, not semantic skin detection: false positives only receive less
+// creative vibrance and never alter the technical scene-referred master.
+const ADAPTIVE_VIBRANCE_SKIN_CORE_LIGHTNESS: [f64; 2] = [27.12, 73.71];
+const ADAPTIVE_VIBRANCE_SKIN_SUPPORT_LIGHTNESS: [f64; 2] = [18.0, 88.0];
+const ADAPTIVE_VIBRANCE_SKIN_CORE_CHROMA: [f64; 2] = [9.01, 30.43];
+const ADAPTIVE_VIBRANCE_SKIN_SUPPORT_CHROMA: [f64; 2] = [5.0, 45.0];
+const ADAPTIVE_VIBRANCE_SKIN_CORE_HUE_DEGREES: [f64; 2] = [24.63, 79.64];
+const ADAPTIVE_VIBRANCE_SKIN_SUPPORT_HUE_DEGREES: [f64; 2] = [15.0, 90.0];
+const ADAPTIVE_VIBRANCE_SKIN_MAXIMUM_REDUCTION: f64 = 0.90;
+// Ji, Tian, and Luo fitted 50%-acceptability CIELAB a*b* ellipses for preferred sky,
+// spring-grass, and autumn-grass reproduction in a psychophysical mobile-display experiment
+// (https://doi.org/10.2352/issn.2169-2629.2021.29.170, Table 2). We use those published
+// image-quality centers and ellipse shapes only as a one-way creative-vibrance overshoot guard.
+// A supported pixel may keep a boost that moves its a*b* projection toward the nearest preferred
+// center, but the guard can reduce a boost that would move farther away. It never pulls a pixel
+// toward a center, changes the technical master, supplies semantic object detection, or establishes
+// calibration truth. Radius 1 is the published 50% ellipse; radius 2 is an explicit feathered
+// engineering support region whose false positives can only receive less optional vibrance.
+const ADAPTIVE_VIBRANCE_PREFERRED_MEMORY_CORE_RADIUS: f64 = 1.0;
+const ADAPTIVE_VIBRANCE_PREFERRED_MEMORY_SUPPORT_RADIUS: f64 = 2.0;
+const ADAPTIVE_VIBRANCE_PREFERRED_MEMORY_REFERENCE: &str =
+    "https://doi.org/10.2352/issn.2169-2629.2021.29.170";
+// The same study reports an aggregate preferred-skin image-quality centre and 50%-acceptability
+// a*b* ellipse. Modern-clean rendering leaves that ellipse untouched and applies only a bounded
+// one-way shoulder to high-chroma outlying pixels which are also supported by the broader
+// four-continent measured skin-colour region above. The adjustment is an appearance proxy, not
+// face detection or calibration: it never raises chroma, preserves CIELAB lightness, reduces only
+// 35% of ellipse-radius excess, is capped at 3 DeltaE_ab, and is disabled unless upstream colour
+// is trusted.
+const PREFERRED_SKIN_RENDERING_CORE_RADIUS: f64 = 1.0;
+const PREFERRED_SKIN_RENDERING_RADIAL_EXCESS_REDUCTION: f64 = 0.35;
+const PREFERRED_SKIN_RENDERING_MAX_DELTA_E_AB: f64 = 3.0;
+const PREFERRED_SKIN_RENDERING_MIN_SUPPORT_WEIGHT: f64 = 0.05;
+const PREFERRED_SKIN_RENDERING_MIN_DELTA_E_AB: f64 = 0.001;
+
+#[derive(Debug, Clone, Copy)]
+struct PreferredMemoryColorModel {
+    family: &'static str,
+    preferred_center_lch: [f64; 3],
+    semi_major_axis_ab: f64,
+    axis_ratio: f64,
+    ellipse_rotation_degrees: f64,
+}
+
+impl PreferredMemoryColorModel {
+    const fn semi_minor_axis_ab(self) -> f64 {
+        self.semi_major_axis_ab / self.axis_ratio
+    }
+
+    fn preferred_center_lab(self) -> [f64; 3] {
+        let hue = self.preferred_center_lch[2].to_radians();
+        [
+            self.preferred_center_lch[0],
+            self.preferred_center_lch[1] * hue.cos(),
+            self.preferred_center_lch[1] * hue.sin(),
+        ]
+    }
+}
+
+const ADAPTIVE_VIBRANCE_PREFERRED_MEMORY_MODELS: [PreferredMemoryColorModel; 3] = [
+    PreferredMemoryColorModel {
+        family: "sky",
+        preferred_center_lch: [58.3, 43.7, 277.8],
+        semi_major_axis_ab: 15.02,
+        axis_ratio: 1.85,
+        ellipse_rotation_degrees: 120.00,
+    },
+    PreferredMemoryColorModel {
+        family: "spring_grass",
+        preferred_center_lch: [37.7, 61.7, 124.0],
+        semi_major_axis_ab: 32.71,
+        axis_ratio: 2.75,
+        ellipse_rotation_degrees: 125.77,
+    },
+    PreferredMemoryColorModel {
+        family: "autumn_grass",
+        preferred_center_lch: [45.3, 44.2, 88.3],
+        semi_major_axis_ab: 16.08,
+        axis_ratio: 1.25,
+        ellipse_rotation_degrees: 96.77,
+    },
+];
+const PREFERRED_SKIN_RENDERING_MODEL: PreferredMemoryColorModel = PreferredMemoryColorModel {
+    family: "skin",
+    preferred_center_lch: [61.3, 25.6, 40.3],
+    semi_major_axis_ab: 19.41,
+    axis_ratio: 2.78,
+    ellipse_rotation_degrees: 71.57,
+};
 const RENDER_NOISE_REDUCTION_RADIUS: usize = 2;
 const RENDER_NOISE_REDUCTION_CHROMA_RADIUS: usize = 2;
 const RENDER_NOISE_REDUCTION_CHROMA_AMOUNT: f64 = 0.96;
 const RENDER_NOISE_REDUCTION_LUMA_AMOUNT: f64 = 0.30;
 const RENDER_NOISE_REDUCTION_TEXTURE_START: f64 = 0.018;
 const RENDER_NOISE_REDUCTION_TEXTURE_END: f64 = 0.180;
+// A pixel at or above the same contrast floor used by the independent detail-retention
+// decision must be left exactly unchanged. The feather below that floor avoids a hard halo while
+// still making the optional pass selective on real photographs rather than a nearly universal
+// low-pass blend.
+const RENDER_NOISE_REDUCTION_STRUCTURE_GATE_START: f64 = RENDER_NOISE_REDUCTION_TEXTURE_START;
+const RENDER_NOISE_REDUCTION_STRUCTURE_GATE_END: f64 = GRAIN_DETAIL_LUMA_CONTRAST_MIN;
 const RENDER_NOISE_REDUCTION_CHROMA_TEXTURE_RESIDUAL_WEIGHT: f64 = 0.24;
 const RENDER_NOISE_REDUCTION_LUMA_TEXTURE_RESIDUAL_WEIGHT: f64 = 0.10;
 const RENDER_NOISE_REDUCTION_LUMA_TEXTURE_FLOOR: f64 = 0.50;
@@ -107,12 +207,21 @@ const RENDER_NOISE_REDUCTION_CHROMA_DAMP_AMOUNT: f64 = 0.85;
 const RENDER_NOISE_REDUCTION_NEUTRAL_TEXTURE_FLOOR: f64 = 0.85;
 const RENDER_NOISE_REDUCTION_NEUTRAL_FLOOR_HIGHLIGHT_START: f64 = 0.62;
 const RENDER_NOISE_REDUCTION_NEUTRAL_FLOOR_HIGHLIGHT_END: f64 = 0.82;
-const RENDER_NOISE_REDUCTION_SATURATION_GATE_FLOOR: f64 = 1.0;
+const RENDER_NOISE_REDUCTION_SATURATION_GATE_FLOOR: f64 = 0.35;
 const RENDER_NOISE_REDUCTION_SATURATION_START: f64 = 0.24;
 const RENDER_NOISE_REDUCTION_SATURATION_END: f64 = 0.72;
 const RENDER_NOISE_REDUCTION_SHADOW_SATURATION_RELAXATION: f64 = 0.90;
 const RENDER_NOISE_REDUCTION_SHADOW_START: f64 = 0.08;
 const RENDER_NOISE_REDUCTION_SHADOW_END: f64 = 0.42;
+const GRAIN_DETAIL_MAX_PROBES: usize = 200_000;
+pub const GRAIN_DETAIL_MIN_PROBE_COUNT: usize = 64;
+const GRAIN_DETAIL_LUMA_CONTRAST_MIN: f64 = 0.035;
+const GRAIN_DETAIL_CHROMA_CONTRAST_MIN: f64 = 0.050;
+const GRAIN_DETAIL_COHERENCE_MIN: f64 = 0.75;
+const GRAIN_DETAIL_SCALE_AGREEMENT_MIN: f64 = 0.35;
+const GRAIN_DETAIL_MEDIAN_RETENTION_MIN: f64 = 0.90;
+pub const GRAIN_DETAIL_P10_RETENTION_MIN: f64 = 0.70;
+const GRAIN_DETAIL_RETENTION_RATIO_MAX: f64 = 2.0;
 const SCENE_REFERRED_DETAIL_FUSION_RADIUS: usize = 5;
 const SCENE_REFERRED_DETAIL_FUSION_AMOUNT: f64 = 0.42;
 const SCENE_REFERRED_DETAIL_FUSION_MAX_EV: f64 = 0.16;
@@ -140,17 +249,17 @@ impl RenderStyle {
             Self::ModernClean => RenderProcessingConfig {
                 local_luminance_detail: true,
                 adaptive_vibrance: true,
-                noise_reduction: true,
+                preferred_skin_rendering: true,
             },
             Self::NaturalNeutral => RenderProcessingConfig {
                 local_luminance_detail: true,
                 adaptive_vibrance: false,
-                noise_reduction: true,
+                preferred_skin_rendering: false,
             },
             Self::FilmFaithful => RenderProcessingConfig {
                 local_luminance_detail: false,
                 adaptive_vibrance: false,
-                noise_reduction: false,
+                preferred_skin_rendering: false,
             },
         }
     }
@@ -160,7 +269,50 @@ impl RenderStyle {
 struct RenderProcessingConfig {
     local_luminance_detail: bool,
     adaptive_vibrance: bool,
-    noise_reduction: bool,
+    preferred_skin_rendering: bool,
+}
+
+/// Film-grain reduction is deliberately independent of creative render style.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GrainReductionSettings {
+    pub enabled: bool,
+    /// Normalized user strength in the inclusive range 0..=1.
+    pub strength: f64,
+    /// Spatial radius multiplier in the inclusive range 0.5..=4.
+    pub scale: f64,
+}
+
+impl GrainReductionSettings {
+    pub fn normalized(self) -> Self {
+        Self {
+            enabled: self.enabled,
+            strength: if self.strength.is_finite() {
+                self.strength.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
+            scale: if self.scale.is_finite() {
+                self.scale.clamp(0.5, 4.0)
+            } else {
+                1.0
+            },
+        }
+    }
+
+    fn effective_radius(self) -> usize {
+        ((RENDER_NOISE_REDUCTION_RADIUS as f64 * self.normalized().scale).round() as usize)
+            .clamp(1, 8)
+    }
+}
+
+impl Default for GrainReductionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            strength: 0.5,
+            scale: 1.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +346,188 @@ pub struct ToneFitResult {
 }
 
 #[derive(Debug, Clone)]
+pub struct AdaptiveVibranceSkinMemoryProtectionDiagnostics {
+    pub enabled: bool,
+    pub method: &'static str,
+    pub working_space: &'static str,
+    pub reference: &'static str,
+    pub core_lightness: [f64; 2],
+    pub support_lightness: [f64; 2],
+    pub core_chroma: [f64; 2],
+    pub support_chroma: [f64; 2],
+    pub core_hue_degrees: [f64; 2],
+    pub support_hue_degrees: [f64; 2],
+    pub maximum_vibrance_reduction: f64,
+    pub evaluated_pixel_ratio: f64,
+    pub protected_pixel_ratio: f64,
+    pub mean_protection_weight: f64,
+    pub max_protection_weight: f64,
+}
+
+impl AdaptiveVibranceSkinMemoryProtectionDiagnostics {
+    fn empty(enabled: bool) -> Self {
+        Self {
+            enabled,
+            method: "feathered_cielab_lightness_chroma_hue_region_limits_only_creative_vibrance",
+            working_space: "CIELAB_D50_from_linear_ProPhoto_RGB_D50",
+            reference: "https://doi.org/10.1002/col.70012",
+            core_lightness: ADAPTIVE_VIBRANCE_SKIN_CORE_LIGHTNESS,
+            support_lightness: ADAPTIVE_VIBRANCE_SKIN_SUPPORT_LIGHTNESS,
+            core_chroma: ADAPTIVE_VIBRANCE_SKIN_CORE_CHROMA,
+            support_chroma: ADAPTIVE_VIBRANCE_SKIN_SUPPORT_CHROMA,
+            core_hue_degrees: ADAPTIVE_VIBRANCE_SKIN_CORE_HUE_DEGREES,
+            support_hue_degrees: ADAPTIVE_VIBRANCE_SKIN_SUPPORT_HUE_DEGREES,
+            maximum_vibrance_reduction: ADAPTIVE_VIBRANCE_SKIN_MAXIMUM_REDUCTION,
+            evaluated_pixel_ratio: 0.0,
+            protected_pixel_ratio: 0.0,
+            mean_protection_weight: 0.0,
+            max_protection_weight: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PreferredSkinRenderingDiagnostics {
+    pub enabled: bool,
+    pub reason: String,
+    pub method: &'static str,
+    pub working_space: &'static str,
+    pub preference_reference: &'static str,
+    pub support_reference: &'static str,
+    pub interpretation: &'static str,
+    pub preferred_center_lab: [f64; 3],
+    pub preferred_center_lch: [f64; 3],
+    pub semi_major_axis_ab: f64,
+    pub semi_minor_axis_ab: f64,
+    pub axis_ratio: f64,
+    pub ellipse_rotation_degrees: f64,
+    pub core_normalized_radius: f64,
+    pub radial_excess_reduction: f64,
+    pub maximum_delta_e_ab: f64,
+    pub minimum_support_weight: f64,
+    pub evaluated_pixel_ratio: f64,
+    pub matched_pixel_ratio: f64,
+    pub outside_preferred_core_ratio: f64,
+    pub adjusted_pixel_ratio: f64,
+    pub gamut_limited_pixel_ratio: f64,
+    pub mean_delta_e_ab: f64,
+    pub max_delta_e_ab: f64,
+    pub mean_abs_hue_shift_degrees: f64,
+    pub max_abs_hue_shift_degrees: f64,
+    pub mean_chroma_delta: f64,
+    pub max_abs_chroma_delta: f64,
+}
+
+impl PreferredSkinRenderingDiagnostics {
+    fn empty(enabled: bool, reason: impl Into<String>) -> Self {
+        Self {
+            enabled,
+            reason: reason.into(),
+            method: "published_skin_preference_ellipse_with_bounded_one_way_excess_chroma_shoulder",
+            working_space: "CIELAB_D50_ab_projection_from_linear_ProPhoto_RGB_D50",
+            preference_reference: ADAPTIVE_VIBRANCE_PREFERRED_MEMORY_REFERENCE,
+            support_reference: "https://doi.org/10.1002/col.70012",
+            interpretation: "display-only aggregate appearance proxy; not face or skin-group detection, calibration evidence, or a claim that every matched pixel is skin",
+            preferred_center_lab: PREFERRED_SKIN_RENDERING_MODEL.preferred_center_lab(),
+            preferred_center_lch: PREFERRED_SKIN_RENDERING_MODEL.preferred_center_lch,
+            semi_major_axis_ab: PREFERRED_SKIN_RENDERING_MODEL.semi_major_axis_ab,
+            semi_minor_axis_ab: PREFERRED_SKIN_RENDERING_MODEL.semi_minor_axis_ab(),
+            axis_ratio: PREFERRED_SKIN_RENDERING_MODEL.axis_ratio,
+            ellipse_rotation_degrees: PREFERRED_SKIN_RENDERING_MODEL.ellipse_rotation_degrees,
+            core_normalized_radius: PREFERRED_SKIN_RENDERING_CORE_RADIUS,
+            radial_excess_reduction: PREFERRED_SKIN_RENDERING_RADIAL_EXCESS_REDUCTION,
+            maximum_delta_e_ab: PREFERRED_SKIN_RENDERING_MAX_DELTA_E_AB,
+            minimum_support_weight: PREFERRED_SKIN_RENDERING_MIN_SUPPORT_WEIGHT,
+            evaluated_pixel_ratio: 0.0,
+            matched_pixel_ratio: 0.0,
+            outside_preferred_core_ratio: 0.0,
+            adjusted_pixel_ratio: 0.0,
+            gamut_limited_pixel_ratio: 0.0,
+            mean_delta_e_ab: 0.0,
+            max_delta_e_ab: 0.0,
+            mean_abs_hue_shift_degrees: 0.0,
+            max_abs_hue_shift_degrees: 0.0,
+            mean_chroma_delta: 0.0,
+            max_abs_chroma_delta: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AdaptiveVibrancePreferredMemoryColorFamilyDiagnostics {
+    pub family: &'static str,
+    pub preferred_center_lab: [f64; 3],
+    pub preferred_center_lch: [f64; 3],
+    pub semi_major_axis_ab: f64,
+    pub semi_minor_axis_ab: f64,
+    pub axis_ratio: f64,
+    pub ellipse_rotation_degrees: f64,
+    pub matched_pixel_ratio: f64,
+    pub limited_pixel_ratio: f64,
+    pub mean_scale_reduction: f64,
+    pub max_scale_reduction: f64,
+}
+
+impl AdaptiveVibrancePreferredMemoryColorFamilyDiagnostics {
+    fn empty(model: PreferredMemoryColorModel) -> Self {
+        Self {
+            family: model.family,
+            preferred_center_lab: model.preferred_center_lab(),
+            preferred_center_lch: model.preferred_center_lch,
+            semi_major_axis_ab: model.semi_major_axis_ab,
+            semi_minor_axis_ab: model.semi_minor_axis_ab(),
+            axis_ratio: model.axis_ratio,
+            ellipse_rotation_degrees: model.ellipse_rotation_degrees,
+            matched_pixel_ratio: 0.0,
+            limited_pixel_ratio: 0.0,
+            mean_scale_reduction: 0.0,
+            max_scale_reduction: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AdaptiveVibrancePreferredMemoryColorGuardDiagnostics {
+    pub enabled: bool,
+    pub method: &'static str,
+    pub working_space: &'static str,
+    pub reference: &'static str,
+    pub interpretation: &'static str,
+    pub core_normalized_radius: f64,
+    pub support_normalized_radius: f64,
+    pub evaluated_pixel_ratio: f64,
+    pub matched_pixel_ratio: f64,
+    pub limited_pixel_ratio: f64,
+    pub mean_scale_reduction: f64,
+    pub max_scale_reduction: f64,
+    pub families: Vec<AdaptiveVibrancePreferredMemoryColorFamilyDiagnostics>,
+}
+
+impl AdaptiveVibrancePreferredMemoryColorGuardDiagnostics {
+    fn empty(enabled: bool) -> Self {
+        Self {
+            enabled,
+            method: "published_preference_ellipse_support_then_one_way_ab_path_projection_limits_only_creative_vibrance",
+            working_space: "CIELAB_D50_ab_projection_from_linear_ProPhoto_RGB_D50",
+            reference: ADAPTIVE_VIBRANCE_PREFERRED_MEMORY_REFERENCE,
+            interpretation: "appearance-relative proxy only; not semantic detection, calibration evidence, or an instruction to pull pixels toward a preferred center",
+            core_normalized_radius: ADAPTIVE_VIBRANCE_PREFERRED_MEMORY_CORE_RADIUS,
+            support_normalized_radius: ADAPTIVE_VIBRANCE_PREFERRED_MEMORY_SUPPORT_RADIUS,
+            evaluated_pixel_ratio: 0.0,
+            matched_pixel_ratio: 0.0,
+            limited_pixel_ratio: 0.0,
+            mean_scale_reduction: 0.0,
+            max_scale_reduction: 0.0,
+            families: ADAPTIVE_VIBRANCE_PREFERRED_MEMORY_MODELS
+                .iter()
+                .copied()
+                .map(AdaptiveVibrancePreferredMemoryColorFamilyDiagnostics::empty)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct TonemapApplyDiagnostics {
     pub highlight_chroma_compressed_ratio: f64,
     pub highlight_neutral_chroma_compressed_ratio: f64,
@@ -219,6 +553,10 @@ pub struct TonemapApplyDiagnostics {
     pub pre_chroma_compression_clipped_high_ratio: [f64; 3],
     pub post_chroma_compression_clipped_high_ratio: [f64; 3],
     pub post_chroma_compression_clipped_low_ratio: [f64; 3],
+    pub perceptual_gamut_mapping_space: &'static str,
+    pub perceptual_gamut_mapped_ratio: f64,
+    pub perceptual_gamut_mean_chroma_scale: f64,
+    pub perceptual_gamut_min_chroma_scale: f64,
     pub local_luminance_detail_enabled: bool,
     pub local_luminance_detail_radius: usize,
     pub local_luminance_detail_amount: f64,
@@ -237,18 +575,33 @@ pub struct TonemapApplyDiagnostics {
     pub adaptive_vibrance_max_applied_scale: f64,
     pub adaptive_vibrance_texture_limited_ratio: f64,
     pub adaptive_vibrance_gamut_limited_ratio: f64,
+    pub adaptive_vibrance_skin_memory_protection: AdaptiveVibranceSkinMemoryProtectionDiagnostics,
+    pub adaptive_vibrance_preferred_memory_color_guard:
+        AdaptiveVibrancePreferredMemoryColorGuardDiagnostics,
+    pub preferred_skin_rendering: PreferredSkinRenderingDiagnostics,
     pub noise_reduction_enabled: bool,
+    pub noise_reduction_requested_enabled: bool,
     pub noise_reduction_reason: String,
+    pub noise_reduction_requested_strength: f64,
+    pub noise_reduction_requested_scale: f64,
     pub noise_reduction_radius: usize,
     pub noise_reduction_chroma_amount: f64,
     pub noise_reduction_luma_amount: f64,
     pub noise_reduction_applied_ratio: f64,
+    pub noise_reduction_structure_gate_start: f64,
+    pub noise_reduction_structure_gate_end: f64,
+    pub noise_reduction_structure_excluded_ratio: f64,
     pub noise_reduction_texture_limited_ratio: f64,
     pub noise_reduction_saturation_limited_ratio: f64,
     pub noise_reduction_mean_abs_chroma_delta: f64,
     pub noise_reduction_max_abs_chroma_delta: f64,
     pub noise_reduction_mean_abs_luma_delta: f64,
     pub noise_reduction_max_abs_luma_delta: f64,
+    pub noise_reduction_pre_grain: RenderGrainDiagnostics,
+    pub noise_reduction_post_grain: RenderGrainDiagnostics,
+    pub noise_reduction_flat_luma_p95_reduction_ratio: f64,
+    pub noise_reduction_flat_chroma_p95_reduction_ratio: f64,
+    pub noise_reduction_detail_retention: GrainDetailRetentionDiagnostics,
 }
 
 pub struct TonemapApplyResult {
@@ -332,6 +685,8 @@ struct AdaptiveVibranceDiagnostics {
     max_applied_scale: f64,
     texture_limited_ratio: f64,
     gamut_limited_ratio: f64,
+    skin_memory_protection: AdaptiveVibranceSkinMemoryProtectionDiagnostics,
+    preferred_memory_color_guard: AdaptiveVibrancePreferredMemoryColorGuardDiagnostics,
 }
 
 impl AdaptiveVibranceDiagnostics {
@@ -346,6 +701,9 @@ impl AdaptiveVibranceDiagnostics {
             max_applied_scale: 1.0,
             texture_limited_ratio: 0.0,
             gamut_limited_ratio: 0.0,
+            skin_memory_protection: AdaptiveVibranceSkinMemoryProtectionDiagnostics::empty(false),
+            preferred_memory_color_guard:
+                AdaptiveVibrancePreferredMemoryColorGuardDiagnostics::empty(false),
         }
     }
 }
@@ -353,34 +711,49 @@ impl AdaptiveVibranceDiagnostics {
 #[derive(Debug, Clone)]
 struct RenderNoiseReductionDiagnostics {
     enabled: bool,
+    requested_enabled: bool,
     reason: String,
+    requested_strength: f64,
+    requested_scale: f64,
     radius: usize,
     chroma_amount: f64,
     luma_amount: f64,
     applied_ratio: f64,
+    structure_gate_start: f64,
+    structure_gate_end: f64,
+    structure_excluded_ratio: f64,
     texture_limited_ratio: f64,
     saturation_limited_ratio: f64,
     mean_abs_chroma_delta: f64,
     max_abs_chroma_delta: f64,
     mean_abs_luma_delta: f64,
     max_abs_luma_delta: f64,
+    detail_retention: GrainDetailRetentionDiagnostics,
 }
 
 impl RenderNoiseReductionDiagnostics {
-    fn disabled(reason: impl Into<String>) -> Self {
+    fn disabled(settings: GrainReductionSettings, reason: impl Into<String>) -> Self {
+        let settings = settings.normalized();
         Self {
             enabled: false,
+            requested_enabled: settings.enabled,
             reason: reason.into(),
-            radius: RENDER_NOISE_REDUCTION_RADIUS,
-            chroma_amount: RENDER_NOISE_REDUCTION_CHROMA_AMOUNT,
-            luma_amount: RENDER_NOISE_REDUCTION_LUMA_AMOUNT,
+            requested_strength: settings.strength,
+            requested_scale: settings.scale,
+            radius: settings.effective_radius(),
+            chroma_amount: RENDER_NOISE_REDUCTION_CHROMA_AMOUNT * settings.strength,
+            luma_amount: RENDER_NOISE_REDUCTION_LUMA_AMOUNT * settings.strength,
             applied_ratio: 0.0,
+            structure_gate_start: RENDER_NOISE_REDUCTION_STRUCTURE_GATE_START,
+            structure_gate_end: RENDER_NOISE_REDUCTION_STRUCTURE_GATE_END,
+            structure_excluded_ratio: 0.0,
             texture_limited_ratio: 0.0,
             saturation_limited_ratio: 0.0,
             mean_abs_chroma_delta: 0.0,
             max_abs_chroma_delta: 0.0,
             mean_abs_luma_delta: 0.0,
             max_abs_luma_delta: 0.0,
+            detail_retention: GrainDetailRetentionDiagnostics::not_applied(),
         }
     }
 }
@@ -445,6 +818,18 @@ impl ToneColorProtection {
         diagnostics: &crate::colorspace::ColorspaceDiagnostics,
     ) -> Self {
         let selected_quality = diagnostics.selected_quality_score.unwrap_or(0.0);
+        if diagnostics.candidate_risk == "fallback_only" {
+            return Self {
+                policy: ToneColorProtectionPolicy::DisabledColorCandidateReview,
+                highlight_neutral_chroma_enabled: false,
+                midtone_neutral_chroma_enabled: false,
+                shadow_chroma_enabled: false,
+                reason: format!(
+                    "disabled because selected colorspace candidate `{}` is fallback-only and cannot establish trusted colour",
+                    diagnostics.selected_candidate
+                ),
+            };
+        }
         if diagnostics.candidate_risk == "review_neutral_support"
             || (!diagnostics.candidate_risk.starts_with("review_")
                 && !diagnostics.neutral_estimate_quality.accepted)
@@ -562,6 +947,63 @@ pub struct RenderGrainDiagnostics {
     pub flat_chroma_to_luma_p95_ratio: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct GrainDetailRetentionDiagnostics {
+    pub method: &'static str,
+    pub evaluated: bool,
+    pub decision_supported: bool,
+    pub sample_stride: usize,
+    pub probe_radius: usize,
+    pub minimum_probe_count: usize,
+    pub luminance_probe_count: usize,
+    pub chroma_probe_count: usize,
+    pub luminance_decision_supported: bool,
+    pub chroma_decision_supported: bool,
+    pub luminance_median_retention: f64,
+    pub luminance_p10_retention: f64,
+    pub chroma_median_retention: f64,
+    pub chroma_p10_retention: f64,
+    pub luminance_contrast_threshold: f64,
+    pub chroma_contrast_threshold: f64,
+    pub coherence_threshold: f64,
+    pub median_retention_threshold: f64,
+    pub p10_retention_threshold: f64,
+    pub review_required: bool,
+    pub reason: String,
+    pub review_reason: Option<String>,
+}
+
+impl GrainDetailRetentionDiagnostics {
+    fn not_applied() -> Self {
+        Self {
+            method: "coherent_multiscale_opponent_edge_retention_v1",
+            evaluated: false,
+            decision_supported: true,
+            sample_stride: 1,
+            probe_radius: 0,
+            minimum_probe_count: GRAIN_DETAIL_MIN_PROBE_COUNT,
+            luminance_probe_count: 0,
+            chroma_probe_count: 0,
+            luminance_decision_supported: false,
+            chroma_decision_supported: false,
+            luminance_median_retention: 1.0,
+            luminance_p10_retention: 1.0,
+            chroma_median_retention: 1.0,
+            chroma_p10_retention: 1.0,
+            luminance_contrast_threshold: GRAIN_DETAIL_LUMA_CONTRAST_MIN,
+            chroma_contrast_threshold: GRAIN_DETAIL_CHROMA_CONTRAST_MIN,
+            coherence_threshold: GRAIN_DETAIL_COHERENCE_MIN,
+            median_retention_threshold: GRAIN_DETAIL_MEDIAN_RETENTION_MIN,
+            p10_retention_threshold: GRAIN_DETAIL_P10_RETENTION_MIN,
+            review_required: false,
+            reason:
+                "grain reduction did not run, so no pre/post detail-retention decision was needed"
+                    .to_string(),
+            review_reason: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RenderQualityPixel {
     luminance: f64,
@@ -635,29 +1077,77 @@ fn compress_highlight_chroma(
     rgb: [f64; 3],
     mapped_lum: f64,
     gamut_ceiling: f64,
-) -> ([f64; 3], bool) {
-    if rgb.iter().all(|v| *v >= 0.0 && *v <= 1.0) {
-        return (rgb, false);
+) -> ([f64; 3], bool, f64) {
+    let ceiling = gamut_ceiling.clamp(mapped_lum.clamp(0.0, 1.0), 1.0);
+    if rgb.iter().any(|value| !value.is_finite()) {
+        let neutral = mapped_lum.clamp(0.0, ceiling);
+        return ([neutral; 3], true, 0.0);
+    }
+    if rgb
+        .iter()
+        .all(|value| value.is_finite() && *value >= 0.0 && *value <= ceiling)
+    {
+        return (rgb, false, 1.0);
     }
 
-    let neutral = mapped_lum.clamp(0.0, 1.0);
-    let upper = gamut_ceiling.clamp(neutral, 1.0);
+    let prophoto_to_xyz = crate::colorspace::prophoto_to_xyz_d50_matrix();
+    let xyz_to_prophoto = crate::colorspace::xyz_d50_to_prophoto_matrix();
+    let xyz = prophoto_to_xyz * Vector3::new(rgb[0], rgb[1], rgb[2]);
+    let lab = crate::colorspace::xyz_d50_to_lab([xyz[0], xyz[1], xyz[2]]);
+    let chroma = lab[1].hypot(lab[2]);
+    if lab.iter().all(|value| value.is_finite()) && chroma > 1e-9 {
+        let hue_cos = lab[1] / chroma;
+        let hue_sin = lab[2] / chroma;
+        let candidate_for_scale = |scale: f64| {
+            let candidate_lab = [
+                lab[0].clamp(0.0, 100.0),
+                chroma * scale * hue_cos,
+                chroma * scale * hue_sin,
+            ];
+            let candidate_xyz = Vector3::from(crate::colorspace::lab_to_xyz_d50(candidate_lab));
+            let candidate = xyz_to_prophoto * candidate_xyz;
+            [candidate[0], candidate[1], candidate[2]]
+        };
+
+        let in_gamut = |candidate: &[f64; 3]| {
+            candidate
+                .iter()
+                .all(|value| value.is_finite() && *value >= -1e-10 && *value <= ceiling + 1e-10)
+        };
+        let neutral = candidate_for_scale(0.0);
+        if in_gamut(&neutral) {
+            let mut low = 0.0f64;
+            let mut high = 1.0f64;
+            for _ in 0..22 {
+                let mid = (low + high) * 0.5;
+                if in_gamut(&candidate_for_scale(mid)) {
+                    low = mid;
+                } else {
+                    high = mid;
+                }
+            }
+            let chroma_scale = (low * 0.999_999).clamp(0.0, 1.0);
+            let compressed = candidate_for_scale(chroma_scale);
+            return (compressed, chroma_scale < 1.0 - 1e-7, chroma_scale);
+        }
+    }
+
+    // Degenerate/non-finite Lab values retain a bounded luminance and fall back to the same
+    // neutral-axis geometry rather than channel-wise clipping, so hue is never independently
+    // truncated in one channel.
+    let neutral = mapped_lum.clamp(0.0, ceiling);
     let mut chroma_scale = 1.0f64;
     for value in rgb {
         let delta = value - neutral;
-        if value > 1.0 && delta > 1e-12 {
-            chroma_scale = chroma_scale.min((upper - neutral) / delta);
+        if value > ceiling && delta > 1e-12 {
+            chroma_scale = chroma_scale.min((ceiling - neutral) / delta);
         } else if value < 0.0 && delta < -1e-12 {
             chroma_scale = chroma_scale.min((0.0 - neutral) / delta);
         }
     }
-
-    if !chroma_scale.is_finite() {
-        chroma_scale = 0.0;
-    }
     let chroma_scale = chroma_scale.clamp(0.0, 1.0);
     let compressed = std::array::from_fn(|c| neutral + (rgb[c] - neutral) * chroma_scale);
-    (compressed, chroma_scale < 1.0 - 1e-12)
+    (compressed, chroma_scale < 1.0 - 1e-12, chroma_scale)
 }
 
 fn smoothstep01(t: f64) -> f64 {
@@ -1044,6 +1534,594 @@ fn smoothstep_range(edge0: f64, edge1: f64, value: f64) -> f64 {
     smoothstep01((value - edge0) / (edge1 - edge0))
 }
 
+fn feathered_range_weight(value: f64, support: [f64; 2], core: [f64; 2]) -> f64 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    smoothstep_range(support[0], core[0], value)
+        * (1.0 - smoothstep_range(core[1], support[1], value))
+}
+
+fn prophoto_rgb_to_lab(
+    rgb: [f64; 3],
+    prophoto_to_xyz: &nalgebra::Matrix3<f64>,
+) -> Option<[f64; 3]> {
+    if rgb.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let xyz = prophoto_to_xyz * Vector3::new(rgb[0], rgb[1], rgb[2]);
+    let lab = crate::colorspace::xyz_d50_to_lab([xyz[0], xyz[1], xyz[2]]);
+    lab.iter().all(|value| value.is_finite()).then_some(lab)
+}
+
+fn skin_memory_protection_weight_from_lab(lab: [f64; 3]) -> f64 {
+    if lab.iter().any(|value| !value.is_finite()) {
+        return 0.0;
+    }
+    let chroma = lab[1].hypot(lab[2]);
+    let hue_degrees = lab[2].atan2(lab[1]).to_degrees().rem_euclid(360.0);
+    feathered_range_weight(
+        lab[0],
+        ADAPTIVE_VIBRANCE_SKIN_SUPPORT_LIGHTNESS,
+        ADAPTIVE_VIBRANCE_SKIN_CORE_LIGHTNESS,
+    ) * feathered_range_weight(
+        chroma,
+        ADAPTIVE_VIBRANCE_SKIN_SUPPORT_CHROMA,
+        ADAPTIVE_VIBRANCE_SKIN_CORE_CHROMA,
+    ) * feathered_range_weight(
+        hue_degrees,
+        ADAPTIVE_VIBRANCE_SKIN_SUPPORT_HUE_DEGREES,
+        ADAPTIVE_VIBRANCE_SKIN_CORE_HUE_DEGREES,
+    )
+}
+
+#[cfg(test)]
+fn skin_memory_protection_weight(rgb: [f64; 3], prophoto_to_xyz: &nalgebra::Matrix3<f64>) -> f64 {
+    prophoto_rgb_to_lab(rgb, prophoto_to_xyz)
+        .map(skin_memory_protection_weight_from_lab)
+        .unwrap_or(0.0)
+}
+
+fn preferred_memory_color_normalized_radius(
+    lab: [f64; 3],
+    model: PreferredMemoryColorModel,
+) -> f64 {
+    if lab.iter().any(|value| !value.is_finite()) {
+        return f64::INFINITY;
+    }
+    let center = model.preferred_center_lab();
+    let delta_a = lab[1] - center[1];
+    let delta_b = lab[2] - center[2];
+    let theta = model.ellipse_rotation_degrees.to_radians();
+    let along_major = theta.cos() * delta_a + theta.sin() * delta_b;
+    let along_minor = -theta.sin() * delta_a + theta.cos() * delta_b;
+    ((along_major / model.semi_major_axis_ab).powi(2)
+        + (along_minor / model.semi_minor_axis_ab()).powi(2))
+    .sqrt()
+}
+
+fn preferred_memory_color_support_weight(normalized_radius: f64) -> f64 {
+    if !normalized_radius.is_finite()
+        || normalized_radius >= ADAPTIVE_VIBRANCE_PREFERRED_MEMORY_SUPPORT_RADIUS
+    {
+        return 0.0;
+    }
+    1.0 - smoothstep_range(
+        ADAPTIVE_VIBRANCE_PREFERRED_MEMORY_CORE_RADIUS,
+        ADAPTIVE_VIBRANCE_PREFERRED_MEMORY_SUPPORT_RADIUS,
+        normalized_radius,
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreferredMemoryColorGuardDecision {
+    scale: f64,
+    family_index: Option<usize>,
+    support_weight: f64,
+    scale_reduction: f64,
+}
+
+fn preferred_memory_color_match(
+    before_lab: [f64; 3],
+) -> Option<(usize, PreferredMemoryColorModel, f64)> {
+    ADAPTIVE_VIBRANCE_PREFERRED_MEMORY_MODELS
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(index, model)| {
+            let radius = preferred_memory_color_normalized_radius(before_lab, model);
+            (radius < ADAPTIVE_VIBRANCE_PREFERRED_MEMORY_SUPPORT_RADIUS)
+                .then_some((index, model, radius))
+        })
+        .min_by(|left, right| left.2.total_cmp(&right.2))
+}
+
+fn preferred_memory_color_guard_scale_with_match(
+    before_lab: [f64; 3],
+    tentative_lab: [f64; 3],
+    requested_scale: f64,
+    matched: Option<(usize, PreferredMemoryColorModel, f64)>,
+) -> PreferredMemoryColorGuardDecision {
+    let Some((family_index, model, radius)) = matched else {
+        return PreferredMemoryColorGuardDecision {
+            scale: requested_scale,
+            family_index: None,
+            support_weight: 0.0,
+            scale_reduction: 0.0,
+        };
+    };
+
+    let support_weight = preferred_memory_color_support_weight(radius);
+    let path_a = tentative_lab[1] - before_lab[1];
+    let path_b = tentative_lab[2] - before_lab[2];
+    let path_norm_sq = path_a * path_a + path_b * path_b;
+    if path_norm_sq <= 1e-18 || requested_scale <= 1.0 + 1e-12 {
+        return PreferredMemoryColorGuardDecision {
+            scale: requested_scale,
+            family_index: Some(family_index),
+            support_weight,
+            scale_reduction: 0.0,
+        };
+    }
+
+    let center = model.preferred_center_lab();
+    let target_a = center[1] - before_lab[1];
+    let target_b = center[2] - before_lab[2];
+    let closest_path_fraction =
+        ((target_a * path_a + target_b * path_b) / path_norm_sq).clamp(0.0, 1.0);
+    let closest_scale = 1.0 + (requested_scale - 1.0) * closest_path_fraction;
+    let guarded_scale =
+        requested_scale - support_weight * (requested_scale - closest_scale).max(0.0);
+    let guarded_scale = guarded_scale.clamp(1.0, requested_scale);
+    PreferredMemoryColorGuardDecision {
+        scale: guarded_scale,
+        family_index: Some(family_index),
+        support_weight,
+        scale_reduction: (requested_scale - guarded_scale).max(0.0),
+    }
+}
+
+#[cfg(test)]
+fn preferred_memory_color_guard_scale(
+    before_lab: [f64; 3],
+    tentative_lab: [f64; 3],
+    requested_scale: f64,
+) -> PreferredMemoryColorGuardDecision {
+    preferred_memory_color_guard_scale_with_match(
+        before_lab,
+        tentative_lab,
+        requested_scale,
+        preferred_memory_color_match(before_lab),
+    )
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PreferredMemoryColorFamilyAccumulator {
+    matched: usize,
+    limited: usize,
+    scale_reduction_sum: f64,
+    scale_reduction_max: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PreferredMemoryColorGuardAccumulator {
+    evaluated: usize,
+    matched: usize,
+    limited: usize,
+    scale_reduction_sum: f64,
+    scale_reduction_max: f64,
+    families: [PreferredMemoryColorFamilyAccumulator; 3],
+}
+
+impl PreferredMemoryColorGuardAccumulator {
+    fn record(&mut self, decision: PreferredMemoryColorGuardDecision) {
+        self.evaluated += 1;
+        let Some(family_index) = decision.family_index else {
+            return;
+        };
+        if decision.support_weight <= 0.0 {
+            return;
+        }
+        self.matched += 1;
+        let family = &mut self.families[family_index];
+        family.matched += 1;
+        if decision.scale_reduction <= 1e-12 {
+            return;
+        }
+        self.limited += 1;
+        self.scale_reduction_sum += decision.scale_reduction;
+        self.scale_reduction_max = self.scale_reduction_max.max(decision.scale_reduction);
+        family.limited += 1;
+        family.scale_reduction_sum += decision.scale_reduction;
+        family.scale_reduction_max = family.scale_reduction_max.max(decision.scale_reduction);
+    }
+
+    fn finish(self, denominator: f64) -> AdaptiveVibrancePreferredMemoryColorGuardDiagnostics {
+        let mut diagnostics = AdaptiveVibrancePreferredMemoryColorGuardDiagnostics::empty(true);
+        diagnostics.evaluated_pixel_ratio = self.evaluated as f64 / denominator;
+        diagnostics.matched_pixel_ratio = self.matched as f64 / denominator;
+        diagnostics.limited_pixel_ratio = self.limited as f64 / denominator;
+        diagnostics.mean_scale_reduction = if self.limited == 0 {
+            0.0
+        } else {
+            self.scale_reduction_sum / self.limited as f64
+        };
+        diagnostics.max_scale_reduction = self.scale_reduction_max;
+        for (family_diagnostics, accumulator) in diagnostics.families.iter_mut().zip(self.families)
+        {
+            family_diagnostics.matched_pixel_ratio = accumulator.matched as f64 / denominator;
+            family_diagnostics.limited_pixel_ratio = accumulator.limited as f64 / denominator;
+            family_diagnostics.mean_scale_reduction = if accumulator.limited == 0 {
+                0.0
+            } else {
+                accumulator.scale_reduction_sum / accumulator.limited as f64
+            };
+            family_diagnostics.max_scale_reduction = accumulator.scale_reduction_max;
+        }
+        diagnostics
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.evaluated += other.evaluated;
+        self.matched += other.matched;
+        self.limited += other.limited;
+        self.scale_reduction_sum += other.scale_reduction_sum;
+        self.scale_reduction_max = self.scale_reduction_max.max(other.scale_reduction_max);
+        for (left, right) in self.families.iter_mut().zip(other.families) {
+            left.matched += right.matched;
+            left.limited += right.limited;
+            left.scale_reduction_sum += right.scale_reduction_sum;
+            left.scale_reduction_max = left.scale_reduction_max.max(right.scale_reduction_max);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreferredSkinRenderingDecision {
+    output_rgb: [f64; 3],
+    output_lab: [f64; 3],
+    matched: bool,
+    outside_preferred_core: bool,
+    adjusted: bool,
+    gamut_limited: bool,
+    delta_e_ab: f64,
+    abs_hue_shift_degrees: f64,
+    chroma_delta: f64,
+}
+
+impl PreferredSkinRenderingDecision {
+    fn unchanged(
+        rgb: [f64; 3],
+        lab: [f64; 3],
+        matched: bool,
+        outside_preferred_core: bool,
+    ) -> Self {
+        Self {
+            output_rgb: rgb,
+            output_lab: lab,
+            matched,
+            outside_preferred_core,
+            adjusted: false,
+            gamut_limited: false,
+            delta_e_ab: 0.0,
+            abs_hue_shift_degrees: 0.0,
+            chroma_delta: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PreferredSkinRenderingAccumulator {
+    evaluated: usize,
+    matched: usize,
+    outside_preferred_core: usize,
+    adjusted: usize,
+    gamut_limited: usize,
+    delta_e_ab_sum: f64,
+    delta_e_ab_max: f64,
+    abs_hue_shift_degrees_sum: f64,
+    abs_hue_shift_degrees_max: f64,
+    chroma_delta_sum: f64,
+    abs_chroma_delta_max: f64,
+}
+
+impl PreferredSkinRenderingAccumulator {
+    fn record(&mut self, decision: PreferredSkinRenderingDecision) {
+        self.evaluated += 1;
+        if decision.matched {
+            self.matched += 1;
+        }
+        if decision.outside_preferred_core {
+            self.outside_preferred_core += 1;
+        }
+        if !decision.adjusted {
+            return;
+        }
+        self.adjusted += 1;
+        self.gamut_limited += usize::from(decision.gamut_limited);
+        self.delta_e_ab_sum += decision.delta_e_ab;
+        self.delta_e_ab_max = self.delta_e_ab_max.max(decision.delta_e_ab);
+        self.abs_hue_shift_degrees_sum += decision.abs_hue_shift_degrees;
+        self.abs_hue_shift_degrees_max = self
+            .abs_hue_shift_degrees_max
+            .max(decision.abs_hue_shift_degrees);
+        self.chroma_delta_sum += decision.chroma_delta;
+        self.abs_chroma_delta_max = self.abs_chroma_delta_max.max(decision.chroma_delta.abs());
+    }
+
+    fn finish(self, denominator: f64) -> PreferredSkinRenderingDiagnostics {
+        let mut diagnostics = PreferredSkinRenderingDiagnostics::empty(
+            true,
+            "trusted modern-clean render applied a bounded one-way excess-chroma preference-ellipse shoulder while preserving CIELAB lightness",
+        );
+        diagnostics.evaluated_pixel_ratio = self.evaluated as f64 / denominator;
+        diagnostics.matched_pixel_ratio = self.matched as f64 / denominator;
+        diagnostics.outside_preferred_core_ratio = self.outside_preferred_core as f64 / denominator;
+        diagnostics.adjusted_pixel_ratio = self.adjusted as f64 / denominator;
+        diagnostics.gamut_limited_pixel_ratio = self.gamut_limited as f64 / denominator;
+        if self.adjusted > 0 {
+            let adjusted = self.adjusted as f64;
+            diagnostics.mean_delta_e_ab = self.delta_e_ab_sum / adjusted;
+            diagnostics.max_delta_e_ab = self
+                .delta_e_ab_max
+                .min(PREFERRED_SKIN_RENDERING_MAX_DELTA_E_AB);
+            diagnostics.mean_abs_hue_shift_degrees = self.abs_hue_shift_degrees_sum / adjusted;
+            diagnostics.max_abs_hue_shift_degrees = self.abs_hue_shift_degrees_max;
+            diagnostics.mean_chroma_delta = self.chroma_delta_sum / adjusted;
+            diagnostics.max_abs_chroma_delta = self.abs_chroma_delta_max;
+        }
+        diagnostics
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.evaluated += other.evaluated;
+        self.matched += other.matched;
+        self.outside_preferred_core += other.outside_preferred_core;
+        self.adjusted += other.adjusted;
+        self.gamut_limited += other.gamut_limited;
+        self.delta_e_ab_sum += other.delta_e_ab_sum;
+        self.delta_e_ab_max = self.delta_e_ab_max.max(other.delta_e_ab_max);
+        self.abs_hue_shift_degrees_sum += other.abs_hue_shift_degrees_sum;
+        self.abs_hue_shift_degrees_max = self
+            .abs_hue_shift_degrees_max
+            .max(other.abs_hue_shift_degrees_max);
+        self.chroma_delta_sum += other.chroma_delta_sum;
+        self.abs_chroma_delta_max = self.abs_chroma_delta_max.max(other.abs_chroma_delta_max);
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct AdaptiveVibranceAccumulator {
+    applied: usize,
+    texture_limited: usize,
+    gamut_limited: usize,
+    skin_memory_evaluated: usize,
+    skin_memory_protected: usize,
+    skin_memory_protection_sum: f64,
+    skin_memory_protection_max: f64,
+    preferred_memory_color_guard: PreferredMemoryColorGuardAccumulator,
+    preferred_skin_rendering: PreferredSkinRenderingAccumulator,
+    sum_scale: f64,
+    max_applied_scale: f64,
+}
+
+impl AdaptiveVibranceAccumulator {
+    fn merge(&mut self, other: Self) {
+        self.applied += other.applied;
+        self.texture_limited += other.texture_limited;
+        self.gamut_limited += other.gamut_limited;
+        self.skin_memory_evaluated += other.skin_memory_evaluated;
+        self.skin_memory_protected += other.skin_memory_protected;
+        self.skin_memory_protection_sum += other.skin_memory_protection_sum;
+        self.skin_memory_protection_max = self
+            .skin_memory_protection_max
+            .max(other.skin_memory_protection_max);
+        self.preferred_memory_color_guard
+            .merge(other.preferred_memory_color_guard);
+        self.preferred_skin_rendering
+            .merge(other.preferred_skin_rendering);
+        self.sum_scale += other.sum_scale;
+        self.max_applied_scale = self.max_applied_scale.max(other.max_applied_scale);
+    }
+}
+
+fn lab_to_prophoto_rgb(
+    lab: [f64; 3],
+    xyz_to_prophoto: &nalgebra::Matrix3<f64>,
+) -> Option<[f64; 3]> {
+    if lab.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let xyz = Vector3::from(crate::colorspace::lab_to_xyz_d50(lab));
+    let rgb = xyz_to_prophoto * xyz;
+    let rgb = [rgb[0], rgb[1], rgb[2]];
+    rgb.iter().all(|value| value.is_finite()).then_some(rgb)
+}
+
+fn unit_rgb_in_gamut(rgb: [f64; 3]) -> bool {
+    rgb.iter()
+        .all(|value| value.is_finite() && *value >= -1e-10 && *value <= 1.0 + 1e-10)
+}
+
+fn shortest_hue_delta_degrees(from: f64, to: f64) -> f64 {
+    (to - from + 180.0).rem_euclid(360.0) - 180.0
+}
+
+fn preferred_skin_rendering_decision(
+    rgb: [f64; 3],
+    lab: [f64; 3],
+    xyz_to_prophoto: &nalgebra::Matrix3<f64>,
+) -> PreferredSkinRenderingDecision {
+    let support_weight = skin_memory_protection_weight_from_lab(lab);
+    let matched = support_weight >= PREFERRED_SKIN_RENDERING_MIN_SUPPORT_WEIGHT;
+    if !matched {
+        return PreferredSkinRenderingDecision::unchanged(rgb, lab, false, false);
+    }
+
+    let radius = preferred_memory_color_normalized_radius(lab, PREFERRED_SKIN_RENDERING_MODEL);
+    let outside_preferred_core = radius > PREFERRED_SKIN_RENDERING_CORE_RADIUS + 1e-12;
+    if !outside_preferred_core || !radius.is_finite() {
+        return PreferredSkinRenderingDecision::unchanged(rgb, lab, true, false);
+    }
+
+    let center = PREFERRED_SKIN_RENDERING_MODEL.preferred_center_lab();
+    let before_chroma = lab[1].hypot(lab[2]);
+    if before_chroma <= PREFERRED_SKIN_RENDERING_MODEL.preferred_center_lch[1] + 1e-12 {
+        return PreferredSkinRenderingDecision::unchanged(rgb, lab, true, true);
+    }
+    let delta_a = center[1] - lab[1];
+    let delta_b = center[2] - lab[2];
+    let distance_ab = delta_a.hypot(delta_b);
+    if distance_ab <= 1e-12 {
+        return PreferredSkinRenderingDecision::unchanged(rgb, lab, true, true);
+    }
+
+    let fraction_to_core =
+        ((radius - PREFERRED_SKIN_RENDERING_CORE_RADIUS) / radius).clamp(0.0, 1.0);
+    let mut requested_fraction =
+        PREFERRED_SKIN_RENDERING_RADIAL_EXCESS_REDUCTION * support_weight * fraction_to_core;
+    let requested_delta_e_ab = distance_ab * requested_fraction;
+    if requested_delta_e_ab > PREFERRED_SKIN_RENDERING_MAX_DELTA_E_AB {
+        requested_fraction *= PREFERRED_SKIN_RENDERING_MAX_DELTA_E_AB / requested_delta_e_ab;
+    }
+    if distance_ab * requested_fraction < PREFERRED_SKIN_RENDERING_MIN_DELTA_E_AB {
+        return PreferredSkinRenderingDecision::unchanged(rgb, lab, true, true);
+    }
+
+    let candidate_for_fraction = |fraction: f64| {
+        let candidate_lab = [
+            lab[0],
+            lab[1] + delta_a * fraction,
+            lab[2] + delta_b * fraction,
+        ];
+        lab_to_prophoto_rgb(candidate_lab, xyz_to_prophoto)
+            .map(|candidate| (candidate_lab, candidate))
+    };
+
+    let mut applied_fraction = requested_fraction;
+    let requested_candidate = candidate_for_fraction(requested_fraction);
+    let requested_in_gamut = requested_candidate
+        .as_ref()
+        .is_some_and(|(_, candidate)| unit_rgb_in_gamut(*candidate));
+    if !requested_in_gamut {
+        let mut low = 0.0;
+        let mut high = requested_fraction;
+        for _ in 0..22 {
+            let mid = (low + high) * 0.5;
+            if candidate_for_fraction(mid)
+                .as_ref()
+                .is_some_and(|(_, candidate)| unit_rgb_in_gamut(*candidate))
+            {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        applied_fraction = low * 0.999_999;
+    }
+
+    let Some((output_lab, output_rgb)) = candidate_for_fraction(applied_fraction) else {
+        return PreferredSkinRenderingDecision::unchanged(rgb, lab, true, true);
+    };
+    let delta_e_ab = distance_ab * applied_fraction;
+    if delta_e_ab < PREFERRED_SKIN_RENDERING_MIN_DELTA_E_AB {
+        return PreferredSkinRenderingDecision::unchanged(rgb, lab, true, true);
+    }
+
+    let after_chroma = output_lab[1].hypot(output_lab[2]);
+    if after_chroma > before_chroma + 1e-10 {
+        return PreferredSkinRenderingDecision::unchanged(rgb, lab, true, true);
+    }
+    let before_hue = lab[2].atan2(lab[1]).to_degrees().rem_euclid(360.0);
+    let after_hue = output_lab[2]
+        .atan2(output_lab[1])
+        .to_degrees()
+        .rem_euclid(360.0);
+    PreferredSkinRenderingDecision {
+        output_rgb: output_rgb.map(|value| value.clamp(0.0, 1.0)),
+        output_lab,
+        matched: true,
+        outside_preferred_core: true,
+        adjusted: true,
+        gamut_limited: applied_fraction + 1e-9 < requested_fraction,
+        delta_e_ab,
+        abs_hue_shift_degrees: shortest_hue_delta_degrees(before_hue, after_hue).abs(),
+        chroma_delta: after_chroma - before_chroma,
+    }
+}
+
+fn apply_preferred_skin_rendering(
+    mut img: Array3<f64>,
+    color_protection: &ToneColorProtection,
+) -> (Array3<f64>, PreferredSkinRenderingDiagnostics) {
+    let (height, width, channels) = img.dim();
+    if color_protection.color_trust_state() != "trusted" {
+        return (
+            img,
+            PreferredSkinRenderingDiagnostics::empty(
+                false,
+                format!(
+                    "disabled because tone color trust state is {}",
+                    color_protection.color_trust_state()
+                ),
+            ),
+        );
+    }
+    if channels < 3 {
+        return (
+            img,
+            PreferredSkinRenderingDiagnostics::empty(
+                false,
+                "preferred-skin rendering requires at least three channels",
+            ),
+        );
+    }
+
+    let prophoto_to_xyz = crate::colorspace::prophoto_to_xyz_d50_matrix();
+    let xyz_to_prophoto = crate::colorspace::xyz_d50_to_prophoto_matrix();
+    let accumulator = img
+        .axis_chunks_iter_mut(Axis(0), 128)
+        .into_par_iter()
+        .map(|mut chunk| {
+            let mut accumulator = PreferredSkinRenderingAccumulator::default();
+            let chunk_height = chunk.dim().0;
+            for y in 0..chunk_height {
+                for x in 0..width {
+                    let rgb = [
+                        chunk[[y, x, 0]].clamp(0.0, 1.0),
+                        chunk[[y, x, 1]].clamp(0.0, 1.0),
+                        chunk[[y, x, 2]].clamp(0.0, 1.0),
+                    ];
+                    let luminance = linear_luminance(rgb[0], rgb[1], rgb[2]);
+                    if !(0.015..=0.82).contains(&luminance) || rgb_saturation(rgb) < 0.015 {
+                        continue;
+                    }
+                    let Some(lab) = prophoto_rgb_to_lab(rgb, &prophoto_to_xyz) else {
+                        continue;
+                    };
+                    let decision = preferred_skin_rendering_decision(rgb, lab, &xyz_to_prophoto);
+                    accumulator.record(decision);
+                    if decision.adjusted {
+                        for channel in 0..3 {
+                            chunk[[y, x, channel]] = decision.output_rgb[channel];
+                        }
+                    }
+                }
+            }
+            accumulator
+        })
+        .reduce(
+            PreferredSkinRenderingAccumulator::default,
+            |mut left, right| {
+                left.merge(right);
+                left
+            },
+        );
+
+    let denominator = height.saturating_mul(width).max(1) as f64;
+    (img, accumulator.finish(denominator))
+}
+
 fn box_blur_luminance(luminance: &[f32], height: usize, width: usize, radius: usize) -> Vec<f32> {
     if height == 0 || width == 0 || radius == 0 {
         return luminance.to_vec();
@@ -1246,43 +2324,83 @@ fn max_chroma_scale_inside_gamut(rgb: [f64; 3], luminance: f64) -> f64 {
 }
 
 fn apply_adaptive_vibrance(
-    img: &Array3<f64>,
+    img: Array3<f64>,
     color_protection: &ToneColorProtection,
 ) -> (Array3<f64>, AdaptiveVibranceDiagnostics) {
+    let (img, diagnostics, _) = apply_adaptive_vibrance_internal(img, color_protection, false);
+    (img, diagnostics)
+}
+
+fn apply_adaptive_vibrance_with_preferred_skin(
+    img: Array3<f64>,
+    color_protection: &ToneColorProtection,
+) -> (
+    Array3<f64>,
+    AdaptiveVibranceDiagnostics,
+    PreferredSkinRenderingDiagnostics,
+) {
+    apply_adaptive_vibrance_internal(img, color_protection, true)
+}
+
+fn apply_adaptive_vibrance_internal(
+    mut img: Array3<f64>,
+    color_protection: &ToneColorProtection,
+    preferred_skin_requested: bool,
+) -> (
+    Array3<f64>,
+    AdaptiveVibranceDiagnostics,
+    PreferredSkinRenderingDiagnostics,
+) {
     let (height, width, channels) = img.dim();
     if color_protection.color_trust_state() != "trusted" {
         return (
-            img.clone(),
+            img,
             AdaptiveVibranceDiagnostics::disabled(format!(
                 "disabled because tone color trust state is {}",
                 color_protection.color_trust_state()
             )),
+            PreferredSkinRenderingDiagnostics::empty(
+                false,
+                format!(
+                    "disabled because tone color trust state is {}",
+                    color_protection.color_trust_state()
+                ),
+            ),
         );
     }
     if height < ADAPTIVE_VIBRANCE_MIN_DIMENSION || width < ADAPTIVE_VIBRANCE_MIN_DIMENSION {
+        let adaptive = AdaptiveVibranceDiagnostics::disabled(
+            "image is smaller than the adaptive vibrance minimum dimension",
+        );
+        if preferred_skin_requested {
+            let (img, preferred_skin) = apply_preferred_skin_rendering(img, color_protection);
+            return (img, adaptive, preferred_skin);
+        }
         return (
-            img.clone(),
-            AdaptiveVibranceDiagnostics::disabled(
-                "image is smaller than the adaptive vibrance minimum dimension",
+            img,
+            adaptive,
+            PreferredSkinRenderingDiagnostics::empty(
+                false,
+                "preferred-skin rendering was not requested",
             ),
         );
     }
     if channels < 3 {
         return (
-            img.clone(),
+            img,
             AdaptiveVibranceDiagnostics::disabled(
                 "adaptive vibrance requires at least three channels",
+            ),
+            PreferredSkinRenderingDiagnostics::empty(
+                false,
+                "preferred-skin rendering requires at least three channels",
             ),
         );
     }
 
-    let mut out = Array3::<f64>::zeros((height, width, channels));
-    let mut applied = 0usize;
-    let mut texture_limited = 0usize;
-    let mut gamut_limited = 0usize;
-    let mut sum_scale = 0.0f64;
-    let mut max_applied_scale = 1.0f64;
     let pixel_count = height * width;
+    let prophoto_to_xyz = crate::colorspace::prophoto_to_xyz_d50_matrix();
+    let xyz_to_prophoto = crate::colorspace::xyz_d50_to_prophoto_matrix();
     let mut luminance = vec![0.0f32; pixel_count];
     for y in 0..height {
         for x in 0..width {
@@ -1298,114 +2416,671 @@ fn apply_adaptive_vibrance(
     let blurred_luminance =
         box_blur_luminance(&luminance, height, width, ADAPTIVE_VIBRANCE_TEXTURE_RADIUS);
 
+    let chunk_accumulators: Vec<AdaptiveVibranceAccumulator> = img
+        .axis_chunks_iter_mut(Axis(0), 128)
+        .into_par_iter()
+        .enumerate()
+        .map(|(chunk_index, mut chunk)| {
+            let row_start = chunk_index * 128;
+            let chunk_height = chunk.dim().0;
+            let mut accumulator = AdaptiveVibranceAccumulator::default();
+            for local_y in 0..chunk_height {
+                let y = row_start + local_y;
+                for x in 0..width {
+                    let idx = y * width + x;
+                    let source_rgb = [
+                        chunk[[local_y, x, 0]].clamp(0.0, 1.0),
+                        chunk[[local_y, x, 1]].clamp(0.0, 1.0),
+                        chunk[[local_y, x, 2]].clamp(0.0, 1.0),
+                    ];
+                    let luminance = luminance[idx] as f64;
+                    let source_saturation = rgb_saturation(source_rgb);
+                    let texture = (luminance - blurred_luminance[idx] as f64).abs();
+                    let texture_gate = 1.0
+                        - smoothstep_range(
+                            ADAPTIVE_VIBRANCE_TEXTURE_START,
+                            ADAPTIVE_VIBRANCE_TEXTURE_END,
+                            texture,
+                        );
+                    let source_neutral_gate = smoothstep_range(
+                        ADAPTIVE_VIBRANCE_NEUTRAL_START,
+                        ADAPTIVE_VIBRANCE_NEUTRAL_FULL,
+                        source_saturation,
+                    );
+                    let source_saturation_gate = 1.0
+                        - smoothstep_range(
+                            ADAPTIVE_VIBRANCE_SATURATION_START,
+                            ADAPTIVE_VIBRANCE_SATURATION_END,
+                            source_saturation,
+                        );
+                    let luminance_gate = smoothstep_range(
+                        ADAPTIVE_VIBRANCE_SHADOW_START,
+                        ADAPTIVE_VIBRANCE_SHADOW_FULL,
+                        luminance,
+                    ) * (1.0
+                        - smoothstep_range(
+                            ADAPTIVE_VIBRANCE_HIGHLIGHT_START,
+                            ADAPTIVE_VIBRANCE_HIGHLIGHT_END,
+                            luminance,
+                        ));
+                    let source_unprotected_boost = ADAPTIVE_VIBRANCE_AMOUNT
+                        * source_neutral_gate
+                        * source_saturation_gate
+                        * luminance_gate
+                        * texture_gate;
+                    let preferred_skin_candidate = preferred_skin_requested
+                        && (0.015..=0.82).contains(&luminance)
+                        && source_saturation >= 0.015;
+                    let source_lab = if source_unprotected_boost > 1e-12 || preferred_skin_candidate
+                    {
+                        prophoto_rgb_to_lab(source_rgb, &prophoto_to_xyz)
+                    } else {
+                        None
+                    };
+                    let preferred_skin_decision = if preferred_skin_candidate {
+                        source_lab.map(|lab| {
+                            preferred_skin_rendering_decision(source_rgb, lab, &xyz_to_prophoto)
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(decision) = preferred_skin_decision {
+                        accumulator.preferred_skin_rendering.record(decision);
+                    }
+                    let (rgb, before_lab) = preferred_skin_decision
+                        .filter(|decision| decision.adjusted)
+                        .map(|decision| (decision.output_rgb, Some(decision.output_lab)))
+                        .unwrap_or((source_rgb, source_lab));
+                    let unprotected_boost =
+                        if preferred_skin_decision.is_some_and(|decision| decision.adjusted) {
+                            let saturation = rgb_saturation(rgb);
+                            ADAPTIVE_VIBRANCE_AMOUNT
+                                * smoothstep_range(
+                                    ADAPTIVE_VIBRANCE_NEUTRAL_START,
+                                    ADAPTIVE_VIBRANCE_NEUTRAL_FULL,
+                                    saturation,
+                                )
+                                * (1.0
+                                    - smoothstep_range(
+                                        ADAPTIVE_VIBRANCE_SATURATION_START,
+                                        ADAPTIVE_VIBRANCE_SATURATION_END,
+                                        saturation,
+                                    ))
+                                * luminance_gate
+                                * texture_gate
+                        } else {
+                            source_unprotected_boost
+                        };
+                    if unprotected_boost > 1e-12 {
+                        accumulator.skin_memory_evaluated += 1;
+                    }
+                    let skin_memory_weight = before_lab
+                        .filter(|_| unprotected_boost > 1e-12)
+                        .map(skin_memory_protection_weight_from_lab)
+                        .unwrap_or(0.0);
+                    if skin_memory_weight > 1e-12 {
+                        accumulator.skin_memory_protected += 1;
+                        accumulator.skin_memory_protection_sum += skin_memory_weight;
+                        accumulator.skin_memory_protection_max = accumulator
+                            .skin_memory_protection_max
+                            .max(skin_memory_weight);
+                    }
+                    let skin_memory_gate =
+                        1.0 - ADAPTIVE_VIBRANCE_SKIN_MAXIMUM_REDUCTION * skin_memory_weight;
+                    let requested_scale = (1.0 + unprotected_boost * skin_memory_gate)
+                        .min(ADAPTIVE_VIBRANCE_MAX_SCALE);
+                    let gamut_scale = max_chroma_scale_inside_gamut(rgb, luminance);
+                    let gamut_bounded_scale = requested_scale.min(gamut_scale);
+                    let scale = if gamut_bounded_scale > 1.0 + 1e-12 {
+                        before_lab
+                            .and_then(|before_lab| {
+                                let matched = preferred_memory_color_match(before_lab);
+                                let decision = if matched.is_some() {
+                                    let tentative_rgb = std::array::from_fn(|c| {
+                                        (luminance + (rgb[c] - luminance) * gamut_bounded_scale)
+                                            .clamp(0.0, 1.0)
+                                    });
+                                    let tentative_lab =
+                                        prophoto_rgb_to_lab(tentative_rgb, &prophoto_to_xyz)?;
+                                    preferred_memory_color_guard_scale_with_match(
+                                        before_lab,
+                                        tentative_lab,
+                                        gamut_bounded_scale,
+                                        matched,
+                                    )
+                                } else {
+                                    PreferredMemoryColorGuardDecision {
+                                        scale: gamut_bounded_scale,
+                                        family_index: None,
+                                        support_weight: 0.0,
+                                        scale_reduction: 0.0,
+                                    }
+                                };
+                                accumulator.preferred_memory_color_guard.record(decision);
+                                Some(decision.scale)
+                            })
+                            .unwrap_or(gamut_bounded_scale)
+                    } else {
+                        gamut_bounded_scale
+                    };
+                    if texture_gate < 0.5 {
+                        accumulator.texture_limited += 1;
+                    }
+                    if requested_scale > gamut_scale + 1e-12 {
+                        accumulator.gamut_limited += 1;
+                    }
+                    if scale > 1.002 {
+                        accumulator.applied += 1;
+                        accumulator.sum_scale += scale;
+                        accumulator.max_applied_scale = accumulator.max_applied_scale.max(scale);
+                    }
+
+                    for c in 0..channels {
+                        if c < 3 {
+                            chunk[[local_y, x, c]] =
+                                (luminance + (rgb[c] - luminance) * scale).clamp(0.0, 1.0);
+                        }
+                    }
+                }
+            }
+            accumulator
+        })
+        .collect();
+    let mut accumulator = AdaptiveVibranceAccumulator::default();
+    for chunk_accumulator in chunk_accumulators {
+        accumulator.merge(chunk_accumulator);
+    }
+
+    let denom = height.saturating_mul(width).max(1) as f64;
+    let preferred_skin_diagnostics = if preferred_skin_requested {
+        accumulator.preferred_skin_rendering.finish(denom)
+    } else {
+        PreferredSkinRenderingDiagnostics::empty(
+            false,
+            "preferred-skin rendering was not requested",
+        )
+    };
+    (
+        img,
+        AdaptiveVibranceDiagnostics {
+            enabled: true,
+            reason: "trusted color path received bounded hue-preserving adaptive vibrance with feathered D50 CIELAB skin-memory protection and a one-way published sky/grass preference-ellipse overshoot guard".to_string(),
+            amount: ADAPTIVE_VIBRANCE_AMOUNT,
+            max_scale: ADAPTIVE_VIBRANCE_MAX_SCALE,
+            applied_ratio: accumulator.applied as f64 / denom,
+            mean_scale: if accumulator.applied == 0 {
+                1.0
+            } else {
+                accumulator.sum_scale / accumulator.applied as f64
+            },
+            max_applied_scale: accumulator.max_applied_scale.max(1.0),
+            texture_limited_ratio: accumulator.texture_limited as f64 / denom,
+            gamut_limited_ratio: accumulator.gamut_limited as f64 / denom,
+            skin_memory_protection: AdaptiveVibranceSkinMemoryProtectionDiagnostics {
+                enabled: true,
+                evaluated_pixel_ratio: accumulator.skin_memory_evaluated as f64 / denom,
+                protected_pixel_ratio: accumulator.skin_memory_protected as f64 / denom,
+                mean_protection_weight: if accumulator.skin_memory_protected == 0 {
+                    0.0
+                } else {
+                    accumulator.skin_memory_protection_sum
+                        / accumulator.skin_memory_protected as f64
+                },
+                max_protection_weight: accumulator.skin_memory_protection_max,
+                ..AdaptiveVibranceSkinMemoryProtectionDiagnostics::empty(true)
+            },
+            preferred_memory_color_guard: accumulator
+                .preferred_memory_color_guard
+                .finish(denom),
+        },
+        preferred_skin_diagnostics,
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GrainDetailAxis {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GrainLuminanceProbe {
+    y: usize,
+    x: usize,
+    radius: usize,
+    axis: GrainDetailAxis,
+    pre_delta: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GrainChromaProbe {
+    y: usize,
+    x: usize,
+    radius: usize,
+    axis: GrainDetailAxis,
+    pre_delta: [f64; 2],
+}
+
+fn scalar_axis_delta(
+    values: &[f32],
+    width: usize,
+    y: usize,
+    x: usize,
+    radius: usize,
+    axis: GrainDetailAxis,
+) -> f64 {
+    match axis {
+        GrainDetailAxis::Horizontal => {
+            values[y * width + x + radius] as f64 - values[y * width + x - radius] as f64
+        }
+        GrainDetailAxis::Vertical => {
+            values[(y + radius) * width + x] as f64 - values[(y - radius) * width + x] as f64
+        }
+    }
+}
+
+fn opponent_axis_delta(
+    opponent_a: &[f32],
+    opponent_b: &[f32],
+    width: usize,
+    y: usize,
+    x: usize,
+    radius: usize,
+    axis: GrainDetailAxis,
+) -> [f64; 2] {
+    [
+        scalar_axis_delta(opponent_a, width, y, x, radius, axis),
+        scalar_axis_delta(opponent_b, width, y, x, radius, axis),
+    ]
+}
+
+fn opponent_norm(value: [f64; 2]) -> f64 {
+    ((value[0] * value[0] + value[1] * value[1]) * 0.5).sqrt()
+}
+
+fn scalar_multiscale_coherent(inner: f64, outer: f64) -> bool {
+    let inner_abs = inner.abs();
+    let outer_abs = outer.abs();
+    inner * outer > 0.0
+        && inner_abs.min(outer_abs) >= inner_abs.max(outer_abs) * GRAIN_DETAIL_SCALE_AGREEMENT_MIN
+}
+
+fn opponent_multiscale_coherent(inner: [f64; 2], outer: [f64; 2]) -> bool {
+    let inner_norm = opponent_norm(inner);
+    let outer_norm = opponent_norm(outer);
+    if inner_norm <= 1e-12 || outer_norm <= 1e-12 {
+        return false;
+    }
+    let cosine = (inner[0] * outer[0] + inner[1] * outer[1])
+        / ((inner[0].hypot(inner[1])) * (outer[0].hypot(outer[1]))).max(1e-12);
+    cosine >= GRAIN_DETAIL_COHERENCE_MIN
+        && inner_norm.min(outer_norm)
+            >= inner_norm.max(outer_norm) * GRAIN_DETAIL_SCALE_AGREEMENT_MIN
+}
+
+fn populate_coherent_chroma_structure(
+    opponent_a: &[f32],
+    opponent_b: &[f32],
+    structure: &mut [f32],
+    height: usize,
+    width: usize,
+    radius: usize,
+) {
+    let outer_radius = radius.saturating_mul(2);
+    if outer_radius == 0 || height <= outer_radius * 2 || width <= outer_radius * 2 {
+        structure.fill(0.0);
+        return;
+    }
+    structure.fill(0.0);
+    for y in outer_radius..(height - outer_radius) {
+        for x in outer_radius..(width - outer_radius) {
+            let mut coherent_structure = 0.0f64;
+            for axis in [GrainDetailAxis::Horizontal, GrainDetailAxis::Vertical] {
+                let inner = opponent_axis_delta(opponent_a, opponent_b, width, y, x, radius, axis);
+                let outer =
+                    opponent_axis_delta(opponent_a, opponent_b, width, y, x, outer_radius, axis);
+                if opponent_multiscale_coherent(inner, outer) {
+                    coherent_structure = coherent_structure.max(opponent_norm(inner));
+                }
+            }
+            structure[y * width + x] = coherent_structure as f32;
+        }
+    }
+}
+
+fn dilate_structure_max(
+    source: &[f32],
+    horizontal: &mut [f32],
+    destination: &mut [f32],
+    height: usize,
+    width: usize,
+    radius: usize,
+) {
+    if radius == 0 {
+        destination.copy_from_slice(source);
+        return;
+    }
     for y in 0..height {
         for x in 0..width {
-            let idx = y * width + x;
-            let rgb = [
-                img[[y, x, 0]].clamp(0.0, 1.0),
-                img[[y, x, 1]].clamp(0.0, 1.0),
-                img[[y, x, 2]].clamp(0.0, 1.0),
-            ];
-            let luminance = luminance[idx] as f64;
-            let saturation = rgb_saturation(rgb);
-            let texture = (luminance - blurred_luminance[idx] as f64).abs();
-            let texture_gate = 1.0
-                - smoothstep_range(
-                    ADAPTIVE_VIBRANCE_TEXTURE_START,
-                    ADAPTIVE_VIBRANCE_TEXTURE_END,
-                    texture,
-                );
-            let neutral_gate = smoothstep_range(
-                ADAPTIVE_VIBRANCE_NEUTRAL_START,
-                ADAPTIVE_VIBRANCE_NEUTRAL_FULL,
-                saturation,
-            );
-            let saturation_gate = 1.0
-                - smoothstep_range(
-                    ADAPTIVE_VIBRANCE_SATURATION_START,
-                    ADAPTIVE_VIBRANCE_SATURATION_END,
-                    saturation,
-                );
-            let luminance_gate = smoothstep_range(
-                ADAPTIVE_VIBRANCE_SHADOW_START,
-                ADAPTIVE_VIBRANCE_SHADOW_FULL,
-                luminance,
-            ) * (1.0
-                - smoothstep_range(
-                    ADAPTIVE_VIBRANCE_HIGHLIGHT_START,
-                    ADAPTIVE_VIBRANCE_HIGHLIGHT_END,
-                    luminance,
-                ));
-            let requested_scale = (1.0
-                + ADAPTIVE_VIBRANCE_AMOUNT
-                    * neutral_gate
-                    * saturation_gate
-                    * luminance_gate
-                    * texture_gate)
-                .min(ADAPTIVE_VIBRANCE_MAX_SCALE);
-            let gamut_scale = max_chroma_scale_inside_gamut(rgb, luminance);
-            let scale = requested_scale.min(gamut_scale);
-            if texture_gate < 0.5 {
-                texture_limited += 1;
-            }
-            if requested_scale > gamut_scale + 1e-12 {
-                gamut_limited += 1;
-            }
-            if scale > 1.002 {
-                applied += 1;
-                sum_scale += scale;
-                max_applied_scale = max_applied_scale.max(scale);
+            let start = x.saturating_sub(radius);
+            let end = (x + radius + 1).min(width);
+            horizontal[y * width + x] = (start..end)
+                .map(|sample_x| source[y * width + sample_x])
+                .fold(0.0f32, f32::max);
+        }
+    }
+    for y in 0..height {
+        let start = y.saturating_sub(radius);
+        let end = (y + radius + 1).min(height);
+        for x in 0..width {
+            destination[y * width + x] = (start..end)
+                .map(|sample_y| horizontal[sample_y * width + x])
+                .fold(0.0f32, f32::max);
+        }
+    }
+}
+
+fn collect_grain_detail_probes(
+    luminance: &[f32],
+    opponent_a: &[f32],
+    opponent_b: &[f32],
+    height: usize,
+    width: usize,
+    radius: usize,
+) -> (usize, Vec<GrainLuminanceProbe>, Vec<GrainChromaProbe>) {
+    let outer_radius = radius.saturating_mul(2);
+    if outer_radius == 0 || height <= outer_radius * 2 || width <= outer_radius * 2 {
+        return (1, Vec::new(), Vec::new());
+    }
+    let interior_height = height - outer_radius * 2;
+    let interior_width = width - outer_radius * 2;
+    let interior_pixels = interior_height.saturating_mul(interior_width);
+    let sample_stride = interior_pixels.div_ceil(GRAIN_DETAIL_MAX_PROBES).max(1);
+    let capacity = interior_pixels
+        .div_ceil(sample_stride)
+        .min(GRAIN_DETAIL_MAX_PROBES);
+    let mut luminance_probes = Vec::with_capacity(capacity / 2);
+    let mut chroma_probes = Vec::with_capacity(capacity / 2);
+
+    for y in outer_radius..(height - outer_radius) {
+        for x in outer_radius..(width - outer_radius) {
+            let sample_index = (y - outer_radius) * interior_width + (x - outer_radius);
+            if !sample_index.is_multiple_of(sample_stride) {
+                continue;
             }
 
-            for c in 0..channels {
-                if c < 3 {
-                    out[[y, x, c]] = (luminance + (rgb[c] - luminance) * scale).clamp(0.0, 1.0);
+            let horizontal_luma =
+                scalar_axis_delta(luminance, width, y, x, radius, GrainDetailAxis::Horizontal);
+            let vertical_luma =
+                scalar_axis_delta(luminance, width, y, x, radius, GrainDetailAxis::Vertical);
+            let (luma_axis, luma_inner) = if horizontal_luma.abs() >= vertical_luma.abs() {
+                (GrainDetailAxis::Horizontal, horizontal_luma)
+            } else {
+                (GrainDetailAxis::Vertical, vertical_luma)
+            };
+            let luma_outer = scalar_axis_delta(luminance, width, y, x, outer_radius, luma_axis);
+            if luma_inner.abs() >= GRAIN_DETAIL_LUMA_CONTRAST_MIN
+                && luma_outer.abs() >= GRAIN_DETAIL_LUMA_CONTRAST_MIN
+                && scalar_multiscale_coherent(luma_inner, luma_outer)
+            {
+                luminance_probes.push(GrainLuminanceProbe {
+                    y,
+                    x,
+                    radius,
+                    axis: luma_axis,
+                    pre_delta: luma_inner,
+                });
+            }
+
+            let horizontal_chroma = opponent_axis_delta(
+                opponent_a,
+                opponent_b,
+                width,
+                y,
+                x,
+                radius,
+                GrainDetailAxis::Horizontal,
+            );
+            let vertical_chroma = opponent_axis_delta(
+                opponent_a,
+                opponent_b,
+                width,
+                y,
+                x,
+                radius,
+                GrainDetailAxis::Vertical,
+            );
+            let (chroma_axis, chroma_inner) =
+                if opponent_norm(horizontal_chroma) >= opponent_norm(vertical_chroma) {
+                    (GrainDetailAxis::Horizontal, horizontal_chroma)
                 } else {
-                    out[[y, x, c]] = img[[y, x, c]];
-                }
+                    (GrainDetailAxis::Vertical, vertical_chroma)
+                };
+            let chroma_outer = opponent_axis_delta(
+                opponent_a,
+                opponent_b,
+                width,
+                y,
+                x,
+                outer_radius,
+                chroma_axis,
+            );
+            if opponent_norm(chroma_inner) >= GRAIN_DETAIL_CHROMA_CONTRAST_MIN
+                && opponent_norm(chroma_outer) >= GRAIN_DETAIL_CHROMA_CONTRAST_MIN
+                && opponent_multiscale_coherent(chroma_inner, chroma_outer)
+            {
+                chroma_probes.push(GrainChromaProbe {
+                    y,
+                    x,
+                    radius,
+                    axis: chroma_axis,
+                    pre_delta: chroma_inner,
+                });
             }
         }
     }
 
-    let denom = height.saturating_mul(width).max(1) as f64;
-    (
-        out,
-        AdaptiveVibranceDiagnostics {
-            enabled: true,
-            reason: "trusted color path received bounded hue-preserving adaptive vibrance"
-                .to_string(),
-            amount: ADAPTIVE_VIBRANCE_AMOUNT,
-            max_scale: ADAPTIVE_VIBRANCE_MAX_SCALE,
-            applied_ratio: applied as f64 / denom,
-            mean_scale: if applied == 0 {
-                1.0
-            } else {
-                sum_scale / applied as f64
-            },
-            max_applied_scale,
-            texture_limited_ratio: texture_limited as f64 / denom,
-            gamut_limited_ratio: gamut_limited as f64 / denom,
-        },
+    (sample_stride, luminance_probes, chroma_probes)
+}
+
+fn image_luminance_at(img: &Array3<f64>, y: usize, x: usize) -> f64 {
+    linear_luminance(
+        img[[y, x, 0]].clamp(0.0, 1.0),
+        img[[y, x, 1]].clamp(0.0, 1.0),
+        img[[y, x, 2]].clamp(0.0, 1.0),
     )
 }
 
-fn apply_render_noise_reduction(
+fn image_opponent_at(img: &Array3<f64>, y: usize, x: usize) -> [f64; 2] {
+    let red = img[[y, x, 0]].clamp(0.0, 1.0);
+    let green = img[[y, x, 1]].clamp(0.0, 1.0);
+    let blue = img[[y, x, 2]].clamp(0.0, 1.0);
+    [red - green, blue - 0.5 * (red + green)]
+}
+
+fn post_luminance_probe_delta(img: &Array3<f64>, probe: GrainLuminanceProbe) -> f64 {
+    match probe.axis {
+        GrainDetailAxis::Horizontal => {
+            image_luminance_at(img, probe.y, probe.x + probe.radius)
+                - image_luminance_at(img, probe.y, probe.x - probe.radius)
+        }
+        GrainDetailAxis::Vertical => {
+            image_luminance_at(img, probe.y + probe.radius, probe.x)
+                - image_luminance_at(img, probe.y - probe.radius, probe.x)
+        }
+    }
+}
+
+fn post_chroma_probe_delta(img: &Array3<f64>, probe: GrainChromaProbe) -> [f64; 2] {
+    let (positive, negative) = match probe.axis {
+        GrainDetailAxis::Horizontal => (
+            image_opponent_at(img, probe.y, probe.x + probe.radius),
+            image_opponent_at(img, probe.y, probe.x - probe.radius),
+        ),
+        GrainDetailAxis::Vertical => (
+            image_opponent_at(img, probe.y + probe.radius, probe.x),
+            image_opponent_at(img, probe.y - probe.radius, probe.x),
+        ),
+    };
+    [positive[0] - negative[0], positive[1] - negative[1]]
+}
+
+fn evaluate_grain_detail_retention(
     img: &Array3<f64>,
+    sample_stride: usize,
+    probe_radius: usize,
+    luminance_probes: &[GrainLuminanceProbe],
+    chroma_probes: &[GrainChromaProbe],
+) -> GrainDetailRetentionDiagnostics {
+    let mut luminance_retention = luminance_probes
+        .iter()
+        .map(|probe| {
+            (post_luminance_probe_delta(img, *probe) / probe.pre_delta)
+                .clamp(0.0, GRAIN_DETAIL_RETENTION_RATIO_MAX)
+        })
+        .collect::<Vec<_>>();
+    let mut chroma_retention = chroma_probes
+        .iter()
+        .map(|probe| {
+            let post = post_chroma_probe_delta(img, *probe);
+            let pre_norm_squared =
+                probe.pre_delta[0] * probe.pre_delta[0] + probe.pre_delta[1] * probe.pre_delta[1];
+            ((post[0] * probe.pre_delta[0] + post[1] * probe.pre_delta[1])
+                / pre_norm_squared.max(1e-12))
+            .clamp(0.0, GRAIN_DETAIL_RETENTION_RATIO_MAX)
+        })
+        .collect::<Vec<_>>();
+    luminance_retention.sort_by(|a, b| a.total_cmp(b));
+    chroma_retention.sort_by(|a, b| a.total_cmp(b));
+
+    let luminance_decision_supported = luminance_retention.len() >= GRAIN_DETAIL_MIN_PROBE_COUNT;
+    let chroma_decision_supported = chroma_retention.len() >= GRAIN_DETAIL_MIN_PROBE_COUNT;
+    let decision_supported = luminance_decision_supported || chroma_decision_supported;
+    let luminance_median_retention = if luminance_retention.is_empty() {
+        1.0
+    } else {
+        percentile_from_sorted_values(&luminance_retention, 0.50)
+    };
+    let luminance_p10_retention = if luminance_retention.is_empty() {
+        1.0
+    } else {
+        percentile_from_sorted_values(&luminance_retention, 0.10)
+    };
+    let chroma_median_retention = if chroma_retention.is_empty() {
+        1.0
+    } else {
+        percentile_from_sorted_values(&chroma_retention, 0.50)
+    };
+    let chroma_p10_retention = if chroma_retention.is_empty() {
+        1.0
+    } else {
+        percentile_from_sorted_values(&chroma_retention, 0.10)
+    };
+
+    let mut failures = Vec::<String>::new();
+    if luminance_decision_supported
+        && (luminance_median_retention < GRAIN_DETAIL_MEDIAN_RETENTION_MIN
+            || luminance_p10_retention < GRAIN_DETAIL_P10_RETENTION_MIN)
+    {
+        failures.push(format!(
+            "coherent luminance detail retention fell to median {:.3}, p10 {:.3}",
+            luminance_median_retention, luminance_p10_retention
+        ));
+    }
+    if chroma_decision_supported
+        && (chroma_median_retention < GRAIN_DETAIL_MEDIAN_RETENTION_MIN
+            || chroma_p10_retention < GRAIN_DETAIL_P10_RETENTION_MIN)
+    {
+        failures.push(format!(
+            "coherent opponent-color detail retention fell to median {:.3}, p10 {:.3}",
+            chroma_median_retention, chroma_p10_retention
+        ));
+    }
+    let review_required = !failures.is_empty();
+    let reason = if review_required {
+        format!(
+            "grain reduction exceeded conservative structured-detail loss limits: {}",
+            failures.join("; ")
+        )
+    } else if decision_supported {
+        format!(
+            "coherent pre/post detail probes passed; luminance support={}, chroma support={}",
+            luminance_decision_supported, chroma_decision_supported
+        )
+    } else {
+        "no sufficiently strong multiscale-coherent edge population was present; detail retention is reported as unsupported rather than trusted".to_string()
+    };
+
+    GrainDetailRetentionDiagnostics {
+        method: "coherent_multiscale_opponent_edge_retention_v1",
+        evaluated: true,
+        decision_supported,
+        sample_stride,
+        probe_radius,
+        minimum_probe_count: GRAIN_DETAIL_MIN_PROBE_COUNT,
+        luminance_probe_count: luminance_retention.len(),
+        chroma_probe_count: chroma_retention.len(),
+        luminance_decision_supported,
+        chroma_decision_supported,
+        luminance_median_retention,
+        luminance_p10_retention,
+        chroma_median_retention,
+        chroma_p10_retention,
+        luminance_contrast_threshold: GRAIN_DETAIL_LUMA_CONTRAST_MIN,
+        chroma_contrast_threshold: GRAIN_DETAIL_CHROMA_CONTRAST_MIN,
+        coherence_threshold: GRAIN_DETAIL_COHERENCE_MIN,
+        median_retention_threshold: GRAIN_DETAIL_MEDIAN_RETENTION_MIN,
+        p10_retention_threshold: GRAIN_DETAIL_P10_RETENTION_MIN,
+        review_required,
+        reason: reason.clone(),
+        review_reason: review_required.then_some(reason),
+    }
+}
+
+fn apply_render_noise_reduction(
+    mut img: Array3<f64>,
+    settings: GrainReductionSettings,
+    pre_noise: &RenderGrainDiagnostics,
 ) -> (Array3<f64>, RenderNoiseReductionDiagnostics) {
+    let settings = settings.normalized();
+    if !settings.enabled {
+        return (
+            img,
+            RenderNoiseReductionDiagnostics::disabled(
+                settings,
+                "disabled by the independent film-grain control",
+            ),
+        );
+    }
+    if settings.strength <= f64::EPSILON {
+        return (
+            img,
+            RenderNoiseReductionDiagnostics::disabled(
+                settings,
+                "enabled with zero strength, so no grain reduction was applied",
+            ),
+        );
+    }
     let (height, width, channels) = img.dim();
     if channels < 3 {
         return (
-            img.clone(),
+            img,
             RenderNoiseReductionDiagnostics::disabled(
+                settings,
                 "render noise reduction requires at least three channels",
             ),
         );
     }
-    let required_radius = RENDER_NOISE_REDUCTION_RADIUS.max(RENDER_NOISE_REDUCTION_CHROMA_RADIUS);
+    let luminance_radius = settings.effective_radius();
+    let chroma_radius = ((RENDER_NOISE_REDUCTION_CHROMA_RADIUS as f64 * settings.scale).round()
+        as usize)
+        .clamp(1, 8);
+    let required_radius = luminance_radius.max(chroma_radius);
     if height < required_radius * 2 + 1 || width < required_radius * 2 + 1 {
         return (
-            img.clone(),
+            img,
             RenderNoiseReductionDiagnostics::disabled(
+                settings,
                 "image is smaller than the render noise reduction window",
             ),
         );
@@ -1424,7 +3099,6 @@ fn apply_render_noise_reduction(
         }
     }
 
-    let pre_noise = render_grain_diagnostics(img);
     let frame_chroma_grain = pre_noise
         .flat_chroma_residual_p95
         .max(pre_noise.chroma_residual_p95 * 0.65);
@@ -1434,12 +3108,48 @@ fn apply_render_noise_reduction(
         frame_chroma_grain,
     );
 
-    let blurred_luminance =
-        box_blur_luminance(&luminance, height, width, RENDER_NOISE_REDUCTION_RADIUS);
+    let blurred_luminance = box_blur_luminance(&luminance, height, width, luminance_radius);
     let mut adjusted_luminance = vec![0.0f32; pixel_count];
     let mut chroma_strength = vec![0.0f32; pixel_count];
     let mut chroma_damping = vec![0.0f32; pixel_count];
+    for y in 0..height {
+        for x in 0..width {
+            let idx = y * width + x;
+            let red = img[[y, x, 0]].clamp(0.0, 1.0);
+            let green = img[[y, x, 1]].clamp(0.0, 1.0);
+            let blue = img[[y, x, 2]].clamp(0.0, 1.0);
+            chroma_strength[idx] = (red - green) as f32;
+            chroma_damping[idx] = (blue - 0.5 * (red + green)) as f32;
+        }
+    }
+    populate_coherent_chroma_structure(
+        &chroma_strength,
+        &chroma_damping,
+        &mut adjusted_luminance,
+        height,
+        width,
+        luminance_radius,
+    );
+    let (detail_sample_stride, luminance_detail_probes, chroma_detail_probes) =
+        collect_grain_detail_probes(
+            &luminance,
+            &chroma_strength,
+            &chroma_damping,
+            height,
+            width,
+            luminance_radius,
+        );
+    dilate_structure_max(
+        &adjusted_luminance,
+        &mut chroma_strength,
+        &mut chroma_damping,
+        height,
+        width,
+        required_radius,
+    );
+    std::mem::swap(&mut adjusted_luminance, &mut chroma_damping);
     let mut applied = 0usize;
+    let mut structure_excluded = 0usize;
     let mut texture_limited = 0usize;
     let mut saturation_limited = 0usize;
     let mut luma_delta_sum = 0.0f64;
@@ -1457,18 +3167,22 @@ fn apply_render_noise_reduction(
             ];
             let saturation = rgb_saturation(rgb);
             let detail_residual = (lum - local_lum).abs();
+            let coherent_chroma_structure = adjusted_luminance[idx] as f64;
             let structure = smoothed_luminance_structure(
                 &blurred_luminance,
                 height,
                 width,
                 y,
                 x,
-                RENDER_NOISE_REDUCTION_RADIUS,
+                luminance_radius,
             )
             .unwrap_or(detail_residual);
-            let chroma_texture = detail_residual.min(
-                structure + detail_residual * RENDER_NOISE_REDUCTION_CHROMA_TEXTURE_RESIDUAL_WEIGHT,
-            );
+            let chroma_texture = detail_residual
+                .min(
+                    structure
+                        + detail_residual * RENDER_NOISE_REDUCTION_CHROMA_TEXTURE_RESIDUAL_WEIGHT,
+                )
+                .max(coherent_chroma_structure);
             let luma_noise_texture =
                 structure + detail_residual * RENDER_NOISE_REDUCTION_LUMA_TEXTURE_RESIDUAL_WEIGHT;
             let chroma_texture_gate = 1.0
@@ -1511,36 +3225,68 @@ fn apply_render_noise_reduction(
                     RENDER_NOISE_REDUCTION_NEUTRAL_FLOOR_HIGHLIGHT_END,
                     lum,
                 );
-            let chroma_texture_for_chroma = chroma_texture_gate.max(
-                RENDER_NOISE_REDUCTION_NEUTRAL_TEXTURE_FLOOR
-                    * effective_saturation_gate
-                    * neutral_floor_luma_gate,
+            let coherent_chroma_protection = smoothstep_range(
+                RENDER_NOISE_REDUCTION_TEXTURE_START,
+                RENDER_NOISE_REDUCTION_TEXTURE_END,
+                coherent_chroma_structure,
             );
-            let chroma_gate = chroma_texture_for_chroma
-                * (RENDER_NOISE_REDUCTION_SATURATION_GATE_FLOOR
-                    + (1.0 - RENDER_NOISE_REDUCTION_SATURATION_GATE_FLOOR)
-                        * effective_saturation_gate)
-                * (0.70 + 0.30 * shadow_gate);
-            let luma_texture_for_luma =
-                luma_texture_gate.max(RENDER_NOISE_REDUCTION_LUMA_TEXTURE_FLOOR * luma_noise_gate);
-            let luma_gate = luma_texture_for_luma * (0.35 + 0.65 * shadow_gate);
-            let chroma = RENDER_NOISE_REDUCTION_CHROMA_AMOUNT * chroma_gate;
-            let luma = RENDER_NOISE_REDUCTION_LUMA_AMOUNT * luma_gate;
-            let damp = frame_chroma_damping
-                * RENDER_NOISE_REDUCTION_CHROMA_DAMP_AMOUNT
-                * chroma_texture_for_chroma
-                * (0.70 + 0.30 * shadow_gate);
-            let new_lum = lum * (1.0 - luma) + local_lum * luma;
-            let luma_delta = (new_lum - lum).abs();
-
-            if chroma > 0.02 || luma > 0.01 {
-                applied += 1;
-            }
+            let structure_gate = 1.0
+                - smoothstep_range(
+                    RENDER_NOISE_REDUCTION_STRUCTURE_GATE_START,
+                    RENDER_NOISE_REDUCTION_STRUCTURE_GATE_END,
+                    structure.max(coherent_chroma_structure),
+                );
             if chroma_texture_gate < 0.5 || luma_texture_gate < 0.5 {
                 texture_limited += 1;
             }
             if effective_saturation_gate < 0.5 {
                 saturation_limited += 1;
+            }
+            let complete_filter_window = y >= required_radius
+                && y + required_radius < height
+                && x >= required_radius
+                && x + required_radius < width;
+            if !complete_filter_window || structure_gate <= f64::EPSILON {
+                // The negative sentinel prevents even f32 luminance/residual round-tripping from
+                // changing a protected output pixel or an incompletely supported boundary pixel
+                // in the channel reconstruction loop below.
+                structure_excluded += 1;
+                adjusted_luminance[idx] = luminance[idx];
+                chroma_strength[idx] = -1.0;
+                chroma_damping[idx] = 0.0;
+                continue;
+            }
+            let chroma_texture_for_chroma = chroma_texture_gate.max(
+                RENDER_NOISE_REDUCTION_NEUTRAL_TEXTURE_FLOOR
+                    * effective_saturation_gate
+                    * neutral_floor_luma_gate
+                    * (1.0 - coherent_chroma_protection),
+            );
+            let chroma_gate = chroma_texture_for_chroma
+                * (RENDER_NOISE_REDUCTION_SATURATION_GATE_FLOOR
+                    + (1.0 - RENDER_NOISE_REDUCTION_SATURATION_GATE_FLOOR)
+                        * effective_saturation_gate)
+                * (0.70 + 0.30 * shadow_gate)
+                * structure_gate;
+            let luma_texture_for_luma =
+                luma_texture_gate.max(RENDER_NOISE_REDUCTION_LUMA_TEXTURE_FLOOR * luma_noise_gate);
+            let luma_gate = luma_texture_for_luma * (0.35 + 0.65 * shadow_gate) * structure_gate;
+            let chroma = RENDER_NOISE_REDUCTION_CHROMA_AMOUNT * settings.strength * chroma_gate;
+            let luma = RENDER_NOISE_REDUCTION_LUMA_AMOUNT * settings.strength * luma_gate;
+            let damp = frame_chroma_damping
+                * RENDER_NOISE_REDUCTION_CHROMA_DAMP_AMOUNT
+                * settings.strength
+                * chroma_texture_for_chroma
+                * (0.70 + 0.30 * shadow_gate)
+                * (RENDER_NOISE_REDUCTION_SATURATION_GATE_FLOOR
+                    + (1.0 - RENDER_NOISE_REDUCTION_SATURATION_GATE_FLOOR)
+                        * effective_saturation_gate)
+                * structure_gate;
+            let new_lum = lum * (1.0 - luma) + local_lum * luma;
+            let luma_delta = (new_lum - lum).abs();
+
+            if chroma > 0.02 || luma > 0.01 {
+                applied += 1;
             }
             luma_delta_sum += luma_delta;
             luma_delta_max = luma_delta_max.max(luma_delta);
@@ -1550,7 +3296,6 @@ fn apply_render_noise_reduction(
         }
     }
 
-    let mut out = Array3::<f64>::zeros((height, width, channels));
     let mut chroma_delta_sum = 0.0f64;
     let mut chroma_delta_max = 0.0f64;
     let mut residual = vec![0.0f32; pixel_count];
@@ -1562,60 +3307,70 @@ fn apply_render_noise_reduction(
                     (img[[y, x, channel]].clamp(0.0, 1.0) - luminance[idx] as f64) as f32;
             }
         }
-        let blurred_residual = box_blur_luminance(
-            &residual,
-            height,
-            width,
-            RENDER_NOISE_REDUCTION_CHROMA_RADIUS,
-        );
+        let blurred_residual = box_blur_luminance(&residual, height, width, chroma_radius);
         for y in 0..height {
             for x in 0..width {
                 let idx = y * width + x;
                 let strength = chroma_strength[idx] as f64;
+                if strength < 0.0 {
+                    continue;
+                }
                 let base_residual = residual[idx] as f64;
                 let smoothed_residual =
                     base_residual * (1.0 - strength) + blurred_residual[idx] as f64 * strength;
-                let damped_residual =
-                    smoothed_residual * (1.0 - chroma_damping[idx] as f64).clamp(0.0, 1.0);
+                // Frame-level grain evidence may increase suppression of the local high-frequency
+                // residual, but it must never scale the locally blurred chroma base. Scaling the
+                // whole opponent residual would be global desaturation rather than denoising.
+                let local_chroma_base = blurred_residual[idx] as f64;
+                let damped_residual = local_chroma_base
+                    + (smoothed_residual - local_chroma_base)
+                        * (1.0 - chroma_damping[idx] as f64).clamp(0.0, 1.0);
                 let chroma_delta = (damped_residual - base_residual).abs();
                 chroma_delta_sum += chroma_delta;
                 chroma_delta_max = chroma_delta_max.max(chroma_delta);
-                out[[y, x, channel]] =
+                img[[y, x, channel]] =
                     (adjusted_luminance[idx] as f64 + damped_residual).clamp(0.0, 1.0);
-            }
-        }
-    }
-    for channel in 3..channels {
-        for y in 0..height {
-            for x in 0..width {
-                out[[y, x, channel]] = img[[y, x, channel]];
             }
         }
     }
 
     let denom = pixel_count.max(1) as f64;
     let chroma_denom = (pixel_count.max(1) * 3) as f64;
+    let detail_retention = evaluate_grain_detail_retention(
+        &img,
+        detail_sample_stride,
+        luminance_radius,
+        &luminance_detail_probes,
+        &chroma_detail_probes,
+    );
     (
-        out,
+        img,
         RenderNoiseReductionDiagnostics {
             enabled: true,
-            reason: "edge-aware final render denoise smoothed chroma residuals and mild shadow luminance noise while preserving local luminance structure".to_string(),
+            requested_enabled: true,
+            reason: "independently requested edge-aware film-grain reduction smoothed selected chroma residuals and mild shadow luminance noise, exactly excluded multiscale structure and incomplete boundary windows, and reduced chroma smoothing in saturated non-shadow regions".to_string(),
+            requested_strength: settings.strength,
+            requested_scale: settings.scale,
             radius: required_radius,
-            chroma_amount: RENDER_NOISE_REDUCTION_CHROMA_AMOUNT,
-            luma_amount: RENDER_NOISE_REDUCTION_LUMA_AMOUNT,
+            chroma_amount: RENDER_NOISE_REDUCTION_CHROMA_AMOUNT * settings.strength,
+            luma_amount: RENDER_NOISE_REDUCTION_LUMA_AMOUNT * settings.strength,
             applied_ratio: applied as f64 / denom,
+            structure_gate_start: RENDER_NOISE_REDUCTION_STRUCTURE_GATE_START,
+            structure_gate_end: RENDER_NOISE_REDUCTION_STRUCTURE_GATE_END,
+            structure_excluded_ratio: structure_excluded as f64 / denom,
             texture_limited_ratio: texture_limited as f64 / denom,
             saturation_limited_ratio: saturation_limited as f64 / denom,
             mean_abs_chroma_delta: chroma_delta_sum / chroma_denom,
             max_abs_chroma_delta: chroma_delta_max,
             mean_abs_luma_delta: luma_delta_sum / denom,
             max_abs_luma_delta: luma_delta_max,
+            detail_retention,
         },
     )
 }
 
 fn apply_local_luminance_detail(
-    img: &Array3<f64>,
+    mut img: Array3<f64>,
 ) -> (Array3<f64>, LocalLuminanceDetailDiagnostics) {
     let (height, width, channels) = img.dim();
     let base_diagnostics = LocalLuminanceDetailDiagnostics {
@@ -1632,7 +3387,7 @@ fn apply_local_luminance_detail(
     if height < LOCAL_LUMINANCE_DETAIL_RADIUS * 2 + 1
         || width < LOCAL_LUMINANCE_DETAIL_RADIUS * 2 + 1
     {
-        return (img.clone(), base_diagnostics);
+        return (img, base_diagnostics);
     }
 
     let pixel_count = height * width;
@@ -1649,7 +3404,6 @@ fn apply_local_luminance_detail(
     }
 
     let blurred = box_blur_luminance(&luminance, height, width, LOCAL_LUMINANCE_DETAIL_RADIUS);
-    let mut out = Array3::<f64>::zeros((height, width, channels));
     let mut applied = 0usize;
     let mut headroom_limited = 0usize;
     let mut clip_limited = 0usize;
@@ -1727,14 +3481,14 @@ fn apply_local_luminance_detail(
                 max_abs_ev = max_abs_ev.max(abs_ev);
             }
             for c in 0..channels {
-                out[[y, x, c]] = (img[[y, x, c]].clamp(0.0, 1.0) * scale).clamp(0.0, 1.0);
+                img[[y, x, c]] = (img[[y, x, c]].clamp(0.0, 1.0) * scale).clamp(0.0, 1.0);
             }
         }
     }
 
     let denom = pixel_count.max(1) as f64;
     (
-        out,
+        img,
         LocalLuminanceDetailDiagnostics {
             enabled: true,
             radius: LOCAL_LUMINANCE_DETAIL_RADIUS,
@@ -1776,15 +3530,14 @@ fn compress_highlight_neutral_chroma(rgb: [f64; 3], mapped_lum: f64) -> ([f64; 3
     (compressed, chroma_scale < 1.0 - 1e-12)
 }
 
-fn apply_highlight_neutral_chroma_cleanup(img: &Array3<f64>) -> (Array3<f64>, usize) {
+fn apply_highlight_neutral_chroma_cleanup(mut img: Array3<f64>) -> (Array3<f64>, usize) {
     let (_, width, channels) = img.dim();
     if channels < 3 {
-        return (img.clone(), 0);
+        return (img, 0);
     }
 
-    let mut out = img.clone();
     let compressed_pixels = AtomicU64::new(0);
-    out.axis_chunks_iter_mut(Axis(0), 512)
+    img.axis_chunks_iter_mut(Axis(0), 512)
         .into_par_iter()
         .for_each(|mut chunk| {
             let chunk_h = chunk.dim().0;
@@ -1807,7 +3560,7 @@ fn apply_highlight_neutral_chroma_cleanup(img: &Array3<f64>) -> (Array3<f64>, us
             }
         });
 
-    (out, compressed_pixels.load(Ordering::Relaxed) as usize)
+    (img, compressed_pixels.load(Ordering::Relaxed) as usize)
 }
 
 fn compress_shadow_chroma(rgb: [f64; 3], mapped_lum: f64) -> ([f64; 3], bool) {
@@ -1861,15 +3614,14 @@ fn limit_midtone_neutral_chroma(rgb: [f64; 3], luminance: f64) -> ([f64; 3], boo
     (limited, chroma_scale < 1.0 - 1e-12)
 }
 
-fn apply_midtone_neutral_chroma_cleanup(img: &Array3<f64>) -> (Array3<f64>, usize) {
+fn apply_midtone_neutral_chroma_cleanup(mut img: Array3<f64>) -> (Array3<f64>, usize) {
     let (_, width, channels) = img.dim();
     if channels < 3 {
-        return (img.clone(), 0);
+        return (img, 0);
     }
 
-    let mut out = img.clone();
     let compressed_pixels = AtomicU64::new(0);
-    out.axis_chunks_iter_mut(Axis(0), 512)
+    img.axis_chunks_iter_mut(Axis(0), 512)
         .into_par_iter()
         .for_each(|mut chunk| {
             let chunk_h = chunk.dim().0;
@@ -1892,7 +3644,7 @@ fn apply_midtone_neutral_chroma_cleanup(img: &Array3<f64>) -> (Array3<f64>, usiz
             }
         });
 
-    (out, compressed_pixels.load(Ordering::Relaxed) as usize)
+    (img, compressed_pixels.load(Ordering::Relaxed) as usize)
 }
 
 fn shadow_saturation_guard_max(luminance: f64) -> f64 {
@@ -1929,15 +3681,14 @@ fn limit_shadow_saturation(rgb: [f64; 3], luminance: f64) -> ([f64; 3], bool) {
     (limited, low < 1.0 - 1e-12)
 }
 
-fn apply_shadow_saturation_guard(img: &Array3<f64>) -> (Array3<f64>, usize) {
+fn apply_shadow_saturation_guard(mut img: Array3<f64>) -> (Array3<f64>, usize) {
     let (_, width, channels) = img.dim();
     if channels < 3 {
-        return (img.clone(), 0);
+        return (img, 0);
     }
 
-    let mut out = img.clone();
     let limited_pixels = AtomicU64::new(0);
-    out.axis_chunks_iter_mut(Axis(0), 512)
+    img.axis_chunks_iter_mut(Axis(0), 512)
         .into_par_iter()
         .for_each(|mut chunk| {
             let chunk_h = chunk.dim().0;
@@ -1960,7 +3711,7 @@ fn apply_shadow_saturation_guard(img: &Array3<f64>) -> (Array3<f64>, usize) {
             }
         });
 
-    (out, limited_pixels.load(Ordering::Relaxed) as usize)
+    (img, limited_pixels.load(Ordering::Relaxed) as usize)
 }
 
 fn histogram_bin(value: f64, range_max: f64) -> usize {
@@ -2301,6 +4052,13 @@ pub fn positive_scan_auto_exposure_ev(img: &Array3<f64>) -> f64 {
     exposure_scale.log2().min(0.0)
 }
 
+/// Pre-tone linear luminance percentiles `[p5, p50, p95]` of a scene-referred buffer —
+/// the statistics that drive auto exposure, surfaced for diagnostics.
+pub fn tone_input_linear_percentiles(img: &Array3<f64>) -> [f64; 3] {
+    let (_, input_linear_percentiles, _) = tone_input_percentiles(img);
+    input_linear_percentiles
+}
+
 /// Fit tone curve parameters from an image by analyzing a perceptually compressed
 /// luminance histogram derived from linear ProPhoto RGB.
 pub fn fit_tone_params_with_diagnostics(img: &Array3<f64>) -> ToneFitResult {
@@ -2537,14 +4295,66 @@ pub fn apply_tonemap_with_params_color_protection_and_style_diagnostics(
     color_protection: &ToneColorProtection,
     render_style: RenderStyle,
 ) -> TonemapApplyResult {
-    let shape = img.shape();
+    apply_tonemap_with_params_color_protection_style_and_grain_diagnostics(
+        img,
+        params,
+        color_protection,
+        render_style,
+        GrainReductionSettings::default(),
+    )
+}
+
+pub fn apply_tonemap_with_params_color_protection_style_and_grain_diagnostics(
+    img: &Array3<f64>,
+    params: &ToneCurveParams,
+    color_protection: &ToneColorProtection,
+    render_style: RenderStyle,
+    grain_reduction: GrainReductionSettings,
+) -> TonemapApplyResult {
+    let result = Array3::<f64>::zeros(img.raw_dim());
+    apply_tonemap_to_owned_buffer(
+        Some(img),
+        result,
+        params,
+        color_protection,
+        render_style,
+        grain_reduction,
+    )
+}
+
+pub fn apply_tonemap_owned_with_params_color_protection_style_and_grain_diagnostics(
+    img: Array3<f64>,
+    params: &ToneCurveParams,
+    color_protection: &ToneColorProtection,
+    render_style: RenderStyle,
+    grain_reduction: GrainReductionSettings,
+) -> TonemapApplyResult {
+    apply_tonemap_to_owned_buffer(
+        None,
+        img,
+        params,
+        color_protection,
+        render_style,
+        grain_reduction,
+    )
+}
+
+fn apply_tonemap_to_owned_buffer(
+    source: Option<&Array3<f64>>,
+    mut result: Array3<f64>,
+    params: &ToneCurveParams,
+    color_protection: &ToneColorProtection,
+    render_style: RenderStyle,
+    grain_reduction: GrainReductionSettings,
+) -> TonemapApplyResult {
+    let shape = result.shape();
     let h = shape[0];
     let w = shape[1];
-    let c = shape[2];
     let processing_config = render_style.processing_config();
 
-    let mut result = Array3::<f64>::zeros((h, w, c));
     let compressed_pixels = AtomicU64::new(0);
+    let gamut_chroma_scale_sum = AtomicU64::new(0);
+    let gamut_chroma_scale_min = AtomicU64::new(u64::MAX);
     let highlight_neutral_compressed_pixels = AtomicU64::new(0);
     let shadow_compressed_pixels = AtomicU64::new(0);
     let pre_high_clipped = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
@@ -2561,9 +4371,15 @@ pub fn apply_tonemap_with_params_color_protection_and_style_diagnostics(
             for local_y in 0..chunk_h {
                 let y = row_start + local_y;
                 for x in 0..w {
-                    let r = img[[y, x, 0]];
-                    let g = img[[y, x, 1]];
-                    let b = img[[y, x, 2]];
+                    let (r, g, b) = if let Some(img) = source {
+                        (img[[y, x, 0]], img[[y, x, 1]], img[[y, x, 2]])
+                    } else {
+                        (
+                            out_chunk[[local_y, x, 0]],
+                            out_chunk[[local_y, x, 1]],
+                            out_chunk[[local_y, x, 2]],
+                        )
+                    };
                     let linear_lum = linear_luminance(r, g, b);
                     let mapped_linear = match params.domain {
                         ToneFitDomain::LinearLuminance => apply_tone_curve(linear_lum, params),
@@ -2585,10 +4401,14 @@ pub fn apply_tonemap_with_params_color_protection_and_style_diagnostics(
                         }
                     }
 
-                    let (mapped, compressed) =
+                    let (mapped, compressed, perceptual_chroma_scale) =
                         compress_highlight_chroma(scaled, mapped_linear, params.shoulder_max);
                     if compressed {
                         compressed_pixels.fetch_add(1, Ordering::Relaxed);
+                        let quantized =
+                            (perceptual_chroma_scale.clamp(0.0, 1.0) * 1e9).round() as u64;
+                        gamut_chroma_scale_sum.fetch_add(quantized, Ordering::Relaxed);
+                        gamut_chroma_scale_min.fetch_min(quantized, Ordering::Relaxed);
                     }
                     let (mapped, highlight_neutral_compressed) =
                         if color_protection.highlight_neutral_chroma_enabled {
@@ -2623,51 +4443,89 @@ pub fn apply_tonemap_with_params_color_protection_and_style_diagnostics(
 
     let total_pixels = (h * w).max(1) as f64;
     let (result, local_detail) = if processing_config.local_luminance_detail {
-        apply_local_luminance_detail(&result)
+        apply_local_luminance_detail(result)
     } else {
         (result, LocalLuminanceDetailDiagnostics::disabled())
     };
-    let (result, adaptive_vibrance) = if processing_config.adaptive_vibrance {
-        apply_adaptive_vibrance(&result, color_protection)
-    } else {
-        (
-            result,
-            AdaptiveVibranceDiagnostics::disabled(format!(
-                "disabled by {} render intent",
-                render_style.as_str()
-            )),
-        )
-    };
+    let (result, adaptive_vibrance, preferred_skin_rendering) =
+        if processing_config.adaptive_vibrance && processing_config.preferred_skin_rendering {
+            apply_adaptive_vibrance_with_preferred_skin(result, color_protection)
+        } else if processing_config.adaptive_vibrance {
+            let (result, adaptive_vibrance) = apply_adaptive_vibrance(result, color_protection);
+            (
+                result,
+                adaptive_vibrance,
+                PreferredSkinRenderingDiagnostics::empty(
+                    false,
+                    format!("disabled by {} render intent", render_style.as_str()),
+                ),
+            )
+        } else {
+            (
+                result,
+                AdaptiveVibranceDiagnostics::disabled(format!(
+                    "disabled by {} render intent",
+                    render_style.as_str()
+                )),
+                PreferredSkinRenderingDiagnostics::empty(
+                    false,
+                    format!("disabled by {} render intent", render_style.as_str()),
+                ),
+            )
+        };
     let (result, post_highlight_neutral_compressed_pixels) =
         if color_protection.highlight_neutral_chroma_enabled {
-            apply_highlight_neutral_chroma_cleanup(&result)
+            apply_highlight_neutral_chroma_cleanup(result)
         } else {
             (result, 0)
         };
-    let (result, noise_reduction) = if processing_config.noise_reduction {
-        apply_render_noise_reduction(&result)
-    } else {
-        (
-            result,
-            RenderNoiseReductionDiagnostics::disabled(format!(
-                "disabled by {} render intent",
-                render_style.as_str()
-            )),
-        )
-    };
     let (result, shadow_saturation_guard_pixels) = if color_protection.shadow_chroma_enabled {
-        apply_shadow_saturation_guard(&result)
+        apply_shadow_saturation_guard(result)
     } else {
         (result, 0)
     };
     let (result, midtone_neutral_compressed_pixels) =
         if color_protection.midtone_neutral_chroma_enabled {
-            apply_midtone_neutral_chroma_cleanup(&result)
+            apply_midtone_neutral_chroma_cleanup(result)
         } else {
             (result, 0)
         };
+    let noise_reduction_pre_grain = render_grain_diagnostics(&result);
+    let (result, noise_reduction) =
+        apply_render_noise_reduction(result, grain_reduction, &noise_reduction_pre_grain);
+    let noise_reduction_post_grain = if noise_reduction.enabled {
+        render_grain_diagnostics(&result)
+    } else {
+        noise_reduction_pre_grain.clone()
+    };
+    let flat_luma_before = noise_reduction_pre_grain.flat_luma_residual_p95;
+    let flat_chroma_before = noise_reduction_pre_grain.flat_chroma_residual_p95;
+    let noise_reduction_flat_luma_p95_reduction_ratio = if flat_luma_before > 1e-12 {
+        (flat_luma_before - noise_reduction_post_grain.flat_luma_residual_p95) / flat_luma_before
+    } else {
+        0.0
+    };
+    let noise_reduction_flat_chroma_p95_reduction_ratio = if flat_chroma_before > 1e-12 {
+        (flat_chroma_before - noise_reduction_post_grain.flat_chroma_residual_p95)
+            / flat_chroma_before
+    } else {
+        0.0
+    };
     let midtone_neutral_chroma_compressed_ratio =
         midtone_neutral_compressed_pixels as f64 / total_pixels;
+    let perceptual_gamut_mapped_pixels = compressed_pixels.load(Ordering::Relaxed);
+    let perceptual_gamut_mean_chroma_scale = if perceptual_gamut_mapped_pixels == 0 {
+        1.0
+    } else {
+        gamut_chroma_scale_sum.load(Ordering::Relaxed) as f64
+            / perceptual_gamut_mapped_pixels as f64
+            / 1e9
+    };
+    let perceptual_gamut_min_chroma_scale = if perceptual_gamut_mapped_pixels == 0 {
+        1.0
+    } else {
+        gamut_chroma_scale_min.load(Ordering::Relaxed) as f64 / 1e9
+    };
     let shadow_chroma_compressed_ratio = (shadow_compressed_pixels.load(Ordering::Relaxed) as f64
         / total_pixels)
         .max(shadow_saturation_guard_pixels as f64 / total_pixels);
@@ -2709,6 +4567,10 @@ pub fn apply_tonemap_with_params_color_protection_and_style_diagnostics(
             post_chroma_compression_clipped_low_ratio: std::array::from_fn(|ch| {
                 post_low_clipped[ch].load(Ordering::Relaxed) as f64 / total_pixels
             }),
+            perceptual_gamut_mapping_space: "CIELAB_D50_constant_lightness_and_hue",
+            perceptual_gamut_mapped_ratio: perceptual_gamut_mapped_pixels as f64 / total_pixels,
+            perceptual_gamut_mean_chroma_scale,
+            perceptual_gamut_min_chroma_scale,
             local_luminance_detail_enabled: local_detail.enabled,
             local_luminance_detail_radius: local_detail.radius,
             local_luminance_detail_amount: local_detail.amount,
@@ -2727,18 +4589,33 @@ pub fn apply_tonemap_with_params_color_protection_and_style_diagnostics(
             adaptive_vibrance_max_applied_scale: adaptive_vibrance.max_applied_scale,
             adaptive_vibrance_texture_limited_ratio: adaptive_vibrance.texture_limited_ratio,
             adaptive_vibrance_gamut_limited_ratio: adaptive_vibrance.gamut_limited_ratio,
+            adaptive_vibrance_skin_memory_protection: adaptive_vibrance.skin_memory_protection,
+            adaptive_vibrance_preferred_memory_color_guard: adaptive_vibrance
+                .preferred_memory_color_guard,
+            preferred_skin_rendering,
             noise_reduction_enabled: noise_reduction.enabled,
+            noise_reduction_requested_enabled: noise_reduction.requested_enabled,
             noise_reduction_reason: noise_reduction.reason,
+            noise_reduction_requested_strength: noise_reduction.requested_strength,
+            noise_reduction_requested_scale: noise_reduction.requested_scale,
             noise_reduction_radius: noise_reduction.radius,
             noise_reduction_chroma_amount: noise_reduction.chroma_amount,
             noise_reduction_luma_amount: noise_reduction.luma_amount,
             noise_reduction_applied_ratio: noise_reduction.applied_ratio,
+            noise_reduction_structure_gate_start: noise_reduction.structure_gate_start,
+            noise_reduction_structure_gate_end: noise_reduction.structure_gate_end,
+            noise_reduction_structure_excluded_ratio: noise_reduction.structure_excluded_ratio,
             noise_reduction_texture_limited_ratio: noise_reduction.texture_limited_ratio,
             noise_reduction_saturation_limited_ratio: noise_reduction.saturation_limited_ratio,
             noise_reduction_mean_abs_chroma_delta: noise_reduction.mean_abs_chroma_delta,
             noise_reduction_max_abs_chroma_delta: noise_reduction.max_abs_chroma_delta,
             noise_reduction_mean_abs_luma_delta: noise_reduction.mean_abs_luma_delta,
             noise_reduction_max_abs_luma_delta: noise_reduction.max_abs_luma_delta,
+            noise_reduction_pre_grain,
+            noise_reduction_post_grain,
+            noise_reduction_flat_luma_p95_reduction_ratio,
+            noise_reduction_flat_chroma_p95_reduction_ratio,
+            noise_reduction_detail_retention: noise_reduction.detail_retention,
         },
     }
 }
@@ -2746,6 +4623,399 @@ pub fn apply_tonemap_with_params_color_protection_and_style_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prophoto_lab(rgb: [f64; 3]) -> [f64; 3] {
+        let xyz =
+            crate::colorspace::prophoto_to_xyz_d50_matrix() * Vector3::new(rgb[0], rgb[1], rgb[2]);
+        crate::colorspace::xyz_d50_to_lab([xyz[0], xyz[1], xyz[2]])
+    }
+
+    fn lab_prophoto(lab: [f64; 3]) -> [f64; 3] {
+        let xyz = Vector3::from(crate::colorspace::lab_to_xyz_d50(lab));
+        let rgb = crate::colorspace::xyz_d50_to_prophoto_matrix() * xyz;
+        [rgb[0], rgb[1], rgb[2]]
+    }
+
+    fn lch_prophoto(lightness: f64, chroma: f64, hue_degrees: f64) -> [f64; 3] {
+        let hue = hue_degrees.to_radians();
+        lab_prophoto([lightness, chroma * hue.cos(), chroma * hue.sin()])
+    }
+
+    #[test]
+    fn perceptual_gamut_mapping_preserves_cielab_lightness_and_hue() {
+        let source = [1.18, -0.08, 0.64];
+        let source_lab = prophoto_lab(source);
+        let (mapped, changed, chroma_scale) = compress_highlight_chroma(source, 0.5, 0.99);
+        let mapped_lab = prophoto_lab(mapped);
+
+        assert!(changed);
+        assert!((0.0..1.0).contains(&chroma_scale));
+        assert!(mapped
+            .iter()
+            .all(|value| *value >= -1e-8 && *value <= 0.99 + 1e-8));
+        assert!((mapped_lab[0] - source_lab[0]).abs() < 1e-6);
+        let source_hue = source_lab[2].atan2(source_lab[1]);
+        let mapped_hue = mapped_lab[2].atan2(mapped_lab[1]);
+        assert!((mapped_hue - source_hue).abs() < 1e-6);
+    }
+
+    #[test]
+    fn perceptual_gamut_mapping_is_identity_inside_render_gamut() {
+        let source = [0.18, 0.42, 0.73];
+        let (mapped, changed, chroma_scale) = compress_highlight_chroma(source, 0.4, 0.99);
+        assert_eq!(mapped, source);
+        assert!(!changed);
+        assert_eq!(chroma_scale, 1.0);
+    }
+
+    #[test]
+    fn skin_memory_protection_uses_measured_core_and_feathered_support() {
+        let matrix = crate::colorspace::prophoto_to_xyz_d50_matrix();
+        let core = skin_memory_protection_weight(lch_prophoto(55.0, 20.0, 50.0), &matrix);
+        let feathered_hue = skin_memory_protection_weight(lch_prophoto(55.0, 20.0, 20.0), &matrix);
+        let neutral = skin_memory_protection_weight(lch_prophoto(55.0, 2.0, 50.0), &matrix);
+        let cool_hue = skin_memory_protection_weight(lch_prophoto(55.0, 20.0, 220.0), &matrix);
+        let outside_lightness =
+            skin_memory_protection_weight(lch_prophoto(95.0, 20.0, 50.0), &matrix);
+
+        assert!((core - 1.0).abs() < 1e-10, "core weight={core}");
+        assert!(
+            feathered_hue > 0.0 && feathered_hue < 1.0,
+            "feathered hue weight={feathered_hue}"
+        );
+        assert_eq!(neutral, 0.0);
+        assert_eq!(cool_hue, 0.0);
+        assert_eq!(outside_lightness, 0.0);
+    }
+
+    #[test]
+    fn preferred_memory_color_ellipse_uses_published_core_and_feathered_support() {
+        let model = ADAPTIVE_VIBRANCE_PREFERRED_MEMORY_MODELS[0];
+        let center = model.preferred_center_lab();
+        let theta = model.ellipse_rotation_degrees.to_radians();
+        let along_major = |radius: f64| {
+            [
+                center[0],
+                center[1] + theta.cos() * model.semi_major_axis_ab * radius,
+                center[2] + theta.sin() * model.semi_major_axis_ab * radius,
+            ]
+        };
+
+        let center_radius = preferred_memory_color_normalized_radius(center, model);
+        let feathered_radius = preferred_memory_color_normalized_radius(along_major(1.5), model);
+        let outside_radius = preferred_memory_color_normalized_radius(along_major(2.1), model);
+        assert!(center_radius < 1e-12);
+        assert!((feathered_radius - 1.5).abs() < 1e-10);
+        assert!((outside_radius - 2.1).abs() < 1e-10);
+        assert_eq!(preferred_memory_color_support_weight(center_radius), 1.0);
+        assert!((0.0..1.0).contains(&preferred_memory_color_support_weight(feathered_radius)));
+        assert_eq!(preferred_memory_color_support_weight(outside_radius), 0.0);
+    }
+
+    fn preferred_skin_lab_at_minor_radius(radius: f64) -> [f64; 3] {
+        let model = PREFERRED_SKIN_RENDERING_MODEL;
+        let center = model.preferred_center_lab();
+        let theta = model.ellipse_rotation_degrees.to_radians();
+        [
+            center[0],
+            center[1] - theta.sin() * model.semi_minor_axis_ab() * radius,
+            center[2] + theta.cos() * model.semi_minor_axis_ab() * radius,
+        ]
+    }
+
+    #[test]
+    fn preferred_skin_rendering_preserves_core_and_reduces_only_high_chroma_radius_excess() {
+        let model = PREFERRED_SKIN_RENDERING_MODEL;
+        let xyz_to_prophoto = crate::colorspace::xyz_d50_to_prophoto_matrix();
+        let center = model.preferred_center_lab();
+        let center_rgb = lab_prophoto(center);
+        let center_decision =
+            preferred_skin_rendering_decision(center_rgb, center, &xyz_to_prophoto);
+        assert!(center_decision.matched);
+        assert!(!center_decision.outside_preferred_core);
+        assert!(!center_decision.adjusted);
+        assert_eq!(center_decision.output_rgb, center_rgb);
+
+        let low_chroma_outlier_lab = preferred_skin_lab_at_minor_radius(1.5);
+        let low_chroma_outlier_rgb = lab_prophoto(low_chroma_outlier_lab);
+        let low_chroma_decision = preferred_skin_rendering_decision(
+            low_chroma_outlier_rgb,
+            low_chroma_outlier_lab,
+            &xyz_to_prophoto,
+        );
+        assert!(low_chroma_decision.matched);
+        assert!(low_chroma_decision.outside_preferred_core);
+        assert!(!low_chroma_decision.adjusted);
+        assert_eq!(low_chroma_decision.output_rgb, low_chroma_outlier_rgb);
+
+        let source_lab = preferred_skin_lab_at_minor_radius(-1.5);
+        let source_rgb = lab_prophoto(source_lab);
+        assert!(unit_rgb_in_gamut(source_rgb));
+        assert!(
+            skin_memory_protection_weight_from_lab(source_lab)
+                >= PREFERRED_SKIN_RENDERING_MIN_SUPPORT_WEIGHT
+        );
+        let decision = preferred_skin_rendering_decision(source_rgb, source_lab, &xyz_to_prophoto);
+        let output_lab = prophoto_lab(decision.output_rgb);
+        let source_radius = preferred_memory_color_normalized_radius(source_lab, model);
+        let output_radius = preferred_memory_color_normalized_radius(output_lab, model);
+
+        assert!(decision.matched);
+        assert!(decision.outside_preferred_core);
+        assert!(decision.adjusted);
+        assert!(decision.delta_e_ab > 0.0);
+        assert!(decision.delta_e_ab <= PREFERRED_SKIN_RENDERING_MAX_DELTA_E_AB + 1e-8);
+        assert!(output_radius < source_radius);
+        assert!(output_radius > PREFERRED_SKIN_RENDERING_CORE_RADIUS);
+        assert!((output_lab[0] - source_lab[0]).abs() < 1e-6);
+        assert!(output_lab[1].hypot(output_lab[2]) < source_lab[1].hypot(source_lab[2]));
+        assert!(decision.chroma_delta < 0.0);
+        assert!(unit_rgb_in_gamut(decision.output_rgb));
+
+        let cool_lab = [55.0, -20.0, -10.0];
+        let cool_rgb = lab_prophoto(cool_lab);
+        let cool_decision = preferred_skin_rendering_decision(cool_rgb, cool_lab, &xyz_to_prophoto);
+        assert!(!cool_decision.matched);
+        assert!(!cool_decision.adjusted);
+        assert_eq!(cool_decision.output_rgb, cool_rgb);
+    }
+
+    #[test]
+    fn preferred_skin_rendering_preserves_variation_and_requires_trusted_color() {
+        let model = PREFERRED_SKIN_RENDERING_MODEL;
+        let inner_lab = preferred_skin_lab_at_minor_radius(-1.3);
+        let outer_lab = preferred_skin_lab_at_minor_radius(-1.8);
+        let image = Array3::from_shape_fn((9, 18, 3), |(_, x, channel)| {
+            if x < 9 {
+                lab_prophoto(inner_lab)[channel]
+            } else {
+                lab_prophoto(outer_lab)[channel]
+            }
+        });
+        let (rendered, diagnostics) =
+            apply_preferred_skin_rendering(image.clone(), &ToneColorProtection::default());
+        let rendered_inner = prophoto_lab([
+            rendered[[4, 4, 0]],
+            rendered[[4, 4, 1]],
+            rendered[[4, 4, 2]],
+        ]);
+        let rendered_outer = prophoto_lab([
+            rendered[[4, 13, 0]],
+            rendered[[4, 13, 1]],
+            rendered[[4, 13, 2]],
+        ]);
+        let rendered_inner_radius = preferred_memory_color_normalized_radius(rendered_inner, model);
+        let rendered_outer_radius = preferred_memory_color_normalized_radius(rendered_outer, model);
+
+        assert!(diagnostics.enabled);
+        assert!(diagnostics.adjusted_pixel_ratio > 0.99);
+        assert!(diagnostics.mean_chroma_delta < 0.0);
+        assert!(rendered_inner_radius > PREFERRED_SKIN_RENDERING_CORE_RADIUS);
+        assert!(rendered_outer_radius > rendered_inner_radius);
+        assert!((rendered_inner[0] - inner_lab[0]).abs() < 1e-6);
+        assert!((rendered_outer[0] - outer_lab[0]).abs() < 1e-6);
+
+        let untrusted = ToneColorProtection {
+            policy: ToneColorProtectionPolicy::DisabledColorCandidateReview,
+            highlight_neutral_chroma_enabled: false,
+            midtone_neutral_chroma_enabled: false,
+            shadow_chroma_enabled: false,
+            reason: "synthetic untrusted color".to_string(),
+        };
+        let (unchanged, disabled) = apply_preferred_skin_rendering(image.clone(), &untrusted);
+        assert!(!disabled.enabled);
+        assert_eq!(unchanged, image);
+    }
+
+    #[test]
+    fn preferred_skin_rendering_fuses_with_adaptive_vibrance_without_undoing_reduction() {
+        let source_lab = preferred_skin_lab_at_minor_radius(-1.8);
+        let source_rgb = lab_prophoto(source_lab);
+        let image = Array3::from_shape_fn((25, 25, 3), |(_, _, channel)| source_rgb[channel]);
+        let allocation = image.as_ptr() as usize;
+
+        let (rendered, adaptive, preferred_skin) =
+            apply_adaptive_vibrance_with_preferred_skin(image, &ToneColorProtection::default());
+        let rendered_lab = prophoto_lab([
+            rendered[[12, 12, 0]],
+            rendered[[12, 12, 1]],
+            rendered[[12, 12, 2]],
+        ]);
+
+        assert_eq!(rendered.as_ptr() as usize, allocation);
+        assert!(adaptive.enabled);
+        assert!(preferred_skin.enabled);
+        assert!(preferred_skin.adjusted_pixel_ratio > 0.99);
+        assert!(preferred_skin.mean_chroma_delta < 0.0);
+        assert!(rendered_lab[1].hypot(rendered_lab[2]) < source_lab[1].hypot(source_lab[2]));
+        assert!((rendered_lab[0] - source_lab[0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn adaptive_vibrance_parallel_chunk_reduction_is_deterministic() {
+        let skin = lab_prophoto(preferred_skin_lab_at_minor_radius(-1.8));
+        let cool = lab_prophoto([55.0, -20.0, -10.0]);
+        let neutral = [0.24, 0.23, 0.22];
+        let image =
+            Array3::from_shape_fn((385, 33, 3), |(y, x, channel)| match (y / 17 + x / 5) % 3 {
+                0 => skin[channel],
+                1 => cool[channel],
+                _ => neutral[channel],
+            });
+
+        let (first, first_adaptive, first_skin) = apply_adaptive_vibrance_with_preferred_skin(
+            image.clone(),
+            &ToneColorProtection::default(),
+        );
+        let (second, second_adaptive, second_skin) =
+            apply_adaptive_vibrance_with_preferred_skin(image, &ToneColorProtection::default());
+
+        assert_eq!(first, second);
+        assert_eq!(first_adaptive.applied_ratio, second_adaptive.applied_ratio);
+        assert_eq!(first_adaptive.mean_scale, second_adaptive.mean_scale);
+        assert_eq!(
+            first_adaptive.skin_memory_protection.protected_pixel_ratio,
+            second_adaptive.skin_memory_protection.protected_pixel_ratio
+        );
+        assert_eq!(
+            first_adaptive
+                .preferred_memory_color_guard
+                .mean_scale_reduction,
+            second_adaptive
+                .preferred_memory_color_guard
+                .mean_scale_reduction
+        );
+        assert_eq!(
+            first_skin.adjusted_pixel_ratio,
+            second_skin.adjusted_pixel_ratio
+        );
+        assert_eq!(first_skin.mean_delta_e_ab, second_skin.mean_delta_e_ab);
+        assert_eq!(first_skin.mean_chroma_delta, second_skin.mean_chroma_delta);
+    }
+
+    #[test]
+    fn preferred_memory_color_guard_only_limits_paths_away_from_a_supported_center() {
+        let model = ADAPTIVE_VIBRANCE_PREFERRED_MEMORY_MODELS[0];
+        let center = model.preferred_center_lab();
+        let outward = [center[0], center[1] * 1.05, center[2] * 1.05];
+        let outward_decision = preferred_memory_color_guard_scale(center, outward, 1.05);
+        assert_eq!(outward_decision.family_index, Some(0));
+        assert!((outward_decision.support_weight - 1.0).abs() < 1e-12);
+        assert!((outward_decision.scale - 1.0).abs() < 1e-12);
+        assert!((outward_decision.scale_reduction - 0.05).abs() < 1e-12);
+
+        let undersaturated = [center[0], center[1] * 0.70, center[2] * 0.70];
+        let toward = [center[0], center[1] * 0.75, center[2] * 0.75];
+        let toward_decision = preferred_memory_color_guard_scale(undersaturated, toward, 1.05);
+        assert_eq!(toward_decision.family_index, Some(0));
+        assert!((toward_decision.scale - 1.05).abs() < 1e-12);
+        assert_eq!(toward_decision.scale_reduction, 0.0);
+
+        let unrelated = [55.0, 45.0, 20.0];
+        let unrelated_after = [55.0, 47.0, 21.0];
+        let unrelated_decision =
+            preferred_memory_color_guard_scale(unrelated, unrelated_after, 1.05);
+        assert_eq!(unrelated_decision.family_index, None);
+        assert_eq!(unrelated_decision.scale, 1.05);
+        assert_eq!(unrelated_decision.scale_reduction, 0.0);
+    }
+
+    #[test]
+    fn adaptive_vibrance_preference_guard_prevents_sky_center_overshoot_without_luma_shift() {
+        let model = ADAPTIVE_VIBRANCE_PREFERRED_MEMORY_MODELS[0];
+        let sky = lab_prophoto(model.preferred_center_lab());
+        assert!(sky.iter().all(|value| (0.0..=1.0).contains(value)));
+        let image = Array3::from_shape_fn((25, 25, 3), |(_, _, c)| sky[c]);
+        let (after, diagnostics) = apply_adaptive_vibrance(image, &ToneColorProtection::default());
+        let after_rgb = [after[[12, 12, 0]], after[[12, 12, 1]], after[[12, 12, 2]]];
+        let before_luma = linear_luminance(sky[0], sky[1], sky[2]);
+        let after_luma = linear_luminance(after_rgb[0], after_rgb[1], after_rgb[2]);
+        let guard = &diagnostics.preferred_memory_color_guard;
+
+        assert!(guard.enabled);
+        assert!(guard.evaluated_pixel_ratio > 0.99);
+        assert!(guard.matched_pixel_ratio > 0.99);
+        assert!(guard.limited_pixel_ratio > 0.99);
+        assert!(guard.mean_scale_reduction > 0.0);
+        assert_eq!(guard.families[0].family, "sky");
+        assert!(guard.families[0].limited_pixel_ratio > 0.99);
+        assert!(after_rgb
+            .iter()
+            .zip(sky)
+            .all(|(actual, expected)| (actual - expected).abs() < 1e-6));
+        assert!((after_luma - before_luma).abs() < 2e-6);
+    }
+
+    #[test]
+    fn adaptive_vibrance_limits_skin_memory_colors_without_luminance_shift() {
+        let skin = lch_prophoto(55.0, 20.0, 50.0);
+        let cool = lch_prophoto(55.0, 20.0, 220.0);
+        assert!(skin.iter().all(|value| (0.0..=1.0).contains(value)));
+        assert!(cool.iter().all(|value| (0.0..=1.0).contains(value)));
+
+        let skin_image = Array3::from_shape_fn((25, 25, 3), |(_, _, c)| skin[c]);
+        let cool_image = Array3::from_shape_fn((25, 25, 3), |(_, _, c)| cool[c]);
+        let (skin_after, skin_diagnostics) =
+            apply_adaptive_vibrance(skin_image, &ToneColorProtection::default());
+        let (cool_after, cool_diagnostics) =
+            apply_adaptive_vibrance(cool_image, &ToneColorProtection::default());
+
+        let skin_after_rgb = [
+            skin_after[[12, 12, 0]],
+            skin_after[[12, 12, 1]],
+            skin_after[[12, 12, 2]],
+        ];
+        let cool_after_rgb = [
+            cool_after[[12, 12, 0]],
+            cool_after[[12, 12, 1]],
+            cool_after[[12, 12, 2]],
+        ];
+        let skin_luminance = linear_luminance(skin[0], skin[1], skin[2]);
+        let cool_luminance = linear_luminance(cool[0], cool[1], cool[2]);
+        let skin_scale = (skin_after_rgb[0] - skin_luminance) / (skin[0] - skin_luminance);
+        let cool_scale = (cool_after_rgb[2] - cool_luminance) / (cool[2] - cool_luminance);
+
+        assert!(skin_diagnostics.skin_memory_protection.enabled);
+        assert!(
+            skin_diagnostics
+                .skin_memory_protection
+                .protected_pixel_ratio
+                > 0.99
+        );
+        assert!(
+            skin_diagnostics
+                .skin_memory_protection
+                .mean_protection_weight
+                > 0.99
+        );
+        assert_eq!(
+            cool_diagnostics
+                .skin_memory_protection
+                .protected_pixel_ratio,
+            0.0
+        );
+        assert!(
+            skin_scale > 1.0 && skin_scale <= 1.011,
+            "skin scale={skin_scale}"
+        );
+        assert!(cool_scale > 1.07, "cool scale={cool_scale}");
+        let skin_luminance_drift =
+            (linear_luminance(skin_after_rgb[0], skin_after_rgb[1], skin_after_rgb[2])
+                - skin_luminance)
+                .abs();
+        let cool_luminance_drift =
+            (linear_luminance(cool_after_rgb[0], cool_after_rgb[1], cool_after_rgb[2])
+                - cool_luminance)
+                .abs();
+        assert!(
+            skin_luminance_drift < 2e-6,
+            "skin luminance drift={skin_luminance_drift}"
+        );
+        assert!(
+            cool_luminance_drift < 2e-6,
+            "cool luminance drift={cool_luminance_drift}"
+        );
+    }
 
     #[test]
     fn solve_midpoint_for_target_treats_nan_input_as_low_curve_bound() {
@@ -2766,5 +5036,142 @@ mod tests {
 
         assert!(nan_midpoint.is_finite());
         assert!((nan_midpoint - low_bound_midpoint).abs() < 1e-12);
+    }
+
+    #[test]
+    fn grain_detail_retention_flags_adversarial_structured_edge_erasure() {
+        let size = 81usize;
+        let mut luminance = vec![0.0f32; size * size];
+        let mut opponent_a = vec![0.0f32; size * size];
+        let mut opponent_b = vec![0.0f32; size * size];
+        for y in 0..size {
+            for x in 0..size {
+                let rgb = if y < size / 2 {
+                    if x < size / 2 {
+                        [0.70, 0.20, 0.20]
+                    } else {
+                        [0.20, 0.4025, 0.70]
+                    }
+                } else {
+                    let level = if x < size / 2 { 0.18 } else { 0.72 };
+                    [level, level, level]
+                };
+                let idx = y * size + x;
+                luminance[idx] = linear_luminance(rgb[0], rgb[1], rgb[2]) as f32;
+                opponent_a[idx] = (rgb[0] - rgb[1]) as f32;
+                opponent_b[idx] = (rgb[2] - 0.5 * (rgb[0] + rgb[1])) as f32;
+            }
+        }
+        let (sample_stride, luminance_probes, chroma_probes) =
+            collect_grain_detail_probes(&luminance, &opponent_a, &opponent_b, size, size, 2);
+        assert!(luminance_probes.len() >= GRAIN_DETAIL_MIN_PROBE_COUNT);
+        assert!(chroma_probes.len() >= GRAIN_DETAIL_MIN_PROBE_COUNT);
+
+        let erased = Array3::<f64>::from_elem((size, size, 3), 0.4);
+        let diagnostics = evaluate_grain_detail_retention(
+            &erased,
+            sample_stride,
+            2,
+            &luminance_probes,
+            &chroma_probes,
+        );
+
+        assert!(diagnostics.decision_supported, "{diagnostics:?}");
+        assert!(diagnostics.review_required, "{diagnostics:?}");
+        assert_eq!(diagnostics.luminance_p10_retention, 0.0);
+        assert_eq!(diagnostics.chroma_p10_retention, 0.0);
+        assert!(diagnostics
+            .review_reason
+            .as_deref()
+            .is_some_and(
+                |reason| reason.contains("luminance") && reason.contains("opponent-color")
+            ));
+    }
+
+    #[test]
+    fn post_tone_render_passes_reuse_the_owned_working_buffer() {
+        let mut image = Array3::<f64>::zeros((96, 128, 3));
+        for y in 0..96 {
+            for x in 0..128 {
+                image[[y, x, 0]] = 0.08 + x as f64 / 512.0;
+                image[[y, x, 1]] = 0.10 + y as f64 / 480.0;
+                image[[y, x, 2]] = 0.07 + (x + y) as f64 / 900.0;
+            }
+        }
+        let allocation = image.as_ptr() as usize;
+        let (image, _) = apply_local_luminance_detail(image);
+        assert_eq!(image.as_ptr() as usize, allocation);
+        let (image, _) = apply_adaptive_vibrance(image, &ToneColorProtection::default());
+        assert_eq!(image.as_ptr() as usize, allocation);
+        let (image, _) = apply_highlight_neutral_chroma_cleanup(image);
+        assert_eq!(image.as_ptr() as usize, allocation);
+        let (image, _) = apply_shadow_saturation_guard(image);
+        assert_eq!(image.as_ptr() as usize, allocation);
+        let (image, _) = apply_midtone_neutral_chroma_cleanup(image);
+        assert_eq!(image.as_ptr() as usize, allocation);
+        let pre_grain = render_grain_diagnostics(&image);
+        let (image, _) =
+            apply_render_noise_reduction(image, GrainReductionSettings::default(), &pre_grain);
+        assert_eq!(image.as_ptr() as usize, allocation);
+
+        let enabled = GrainReductionSettings {
+            enabled: true,
+            strength: 0.5,
+            scale: 1.0,
+        };
+        let pre_grain = render_grain_diagnostics(&image);
+        let (image, _) = apply_render_noise_reduction(image, enabled, &pre_grain);
+        assert_eq!(image.as_ptr() as usize, allocation);
+    }
+
+    #[test]
+    fn owned_batch_tonemap_is_pixel_identical_and_reuses_the_scene_buffer() {
+        let mut image = Array3::<f64>::zeros((96, 128, 3));
+        for y in 0..96 {
+            for x in 0..128 {
+                image[[y, x, 0]] = 0.04 + x as f64 / 170.0;
+                image[[y, x, 1]] = 0.03 + y as f64 / 150.0;
+                image[[y, x, 2]] = 0.02 + (x + y) as f64 / 310.0;
+            }
+        }
+        let allocation = image.as_ptr() as usize;
+        let params = ToneCurveParams::default();
+        let protection = ToneColorProtection::default();
+        let grain = GrainReductionSettings {
+            enabled: true,
+            strength: 0.5,
+            scale: 1.0,
+        };
+        let borrowed = apply_tonemap_with_params_color_protection_style_and_grain_diagnostics(
+            &image,
+            &params,
+            &protection,
+            RenderStyle::ModernClean,
+            grain,
+        );
+        let owned = apply_tonemap_owned_with_params_color_protection_style_and_grain_diagnostics(
+            image,
+            &params,
+            &protection,
+            RenderStyle::ModernClean,
+            grain,
+        );
+
+        assert_eq!(owned.image.as_ptr() as usize, allocation);
+        assert_eq!(owned.image, borrowed.image);
+        assert_eq!(
+            owned.diagnostics.noise_reduction_applied_ratio,
+            borrowed.diagnostics.noise_reduction_applied_ratio
+        );
+        assert_eq!(
+            owned
+                .diagnostics
+                .noise_reduction_detail_retention
+                .luminance_p10_retention,
+            borrowed
+                .diagnostics
+                .noise_reduction_detail_retention
+                .luminance_p10_retention
+        );
     }
 }

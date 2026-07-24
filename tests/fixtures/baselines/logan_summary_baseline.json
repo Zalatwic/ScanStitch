@@ -4,7 +4,15 @@
     "decision": "accepted",
     "confidence": 0.46743358690189807,
     "chosen_hypothesis": "[1|2]",
-    "seam_exposure_correction_applied": false
+    "seam_exposure_correction_applied": false,
+    "seam_exposure_model": "identity",
+    "seam_exposure_spatial_2d_gain_accepted": false,
+    "seam_exposure_spatial_2d_gain_offset_accepted": false,
+    "seam_exposure_spatial_quadratic_gain_accepted": false,
+    "seam_exposure_spatial_quadratic_gain_offset_accepted": false,
+    "seam_blend_review_required": false,
+    "seam_detail_review_required": false,
+    "seam_detail_max_symmetric_energy_ratio": null
   },
   "render": {
     "output_width": 5959,
@@ -33,6 +41,7 @@
     "selected_candidate": "gamut_trusted_image_matrix_blend",
     "selected_candidate_rank": 1,
     "calibration_acceptance_status": "not_applicable",
+    "calibration_color_mapping_applied": false,
     "calibration_acceptance_preferred_candidate": null,
     "calibration_acceptance_beats_image_derived": null,
     "candidate_risk": "review_neutral_support",
@@ -108,6 +117,10 @@
   "grain": {
     "luma_residual_p95": 0.1399048182080719,
     "chroma_residual_p95": 0.06402749340869399,
-    "chroma_to_luma_p95_ratio": 0.4576503813719253
+    "chroma_to_luma_p95_ratio": 0.4576503813719253,
+    "detail_review_required": false,
+    "detail_decision_supported": true,
+    "luminance_p10_retention": 1.0,
+    "chroma_p10_retention": 1.0
   }
 }

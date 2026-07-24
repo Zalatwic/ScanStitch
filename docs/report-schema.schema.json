@@ -17,6 +17,11 @@
         "package_name": { "type": "string" },
         "package_version": { "type": "string" },
         "binary_name": { "type": "string" },
+        "binary_path": { "type": "string" },
+        "binary_sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" },
+        "binary_file_size_bytes": { "type": "integer", "minimum": 1 },
+        "binary_identity_status": { "type": "string" },
+        "binary_identity_error": { "type": "string" },
         "working_directory": { "type": "string" },
         "cli_args": { "type": "array", "items": { "type": "string" } },
         "output_dir": { "type": "string" },
@@ -74,6 +79,50 @@
                 "metrics": { "$ref": "#/$defs/toneMappingMetrics" }
               }
             }
+          },
+          {
+            "if": {
+              "properties": { "name": { "const": "load" } },
+              "required": ["name"]
+            },
+            "then": {
+              "properties": {
+                "metrics": { "$ref": "#/$defs/loadMetrics" }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": { "name": { "const": "fastica" } },
+              "required": ["name"]
+            },
+            "then": {
+              "properties": {
+                "metrics": { "$ref": "#/$defs/fasticaMetrics" }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": { "name": { "const": "density_inversion" } },
+              "required": ["name"]
+            },
+            "then": {
+              "properties": {
+                "metrics": { "$ref": "#/$defs/densityInversionMetrics" }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": { "name": { "const": "save" } },
+              "required": ["name"]
+            },
+            "then": {
+              "properties": {
+                "metrics": { "$ref": "#/$defs/saveMetrics" }
+              }
+            }
           }
         ]
       }
@@ -84,6 +133,314 @@
     "nullableInteger": { "type": ["integer", "null"] },
     "nullableString": { "type": ["string", "null"] },
     "nullableBoolean": { "type": ["boolean", "null"] },
+    "densityInversionMetrics": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "skipped": { "type": "boolean" },
+        "operation_status": {
+          "enum": [
+            "not_applicable_positive_input",
+            "held_out_measured_response_supported",
+            "review_required_incomplete_measured_response_evidence",
+            "review_required_unmeasured_frame_response",
+            "review_required_unmeasured_unit_slope_response"
+          ]
+        },
+        "evidence_evaluated": { "type": "boolean" },
+        "negative_response_model_evidence_evaluated": { "type": "boolean" },
+        "film_base_evidence_confidence": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "negative_response_model_confidence": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "confidence_basis": { "type": "string" },
+        "negative_response_confidence_basis": { "type": "string" },
+        "confidence_definition": { "type": "string" },
+        "runtime_coverage_validation": { "type": "string" },
+        "input_mode": { "enum": ["negative", "positive"] },
+        "direct_density_response_source": { "$ref": "#/$defs/nullableString" },
+        "direct_density_response_model": {
+          "type": ["object", "null"],
+          "additionalProperties": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "operation_status": { "const": "not_applicable_positive_input" } },
+            "required": ["operation_status"]
+          },
+          "then": {
+            "properties": {
+              "evidence_evaluated": { "const": false },
+              "negative_response_model_evidence_evaluated": { "const": false },
+              "film_base_evidence_confidence": { "const": null },
+              "negative_response_model_confidence": { "const": null }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "operation_status": { "const": "held_out_measured_response_supported" } },
+            "required": ["operation_status"]
+          },
+          "then": {
+            "properties": {
+              "evidence_evaluated": { "const": true },
+              "negative_response_model_evidence_evaluated": { "const": true },
+              "negative_response_model_confidence": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "maximum": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation_status": {
+                "enum": [
+                  "review_required_incomplete_measured_response_evidence",
+                  "review_required_unmeasured_frame_response",
+                  "review_required_unmeasured_unit_slope_response"
+                ]
+              }
+            },
+            "required": ["operation_status"]
+          },
+          "then": {
+            "properties": {
+              "evidence_evaluated": { "const": false },
+              "negative_response_model_evidence_evaluated": { "const": false },
+              "negative_response_model_confidence": { "const": 0 }
+            }
+          }
+        }
+      ]
+    },
+    "fasticaMetrics": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "skipped": { "type": "boolean" },
+        "operation_status": {
+          "enum": [
+            "not_applicable_positive_input",
+            "not_evaluated_explicit_direct_density_route",
+            "numerically_converged_physical_separation_unvalidated",
+            "numerical_convergence_failed_physical_separation_unvalidated"
+          ]
+        },
+        "evidence_evaluated": { "type": "boolean" },
+        "numerical_convergence_evaluated": { "type": "boolean" },
+        "numerical_convergence_confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "physical_separation_evidence_evaluated": { "type": "boolean" },
+        "confidence_basis": { "type": "string" },
+        "confidence_definition": { "type": "string" },
+        "downstream_candidate_validation": { "type": "string" },
+        "converged": { "$ref": "#/$defs/nullableBoolean" },
+        "iterations": { "$ref": "#/$defs/nullableInteger" }
+      }
+    },
+    "loadMetrics": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "input_count": { "type": "integer", "minimum": 1 },
+        "inputs": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "components": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/loadComponent" }
+        },
+        "requested_working_bit_depth": { "type": "integer", "minimum": 1 },
+        "preserved_working_bit_depth": { "type": "integer", "minimum": 1 },
+        "decode_fidelity_status": {
+          "enum": [
+            "all_components_full_declared_decode_fidelity",
+            "mixed_component_decode_fidelity",
+            "no_component_full_declared_decode_fidelity"
+          ]
+        },
+        "decode_fidelity_evaluated": { "type": "boolean" },
+        "full_fidelity_component_count": { "type": "integer", "minimum": 0 },
+        "confidence_basis": { "type": "string" },
+        "confidence_definition": { "type": "string" },
+        "component1_decode": { "$ref": "#/$defs/loadDecodeMetrics" },
+        "component2_decode": { "$ref": "#/$defs/loadDecodeMetrics" }
+      }
+    },
+    "loadComponent": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "index": { "type": "integer", "minimum": 1 },
+        "path": { "type": "string" },
+        "shape": {
+          "type": "array",
+          "prefixItems": [
+            { "type": "integer", "minimum": 1 },
+            { "type": "integer", "minimum": 1 }
+          ],
+          "items": false,
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "decode": { "$ref": "#/$defs/loadDecodeMetrics" }
+      }
+    },
+    "loadDecodeMetrics": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 },
+        "color_type": { "type": "string" },
+        "source_bits_per_sample": { "type": "integer", "minimum": 1 },
+        "source_channel_count": { "type": "integer", "minimum": 1 },
+        "source_has_alpha": { "type": "boolean" },
+        "working_bit_depth": { "type": "integer", "minimum": 1 },
+        "range_transform": { "type": "string" },
+        "scale_factor": { "type": "number" },
+        "source_min": { "$ref": "#/$defs/integerVector3" },
+        "source_max": { "$ref": "#/$defs/integerVector3" },
+        "working_min": { "$ref": "#/$defs/integerVector3" },
+        "working_max": { "$ref": "#/$defs/integerVector3" },
+        "note": { "$ref": "#/$defs/nullableString" },
+        "decoded_pixel_sha256": {
+          "type": "string",
+          "pattern": "^[A-Fa-f0-9]{64}$"
+        },
+        "source_orientation_materialized_decoded_pixel_sha256": {
+          "type": "string",
+          "pattern": "^[A-Fa-f0-9]{64}$"
+        },
+        "decode_fidelity": { "$ref": "#/$defs/loadDecodeFidelity" },
+        "orientation": { "$ref": "#/$defs/inputOrientationDiagnostics" },
+        "orientation_correction": { "$ref": "#/$defs/orientationCorrectionDiagnostics" },
+        "effective_orientation_tag": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 8
+        }
+      }
+    },
+    "loadDecodeFidelity": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "status": {
+          "enum": [
+            "full_declared_decode_fidelity",
+            "limited_declared_decode_fidelity",
+            "insufficient_declared_decode_fidelity"
+          ]
+        },
+        "evidence_evaluated": { "type": "boolean" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "confidence_basis": { "type": "string" },
+        "confidence_definition": { "type": "string" },
+        "precision_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "channel_layout_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "orientation_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "dng_level_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "limiters": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "inputOrientationDiagnostics": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "tag_value": {
+          "type": ["integer", "null"],
+          "minimum": 1
+        },
+        "transform": { "type": "string" },
+        "applied": { "type": "boolean" },
+        "source_width": { "type": "integer", "minimum": 1 },
+        "source_height": { "type": "integer", "minimum": 1 },
+        "output_width": { "type": "integer", "minimum": 1 },
+        "output_height": { "type": "integer", "minimum": 1 },
+        "reason": { "type": "string" }
+      }
+    },
+    "orientationCorrectionDiagnostics": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "requested": {
+          "enum": [
+            "none",
+            "flip-horizontal",
+            "rotate-180",
+            "flip-vertical",
+            "rotate-90-clockwise-then-flip-horizontal",
+            "rotate-90-clockwise",
+            "rotate-270-clockwise-then-flip-horizontal",
+            "rotate-270-clockwise"
+          ]
+        },
+        "transform": {
+          "enum": [
+            "identity",
+            "flip_horizontal",
+            "rotate_180",
+            "flip_vertical",
+            "rotate_90_clockwise_then_flip_horizontal",
+            "rotate_90_clockwise",
+            "rotate_270_clockwise_then_flip_horizontal",
+            "rotate_270_clockwise"
+          ]
+        },
+        "applied": { "type": "boolean" },
+        "input_width": { "type": "integer", "minimum": 1 },
+        "input_height": { "type": "integer", "minimum": 1 },
+        "output_width": { "type": "integer", "minimum": 1 },
+        "output_height": { "type": "integer", "minimum": 1 },
+        "effective_tag_value": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 8
+        },
+        "effective_transform": {
+          "enum": [
+            "identity",
+            "flip_horizontal",
+            "rotate_180",
+            "flip_vertical",
+            "rotate_90_clockwise_then_flip_horizontal",
+            "rotate_90_clockwise",
+            "rotate_270_clockwise_then_flip_horizontal",
+            "rotate_270_clockwise"
+          ]
+        },
+        "source_orientation_materialized_decoded_pixel_sha256": {
+          "type": "string",
+          "pattern": "^[A-Fa-f0-9]{64}$"
+        },
+        "corrected_decoded_pixel_sha256": {
+          "type": "string",
+          "pattern": "^[A-Fa-f0-9]{64}$"
+        },
+        "reason": { "type": "string" }
+      }
+    },
     "numberVector3": {
       "type": "array",
       "minItems": 3,
@@ -101,6 +458,443 @@
       "minItems": 3,
       "maxItems": 3,
       "items": { "$ref": "#/$defs/nullableBoolean" }
+    },
+    "strictNumberVector2": {
+      "type": "array",
+      "prefixItems": [{ "type": "number" }, { "type": "number" }],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "strictNumberVector3": {
+      "type": "array",
+      "prefixItems": [
+        { "type": "number" },
+        { "type": "number" },
+        { "type": "number" }
+      ],
+      "items": false,
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "rootPolynomialValidation": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "training_patch_count",
+        "held_out_patch_count",
+        "cross_validation_folds",
+        "regularization_lambda",
+        "design_condition_number",
+        "coefficient_max_abs",
+        "training_delta_e00_rms",
+        "training_delta_e00_max",
+        "held_out_delta_e00_rms",
+        "held_out_delta_e00_max",
+        "matrix_held_out_delta_e00_rms",
+        "matrix_held_out_delta_e00_max",
+        "held_out_delta_e00_rms_improvement",
+        "held_out_delta_e00_rms_improvement_fraction",
+        "held_out_xyz_rms_improvement_fraction",
+        "maximum_hue_family_delta_e00_rms_regression",
+        "selected_over_matrix"
+      ],
+      "properties": {
+        "training_patch_count": { "type": "integer", "minimum": 18 },
+        "held_out_patch_count": { "type": "integer", "minimum": 18 },
+        "cross_validation_folds": { "type": "integer", "minimum": 3, "maximum": 5 },
+        "regularization_lambda": { "type": "number", "minimum": 0 },
+        "design_condition_number": { "type": "number", "minimum": 1 },
+        "coefficient_max_abs": { "type": "number", "minimum": 0 },
+        "training_delta_e00_rms": { "type": "number", "minimum": 0 },
+        "training_delta_e00_max": { "type": "number", "minimum": 0 },
+        "held_out_delta_e00_rms": { "type": "number", "minimum": 0 },
+        "held_out_delta_e00_max": { "type": "number", "minimum": 0 },
+        "matrix_held_out_delta_e00_rms": { "type": "number", "minimum": 0 },
+        "matrix_held_out_delta_e00_max": { "type": "number", "minimum": 0 },
+        "held_out_delta_e00_rms_improvement": { "type": "number" },
+        "held_out_delta_e00_rms_improvement_fraction": { "type": "number" },
+        "held_out_xyz_rms_improvement_fraction": { "type": "number" },
+        "maximum_hue_family_delta_e00_rms_regression": { "type": "number" },
+        "selected_over_matrix": { "type": "boolean" }
+      }
+    },
+    "rootPolynomialTrainingPatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["patch_id", "source_rgb", "reference_xyz"],
+      "properties": {
+        "patch_id": { "type": "string", "minLength": 1 },
+        "scanner_xy": { "$ref": "#/$defs/strictNumberVector2" },
+        "source_rgb": { "$ref": "#/$defs/strictNumberVector3" },
+        "reference_xyz": { "$ref": "#/$defs/strictNumberVector3" }
+      }
+    },
+    "rootPolynomialColorModel": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "model_id",
+        "basis",
+        "degree",
+        "output_space",
+        "coefficients",
+        "training_patches",
+        "training_chromaticity_hull",
+        "validation",
+        "fit"
+      ],
+      "properties": {
+        "model_id": { "type": "string", "minLength": 1 },
+        "basis": { "const": "homogeneous_root_polynomial_rgb" },
+        "degree": { "enum": [2, 3] },
+        "output_space": { "const": "reference_xyz_d50" },
+        "coefficients": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/strictNumberVector3" }
+        },
+        "training_patches": {
+          "type": "array",
+          "minItems": 18,
+          "items": { "$ref": "#/$defs/rootPolynomialTrainingPatch" }
+        },
+        "training_chromaticity_hull": {
+          "type": "array",
+          "minItems": 3,
+          "items": { "$ref": "#/$defs/strictNumberVector2" }
+        },
+        "validation": { "$ref": "#/$defs/rootPolynomialValidation" },
+        "fit": { "type": "object", "additionalProperties": true }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "degree": { "const": 2 } }, "required": ["degree"] },
+          "then": { "properties": { "coefficients": { "minItems": 6, "maxItems": 6 } } }
+        },
+        {
+          "if": { "properties": { "degree": { "const": 3 } }, "required": ["degree"] },
+          "then": {
+            "properties": {
+              "coefficients": { "minItems": 13, "maxItems": 13 },
+              "training_patches": { "minItems": 39 }
+            }
+          }
+        }
+      ]
+    },
+    "residualLut3dValidation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "training_patch_count",
+        "held_out_patch_count",
+        "cross_validation_folds",
+        "regularization_lambda",
+        "regularized_condition_number",
+        "occupied_cell_fraction",
+        "held_out_inside_domain_fraction",
+        "residual_node_max_abs",
+        "residual_node_rms",
+        "residual_edge_roughness_rms",
+        "training_delta_e00_rms",
+        "training_delta_e00_max",
+        "held_out_delta_e00_rms",
+        "held_out_delta_e00_max",
+        "baseline_held_out_delta_e00_rms",
+        "baseline_held_out_delta_e00_max",
+        "held_out_delta_e00_rms_improvement",
+        "held_out_delta_e00_rms_improvement_fraction",
+        "held_out_xyz_rms_improvement_fraction",
+        "maximum_hue_family_delta_e00_rms_regression",
+        "selected_over_baseline"
+      ],
+      "properties": {
+        "training_patch_count": { "type": "integer", "minimum": 108 },
+        "held_out_patch_count": { "type": "integer", "minimum": 48 },
+        "cross_validation_folds": { "type": "integer", "minimum": 3, "maximum": 5 },
+        "regularization_lambda": { "type": "number", "minimum": 0.0001, "maximum": 10 },
+        "regularized_condition_number": { "type": "number", "minimum": 1, "maximum": 10000000000 },
+        "occupied_cell_fraction": { "type": "number", "minimum": 0.35, "maximum": 1 },
+        "held_out_inside_domain_fraction": { "type": "number", "minimum": 0.98, "maximum": 1 },
+        "residual_node_max_abs": { "type": "number", "minimum": 0, "maximum": 0.25 },
+        "residual_node_rms": { "type": "number", "minimum": 0, "maximum": 0.1 },
+        "residual_edge_roughness_rms": { "type": "number", "minimum": 0, "maximum": 0.1 },
+        "training_delta_e00_rms": { "type": "number", "minimum": 0 },
+        "training_delta_e00_max": { "type": "number", "minimum": 0 },
+        "held_out_delta_e00_rms": { "type": "number", "minimum": 0, "maximum": 4 },
+        "held_out_delta_e00_max": { "type": "number", "minimum": 0, "maximum": 10 },
+        "baseline_held_out_delta_e00_rms": { "type": "number", "minimum": 0 },
+        "baseline_held_out_delta_e00_max": { "type": "number", "minimum": 0 },
+        "held_out_delta_e00_rms_improvement": { "type": "number", "minimum": 0.2 },
+        "held_out_delta_e00_rms_improvement_fraction": { "type": "number", "minimum": 0.05 },
+        "held_out_xyz_rms_improvement_fraction": { "type": "number", "minimum": -0.01 },
+        "maximum_hue_family_delta_e00_rms_regression": { "type": "number", "minimum": 0, "maximum": 0.35 },
+        "selected_over_baseline": { "const": true }
+      }
+    },
+    "residualLut3dColorModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_id",
+        "model_type",
+        "interpolation",
+        "grid_size",
+        "output_space",
+        "baseline_kind",
+        "input_min",
+        "input_max",
+        "residual_nodes_xyz",
+        "training_patches",
+        "training_chromaticity_hull",
+        "validation",
+        "fit"
+      ],
+      "properties": {
+        "model_id": { "type": "string", "minLength": 1 },
+        "model_type": { "const": "smooth_residual_lut_3d" },
+        "interpolation": { "const": "tetrahedral" },
+        "grid_size": { "enum": [5, 7] },
+        "output_space": { "const": "reference_xyz_d50" },
+        "baseline_kind": { "enum": ["matrix", "root_polynomial"] },
+        "baseline_model_id": { "type": "string", "minLength": 1 },
+        "input_min": { "$ref": "#/$defs/strictNumberVector3" },
+        "input_max": { "$ref": "#/$defs/strictNumberVector3" },
+        "residual_nodes_xyz": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/strictNumberVector3" }
+        },
+        "training_patches": {
+          "type": "array",
+          "minItems": 108,
+          "items": { "$ref": "#/$defs/rootPolynomialTrainingPatch" }
+        },
+        "training_chromaticity_hull": {
+          "type": "array",
+          "minItems": 3,
+          "items": { "$ref": "#/$defs/strictNumberVector2" }
+        },
+        "validation": { "$ref": "#/$defs/residualLut3dValidation" },
+        "fit": { "type": "object", "additionalProperties": true }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "grid_size": { "const": 5 } }, "required": ["grid_size"] },
+          "then": {
+            "properties": {
+              "residual_nodes_xyz": { "minItems": 125, "maxItems": 125 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "grid_size": { "const": 7 } }, "required": ["grid_size"] },
+          "then": {
+            "properties": {
+              "residual_nodes_xyz": { "minItems": 343, "maxItems": 343 },
+              "training_patches": { "minItems": 500 },
+              "validation": {
+                "properties": {
+                  "training_patch_count": { "minimum": 500 },
+                  "held_out_patch_count": { "minimum": 96 }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "baseline_kind": { "const": "root_polynomial" } },
+            "required": ["baseline_kind"]
+          },
+          "then": { "required": ["baseline_model_id"] }
+        },
+        {
+          "if": {
+            "properties": { "baseline_kind": { "const": "matrix" } },
+            "required": ["baseline_kind"]
+          },
+          "then": { "not": { "required": ["baseline_model_id"] } }
+        }
+      ]
+    },
+    "residualLut3dCandidateDiagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["grid_size", "node_count", "fitted_interior_node_count", "status", "reason"],
+      "properties": {
+        "grid_size": { "enum": [5, 7] },
+        "node_count": { "enum": [125, 343] },
+        "fitted_interior_node_count": { "enum": [27, 125] },
+        "status": {
+          "enum": [
+            "not_evaluated_insufficient_samples",
+            "rejected_fit",
+            "rejected_held_out",
+            "selected",
+            "accepted_not_selected"
+          ]
+        },
+        "reason": { "type": "string", "minLength": 1 },
+        "model_id": { "type": "string", "minLength": 1 },
+        "validation": { "$ref": "#/$defs/residualLut3dValidation" }
+      }
+    },
+    "residualLut3dSelectionDiagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "baseline_kind", "selection_rule", "candidates"],
+      "properties": {
+        "status": { "enum": ["selected_residual_lut_3d", "baseline_retained"] },
+        "baseline_kind": { "enum": ["matrix", "root_polynomial"] },
+        "baseline_model_id": { "type": "string", "minLength": 1 },
+        "selection_rule": { "type": "string", "minLength": 1 },
+        "selected_model_id": { "type": "string", "minLength": 1 },
+        "selected_grid_size": { "enum": [5, 7] },
+        "candidates": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "$ref": "#/$defs/residualLut3dCandidateDiagnostics" }
+        }
+      }
+    },
+    "scannerColorModelApplication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transform",
+        "output_domain",
+        "numerical_zero_tolerance",
+        "numerical_zero_clamp_count"
+      ],
+      "properties": {
+        "transform": {
+          "enum": [
+            "matrix",
+            "root_polynomial_degree_2",
+            "root_polynomial_degree_3",
+            "residual_lut_3d_grid_5",
+            "residual_lut_3d_grid_7"
+          ]
+        },
+        "model_id": { "type": "string", "minLength": 1 },
+        "output_domain": { "const": "reference_xyz_d50" },
+        "numerical_zero_tolerance": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1e-9
+        },
+        "numerical_zero_clamp_count": { "type": "integer", "minimum": 0 }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "transform": { "const": "matrix" } },
+            "required": ["transform"]
+          },
+          "then": { "not": { "required": ["model_id"] } }
+        },
+        {
+          "if": {
+            "properties": {
+              "transform": {
+                "enum": [
+                  "root_polynomial_degree_2",
+                  "root_polynomial_degree_3",
+                  "residual_lut_3d_grid_5",
+                  "residual_lut_3d_grid_7"
+                ]
+              }
+            },
+            "required": ["transform"]
+          },
+          "then": { "required": ["model_id"] }
+        }
+      ]
+    },
+    "nonlinearColorModelRuntimeDiagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_id",
+        "model_type",
+        "basis",
+        "degree",
+        "grid_size",
+        "baseline_kind",
+        "held_out_delta_e00_rms",
+        "held_out_delta_e00_max",
+        "matrix_held_out_delta_e00_rms",
+        "baseline_held_out_delta_e00_rms",
+        "sampled_pixel_count",
+        "negative_input_ratio",
+        "outside_training_chromaticity_hull_ratio",
+        "outside_training_input_domain_ratio",
+        "full_model_application_ratio",
+        "support_status",
+        "support_reason"
+      ],
+      "properties": {
+        "model_id": { "type": "string", "minLength": 1 },
+        "model_type": { "enum": ["root_polynomial", "residual_lut_3d"] },
+        "basis": { "type": "string", "minLength": 1 },
+        "degree": { "type": ["integer", "null"], "enum": [2, 3, null] },
+        "grid_size": { "type": ["integer", "null"], "enum": [5, 7, null] },
+        "baseline_kind": { "enum": ["matrix", "root_polynomial"] },
+        "held_out_delta_e00_rms": { "type": "number", "minimum": 0 },
+        "held_out_delta_e00_max": { "type": "number", "minimum": 0 },
+        "matrix_held_out_delta_e00_rms": { "type": "number", "minimum": 0 },
+        "baseline_held_out_delta_e00_rms": { "type": "number", "minimum": 0 },
+        "sampled_pixel_count": { "type": "integer", "minimum": 0 },
+        "negative_input_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "outside_training_chromaticity_hull_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "outside_training_input_domain_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "full_model_application_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "support_status": { "enum": ["accepted", "rejected"] },
+        "support_reason": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "model_type": { "const": "root_polynomial" } },
+            "required": ["model_type"]
+          },
+          "then": {
+            "properties": {
+              "basis": { "const": "homogeneous_root_polynomial_rgb" },
+              "degree": { "enum": [2, 3] },
+              "grid_size": { "const": null },
+              "baseline_kind": { "const": "matrix" },
+              "outside_training_input_domain_ratio": { "const": 0 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "model_type": { "const": "residual_lut_3d" } },
+            "required": ["model_type"]
+          },
+          "then": {
+            "properties": {
+              "basis": { "const": "tetrahedral" },
+              "degree": { "const": null },
+              "grid_size": { "enum": [5, 7] }
+            }
+          }
+        }
+      ]
     },
     "workingImageSelectMetrics": {
       "type": "object",
@@ -248,6 +1042,51 @@
       "type": "object",
       "additionalProperties": true,
       "properties": {
+        "tone_evidence_evaluated": { "type": "boolean" },
+        "tone_confidence_status": {
+          "enum": [
+            "review_required_upstream_color",
+            "review_required_requested_grain_evidence",
+            "review_required_tone_output_evidence",
+            "limited_upstream_evidence",
+            "supported_tone_and_optional_grain_evidence"
+          ]
+        },
+        "upstream_color_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "requested_grain_evidence_confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "tone_output_evidence_evaluated": { "type": "boolean" },
+        "tone_output_evidence_confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "tone_output_confidence_status": {
+          "$ref": "#/$defs/toneOutputConfidenceStatus"
+        },
+        "tone_output_review_required": { "type": "boolean" },
+        "tone_output_review_reason": { "type": "string" },
+        "confidence_before_tone_output_evidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "confidence_limited_by_tone_output_evidence": { "type": "boolean" },
+        "input_luminance_range_p05_p95": { "$ref": "#/$defs/nullableNumber" },
+        "mapped_luminance_range_p05_p95": { "$ref": "#/$defs/nullableNumber" },
+        "render_to_mapped_luminance_range_ratio": {
+          "$ref": "#/$defs/nullableNumber"
+        },
+        "maximum_post_tone_high_clip_ratio": { "$ref": "#/$defs/nullableNumber" },
+        "maximum_post_tone_low_clip_ratio": { "$ref": "#/$defs/nullableNumber" },
+        "tone_output_evidence_thresholds": {
+          "$ref": "#/$defs/toneOutputEvidenceThresholds"
+        },
+        "confidence_basis": { "type": "string" },
+        "confidence_definition": { "type": "string" },
         "render_quality_sample_count": { "$ref": "#/$defs/nullableInteger" },
         "render_quality_sample_stride": { "$ref": "#/$defs/nullableInteger" },
         "render_luminance_percentiles": { "$ref": "#/$defs/numberVector3" },
@@ -259,10 +1098,596 @@
         "midtone_saturation_p95": { "$ref": "#/$defs/nullableNumber" },
         "bright_neutral_saturation_median": { "$ref": "#/$defs/nullableNumber" },
         "bright_neutral_saturation_p95": { "$ref": "#/$defs/nullableNumber" },
+        "adaptive_vibrance_skin_memory_protection": {
+          "$ref": "#/$defs/adaptiveVibranceSkinMemoryProtection"
+        },
+        "adaptive_vibrance_preferred_memory_color_guard": {
+          "$ref": "#/$defs/adaptiveVibrancePreferredMemoryColorGuard"
+        },
+        "preferred_skin_rendering": {
+          "$ref": "#/$defs/preferredSkinRendering"
+        },
+        "noise_reduction_enabled": { "type": "boolean" },
+        "noise_reduction_applied_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "noise_reduction_structure_gate_start": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "noise_reduction_structure_gate_end": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        },
+        "noise_reduction_structure_excluded_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "noise_reduction_texture_limited_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "noise_reduction_saturation_limited_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
         "render_quality_bands": {
           "type": "object",
           "additionalProperties": true
         }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "tone_output_confidence_status": {
+                "const": "supported_render_tonal_distribution"
+              }
+            },
+            "required": ["tone_output_confidence_status"]
+          },
+          "then": {
+            "properties": {
+              "tone_output_evidence_evaluated": { "const": true },
+              "tone_output_evidence_confidence": { "const": 1 },
+              "tone_output_review_required": { "const": false }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "tone_output_confidence_status": {
+                "const": "review_required_invalid_render_tone_diagnostics"
+              }
+            },
+            "required": ["tone_output_confidence_status"]
+          },
+          "then": {
+            "properties": {
+              "tone_output_evidence_evaluated": { "const": false },
+              "tone_output_evidence_confidence": { "const": 0 },
+              "tone_output_review_required": { "const": true }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "tone_output_confidence_status": {
+                "enum": [
+                  "review_required_catastrophic_post_tone_clipping",
+                  "review_required_insufficient_scene_tonal_range",
+                  "review_required_collapsed_fitted_tone_range",
+                  "review_required_collapsed_render_luminance_range"
+                ]
+              }
+            },
+            "required": ["tone_output_confidence_status"]
+          },
+          "then": {
+            "properties": {
+              "tone_output_evidence_evaluated": { "const": true },
+              "tone_output_evidence_confidence": { "const": 0 },
+              "tone_output_review_required": { "const": true }
+            }
+          }
+        }
+      ]
+    },
+    "adaptiveVibranceSkinMemoryProtection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "method",
+        "working_space",
+        "reference",
+        "core_lightness",
+        "support_lightness",
+        "core_chroma",
+        "support_chroma",
+        "core_hue_degrees",
+        "support_hue_degrees",
+        "maximum_vibrance_reduction",
+        "evaluated_pixel_ratio",
+        "protected_pixel_ratio",
+        "mean_protection_weight",
+        "max_protection_weight"
+      ],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "method": { "type": "string", "minLength": 1 },
+        "working_space": { "const": "CIELAB_D50_from_linear_ProPhoto_RGB_D50" },
+        "reference": { "type": "string", "minLength": 1 },
+        "core_lightness": {
+          "type": "array",
+          "items": { "type": "number" },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "support_lightness": {
+          "type": "array",
+          "items": { "type": "number" },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "core_chroma": {
+          "type": "array",
+          "items": { "type": "number" },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "support_chroma": {
+          "type": "array",
+          "items": { "type": "number" },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "core_hue_degrees": {
+          "type": "array",
+          "items": { "type": "number" },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "support_hue_degrees": {
+          "type": "array",
+          "items": { "type": "number" },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "maximum_vibrance_reduction": { "type": "number", "minimum": 0, "maximum": 1 },
+        "evaluated_pixel_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "protected_pixel_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "mean_protection_weight": { "type": "number", "minimum": 0, "maximum": 1 },
+        "max_protection_weight": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "adaptiveVibrancePreferredMemoryColorFamily": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "family",
+        "preferred_center_lab",
+        "preferred_center_lch",
+        "semi_major_axis_ab",
+        "semi_minor_axis_ab",
+        "axis_ratio",
+        "ellipse_rotation_degrees",
+        "matched_pixel_ratio",
+        "limited_pixel_ratio",
+        "mean_scale_reduction",
+        "max_scale_reduction"
+      ],
+      "properties": {
+        "family": { "enum": ["sky", "spring_grass", "autumn_grass"] },
+        "preferred_center_lab": { "$ref": "#/$defs/numberVector3" },
+        "preferred_center_lch": { "$ref": "#/$defs/numberVector3" },
+        "semi_major_axis_ab": { "type": "number", "exclusiveMinimum": 0 },
+        "semi_minor_axis_ab": { "type": "number", "exclusiveMinimum": 0 },
+        "axis_ratio": { "type": "number", "exclusiveMinimum": 0 },
+        "ellipse_rotation_degrees": { "type": "number" },
+        "matched_pixel_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "limited_pixel_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "mean_scale_reduction": { "type": "number", "minimum": 0, "maximum": 1 },
+        "max_scale_reduction": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "adaptiveVibrancePreferredMemoryColorGuard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "method",
+        "working_space",
+        "reference",
+        "interpretation",
+        "core_normalized_radius",
+        "support_normalized_radius",
+        "evaluated_pixel_ratio",
+        "matched_pixel_ratio",
+        "limited_pixel_ratio",
+        "mean_scale_reduction",
+        "max_scale_reduction",
+        "families"
+      ],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "method": {
+          "const": "published_preference_ellipse_support_then_one_way_ab_path_projection_limits_only_creative_vibrance"
+        },
+        "working_space": {
+          "const": "CIELAB_D50_ab_projection_from_linear_ProPhoto_RGB_D50"
+        },
+        "reference": {
+          "const": "https://doi.org/10.2352/issn.2169-2629.2021.29.170"
+        },
+        "interpretation": { "type": "string", "minLength": 1 },
+        "core_normalized_radius": { "const": 1 },
+        "support_normalized_radius": { "const": 2 },
+        "evaluated_pixel_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "matched_pixel_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "limited_pixel_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "mean_scale_reduction": { "type": "number", "minimum": 0, "maximum": 1 },
+        "max_scale_reduction": { "type": "number", "minimum": 0, "maximum": 1 },
+        "families": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/adaptiveVibrancePreferredMemoryColorFamily" },
+          "minItems": 3,
+          "maxItems": 3
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "enabled": { "const": false } },
+            "required": ["enabled"]
+          },
+          "then": {
+            "properties": {
+              "evaluated_pixel_ratio": { "const": 0 },
+              "matched_pixel_ratio": { "const": 0 },
+              "limited_pixel_ratio": { "const": 0 },
+              "mean_scale_reduction": { "const": 0 },
+              "max_scale_reduction": { "const": 0 }
+            }
+          }
+        }
+      ]
+    },
+    "preferredSkinRendering": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "reason",
+        "method",
+        "working_space",
+        "preference_reference",
+        "support_reference",
+        "interpretation",
+        "preferred_center_lab",
+        "preferred_center_lch",
+        "semi_major_axis_ab",
+        "semi_minor_axis_ab",
+        "axis_ratio",
+        "ellipse_rotation_degrees",
+        "core_normalized_radius",
+        "radial_excess_reduction",
+        "maximum_delta_e_ab",
+        "minimum_support_weight",
+        "evaluated_pixel_ratio",
+        "matched_pixel_ratio",
+        "outside_preferred_core_ratio",
+        "adjusted_pixel_ratio",
+        "gamut_limited_pixel_ratio",
+        "mean_delta_e_ab",
+        "max_delta_e_ab",
+        "mean_abs_hue_shift_degrees",
+        "max_abs_hue_shift_degrees",
+        "mean_chroma_delta",
+        "max_abs_chroma_delta"
+      ],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "reason": { "type": "string", "minLength": 1 },
+        "method": {
+          "const": "published_skin_preference_ellipse_with_bounded_one_way_excess_chroma_shoulder"
+        },
+        "working_space": {
+          "const": "CIELAB_D50_ab_projection_from_linear_ProPhoto_RGB_D50"
+        },
+        "preference_reference": {
+          "const": "https://doi.org/10.2352/issn.2169-2629.2021.29.170"
+        },
+        "support_reference": { "const": "https://doi.org/10.1002/col.70012" },
+        "interpretation": { "type": "string", "minLength": 1 },
+        "preferred_center_lab": { "$ref": "#/$defs/numberVector3" },
+        "preferred_center_lch": { "$ref": "#/$defs/numberVector3" },
+        "semi_major_axis_ab": { "type": "number", "exclusiveMinimum": 0 },
+        "semi_minor_axis_ab": { "type": "number", "exclusiveMinimum": 0 },
+        "axis_ratio": { "type": "number", "exclusiveMinimum": 0 },
+        "ellipse_rotation_degrees": { "type": "number" },
+        "core_normalized_radius": { "const": 1 },
+        "radial_excess_reduction": { "const": 0.35 },
+        "maximum_delta_e_ab": { "const": 3 },
+        "minimum_support_weight": { "const": 0.05 },
+        "evaluated_pixel_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "matched_pixel_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "outside_preferred_core_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "adjusted_pixel_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "gamut_limited_pixel_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "mean_delta_e_ab": { "type": "number", "minimum": 0, "maximum": 3 },
+        "max_delta_e_ab": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 3.000000001,
+          "description": "Observed maximum under the 3 DeltaEab policy; the upper bound includes the validator's 1e-9 floating-point tolerance."
+        },
+        "mean_abs_hue_shift_degrees": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 180
+        },
+        "max_abs_hue_shift_degrees": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 180
+        },
+        "mean_chroma_delta": { "type": "number", "maximum": 0 },
+        "max_abs_chroma_delta": { "type": "number", "minimum": 0 }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "enabled": { "const": false } },
+            "required": ["enabled"]
+          },
+          "then": {
+            "properties": {
+              "evaluated_pixel_ratio": { "const": 0 },
+              "matched_pixel_ratio": { "const": 0 },
+              "outside_preferred_core_ratio": { "const": 0 },
+              "adjusted_pixel_ratio": { "const": 0 },
+              "gamut_limited_pixel_ratio": { "const": 0 },
+              "mean_delta_e_ab": { "const": 0 },
+              "max_delta_e_ab": { "const": 0 },
+              "mean_abs_hue_shift_degrees": { "const": 0 },
+              "max_abs_hue_shift_degrees": { "const": 0 },
+              "mean_chroma_delta": { "const": 0 },
+              "max_abs_chroma_delta": { "const": 0 }
+            }
+          }
+        }
+      ]
+    },
+    "toneOutputConfidenceStatus": {
+      "enum": [
+        "supported_render_tonal_distribution",
+        "review_required_invalid_render_tone_diagnostics",
+        "review_required_catastrophic_post_tone_clipping",
+        "review_required_insufficient_scene_tonal_range",
+        "review_required_collapsed_fitted_tone_range",
+        "review_required_collapsed_render_luminance_range"
+      ]
+    },
+    "toneOutputEvidenceThresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "minimum_evaluable_range",
+        "minimum_render_range",
+        "minimum_render_to_mapped_range_ratio",
+        "maximum_catastrophic_channel_clip_ratio"
+      ],
+      "properties": {
+        "minimum_evaluable_range": { "type": "number", "minimum": 0 },
+        "minimum_render_range": { "type": "number", "minimum": 0 },
+        "minimum_render_to_mapped_range_ratio": { "type": "number", "minimum": 0 },
+        "maximum_catastrophic_channel_clip_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "saveMetrics": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "output_sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" },
+        "artifact_sha256_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "algorithm",
+            "source",
+            "buffer_bytes",
+            "overlaps_artifact_conversion_buffers",
+            "peak_sequential_delivery_buffer_bytes",
+            "required_for_reviewable_delivery"
+          ],
+          "properties": {
+            "algorithm": { "const": "sha256" },
+            "source": { "const": "reopened_saved_file_bytes" },
+            "buffer_bytes": { "type": "integer", "minimum": 1 },
+            "overlaps_artifact_conversion_buffers": { "const": false },
+            "peak_sequential_delivery_buffer_bytes": { "type": "integer", "minimum": 1 },
+            "required_for_reviewable_delivery": { "const": true }
+          }
+        },
+        "artifact_commit_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "strategy",
+            "same_directory_staging",
+            "per_file_atomic_replace",
+            "cross_artifact_transaction",
+            "destination_visible_only_after_successful_encode",
+            "failed_encode_preserves_existing_destination",
+            "file_contents_fsync_before_commit",
+            "directory_fsync_after_commit",
+            "temporary_disk_overhead",
+            "applies_to"
+          ],
+          "properties": {
+            "strategy": { "const": "same_directory_temporary_file_atomic_replace" },
+            "same_directory_staging": { "const": true },
+            "per_file_atomic_replace": { "const": true },
+            "cross_artifact_transaction": { "const": false },
+            "destination_visible_only_after_successful_encode": { "const": true },
+            "failed_encode_preserves_existing_destination": { "const": true },
+            "file_contents_fsync_before_commit": { "const": false },
+            "directory_fsync_after_commit": { "const": false },
+            "temporary_disk_overhead": {
+              "const": "up_to_new_artifact_size_per_sequential_write"
+            },
+            "applies_to": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "primary_tiff",
+                  "requested_scene_master",
+                  "requested_srgb_proof",
+                  "report_json"
+                ]
+              },
+              "minItems": 4,
+              "maxItems": 4,
+              "uniqueItems": true
+            }
+          }
+        },
+        "output_encoding": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "container": { "const": "tiff" },
+            "channels": { "const": "RGB" },
+            "sample_format": { "const": "UINT" },
+            "bits_per_sample": {
+              "type": "array",
+              "prefixItems": [{ "const": 16 }, { "const": 16 }, { "const": 16 }],
+              "items": false,
+              "minItems": 3,
+              "maxItems": 3
+            }
+          }
+        },
+        "master_scene_referred_requested": { "type": "boolean" },
+        "master_scene_referred_path": { "$ref": "#/$defs/nullableString" },
+        "master_scene_referred_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[A-Fa-f0-9]{64}$"
+        },
+        "review_srgb_requested": { "type": "boolean" },
+        "review_srgb_path": { "$ref": "#/$defs/nullableString" },
+        "review_srgb_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[A-Fa-f0-9]{64}$"
+        },
+        "review_srgb_encoding": {
+          "type": ["object", "null"],
+          "additionalProperties": true,
+          "properties": {
+            "container": { "const": "png" },
+            "channels": { "const": "RGB" },
+            "sample_format": { "const": "UINT" },
+            "bits_per_sample": {
+              "type": "array",
+              "prefixItems": [{ "const": 8 }, { "const": 8 }, { "const": 8 }],
+              "items": false,
+              "minItems": 3,
+              "maxItems": 3
+            }
+          }
+        },
+        "review_srgb_icc_profile": {
+          "type": ["object", "null"],
+          "additionalProperties": true,
+          "properties": {
+            "embedded": { "const": true },
+            "description": { "const": "sRGB IEC61966-2.1" },
+            "transfer_function": { "const": "srgb" },
+            "whitepoint": { "const": "D65" }
+          }
+        },
+        "review_srgb_gamut_mapping": {
+          "type": ["object", "null"],
+          "additionalProperties": true,
+          "properties": {
+            "space": {
+              "const": "CIELAB_D50_constant_lightness_and_hue_to_sRGB_D65"
+            },
+            "policy": { "type": "string" },
+            "width": { "type": "integer", "minimum": 1 },
+            "height": { "type": "integer", "minimum": 1 },
+            "pixel_count": { "type": "integer", "minimum": 1 },
+            "nonfinite_input_pixel_count": { "const": 0 },
+            "gamut_mapped_pixel_count": { "type": "integer", "minimum": 0 },
+            "gamut_mapped_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+            "mapped_mean_chroma_scale": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "mapped_min_chroma_scale": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "post_map_out_of_gamut_pixel_count": { "const": 0 }
+          }
+        },
+        "tone_output_review_required": { "type": "boolean" },
+        "tone_output_review_reason": { "type": "string" },
+        "tone_output_confidence_status": {
+          "$ref": "#/$defs/toneOutputConfidenceStatus"
+        },
+        "tone_output_evidence_confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "render_review_status": {
+          "enum": [
+            "blocked_geometry_review",
+            "review_required_input_mode",
+            "blocked_low_base_confidence",
+            "caution_low_base_confidence",
+            "review_required_negative_response",
+            "review_required_color",
+            "review_required_white_balance",
+            "review_required_tone_output",
+            "review_required_grain_detail",
+            "caution_limited_color",
+            "reviewable"
+          ]
+        },
+        "render_reviewable": { "type": "boolean" },
+        "render_review_reason": { "type": "string" },
+        "delivery_confidence_status": {
+          "enum": ["reviewable_delivery", "diagnostic_delivery_requires_review"]
+        },
+        "review_evidence_evaluated": { "type": "boolean" },
+        "confidence_basis": { "type": "string" },
+        "confidence_definition": { "type": "string" }
       }
     },
     "candidateQualityScore": {
@@ -332,6 +1757,7 @@
           "enum": [
             "calibrated_direct",
             "scanner_prior",
+            "positive_rgb",
             "image_derived",
             "neutral_fallback"
           ]
@@ -341,11 +1767,13 @@
         "status": {
           "enum": [
             "selected",
+            "selected_evidence_rescue",
             "rejected_mode",
             "rejected_safety",
             "rejected_reference_fit",
             "rejected_neutral",
             "rejected_quality",
+            "rejected_evidence_rescue",
             "available_fallback",
             "accepted_runner_up"
           ]
@@ -362,6 +1790,99 @@
         "within_negative_gamut_limits": { "$ref": "#/$defs/nullableBoolean" }
       }
     },
+    "calibrationColorMappingApplication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evaluated",
+        "applied",
+        "selection_status",
+        "selected_candidate",
+        "preferred_candidate",
+        "reason",
+        "definition"
+      ],
+      "properties": {
+        "evaluated": { "type": "boolean" },
+        "applied": { "type": "boolean" },
+        "selection_status": {
+          "enum": [
+            "not_applicable",
+            "accepted",
+            "forced",
+            "rejected_unsafe",
+            "rejected_reference_fit",
+            "rejected_neutral",
+            "rejected_quality",
+            "not_selected"
+          ]
+        },
+        "selected_candidate": { "type": "string", "minLength": 1 },
+        "preferred_candidate": { "$ref": "#/$defs/nullableString" },
+        "reason": { "type": "string", "minLength": 1 },
+        "definition": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "evaluated": { "const": true } },
+            "required": ["evaluated"]
+          },
+          "then": {
+            "properties": {
+              "preferred_candidate": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "evaluated": { "const": false } },
+            "required": ["evaluated"]
+          },
+          "then": {
+            "properties": { "preferred_candidate": { "type": "null" } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "applied": { "const": true } },
+            "required": ["applied"]
+          },
+          "then": {
+            "properties": {
+              "selection_status": { "enum": ["accepted", "forced"] }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "selection_status": { "enum": ["accepted", "forced"] }
+            },
+            "required": ["selection_status"]
+          },
+          "then": { "properties": { "applied": { "const": true } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "selection_status": {
+                "enum": [
+                  "not_applicable",
+                  "rejected_unsafe",
+                  "rejected_reference_fit",
+                  "rejected_neutral",
+                  "rejected_quality",
+                  "not_selected"
+                ]
+              }
+            },
+            "required": ["selection_status"]
+          },
+          "then": { "properties": { "applied": { "const": false } } }
+        }
+      ]
+    },
     "calibrationMetrics": {
       "type": "object",
       "additionalProperties": true,
@@ -370,6 +1891,9 @@
           "enum": ["not_configured", "applied", "rejected"]
         },
         "source": { "type": "string" },
+        "color_mapping_application": {
+          "$ref": "#/$defs/calibrationColorMappingApplication"
+        },
         "external_profile": {
           "oneOf": [
             { "$ref": "#/$defs/nullableString" },
@@ -378,7 +1902,21 @@
               "additionalProperties": true,
               "properties": {
                 "path": { "$ref": "#/$defs/nullableString" },
-                "profile_id": { "$ref": "#/$defs/nullableString" }
+                "profile_id": { "$ref": "#/$defs/nullableString" },
+                "target_patch_signal_domain": {
+                  "type": ["string", "null"],
+                  "enum": [
+                    "normalized_scanner_signal",
+                    "scanner_linearized_transmittance",
+                    null
+                  ]
+                },
+                "target_patch_linearization_model_id": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "target_sampling": { "type": ["object", "null"] },
+                "color_model": { "$ref": "#/$defs/rootPolynomialColorModel" },
+                "lut_3d_model": { "$ref": "#/$defs/residualLut3dColorModel" }
               }
             }
           ]
@@ -387,7 +1925,9 @@
         "confidence": { "$ref": "#/$defs/nullableNumber" },
         "reason": { "$ref": "#/$defs/nullableString" },
         "matrix_condition_number": { "$ref": "#/$defs/nullableNumber" },
-        "whitepoint": { "$ref": "#/$defs/numberVector3" },
+        "whitepoint": {
+          "oneOf": [{ "$ref": "#/$defs/numberVector3" }, { "type": "null" }]
+        },
         "calibration_upgrade_available": { "$ref": "#/$defs/nullableBoolean" },
         "calibration_upgrade_reason": { "$ref": "#/$defs/nullableString" },
         "rejection_details": {
@@ -396,11 +1936,45 @@
         },
         "scanner_profile": {
           "type": "object",
-          "additionalProperties": true
+          "additionalProperties": true,
+          "properties": {
+            "target_patch_signal_domain": {
+              "type": ["string", "null"],
+              "enum": [
+                "normalized_scanner_signal",
+                "scanner_linearized_transmittance",
+                null
+              ]
+            },
+            "target_patch_linearization_model_id": {
+              "$ref": "#/$defs/nullableString"
+            },
+            "target_sampling": { "type": ["object", "null"] },
+            "color_model": { "$ref": "#/$defs/rootPolynomialColorModel" },
+            "lut_3d_model": { "$ref": "#/$defs/residualLut3dColorModel" },
+            "lut_3d_fit": { "$ref": "#/$defs/residualLut3dSelectionDiagnostics" }
+          }
         },
         "roll_profile": {
           "type": "object",
-          "additionalProperties": true
+          "additionalProperties": true,
+          "properties": {
+            "target_patch_signal_domain": {
+              "type": ["string", "null"],
+              "enum": [
+                "normalized_scanner_signal",
+                "scanner_linearized_transmittance",
+                null
+              ]
+            },
+            "target_patch_linearization_model_id": {
+              "$ref": "#/$defs/nullableString"
+            },
+            "target_sampling": { "type": ["object", "null"] },
+            "scanner_color_model_application": {
+              "$ref": "#/$defs/scannerColorModelApplication"
+            }
+          }
         },
         "requested_film_stock": { "$ref": "#/$defs/nullableString" },
         "film_stock": {
@@ -471,6 +2045,66 @@
         "beats_image_derived": { "$ref": "#/$defs/nullableBoolean" },
         "within_negative_gamut_limits": { "$ref": "#/$defs/nullableBoolean" },
         "forced_by_color_mode": { "$ref": "#/$defs/nullableBoolean" }
+      }
+    },
+    "neutralSafetyRescue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evaluated",
+        "applied",
+        "matrix_candidate",
+        "matrix_candidate_kind",
+        "matrix_anchor_evidence_supported",
+        "neutral_estimate_supported",
+        "neutral_model_evidence_supported",
+        "matrix_pre_scale_preserved_ratio",
+        "neutral_pre_scale_preserved_ratio",
+        "preserved_ratio_gain",
+        "minimum_preserved_ratio",
+        "minimum_preserved_ratio_gain",
+        "matrix_midtone_saturation_p95",
+        "neutral_midtone_saturation_p95",
+        "midtone_saturation_p95_reduction",
+        "maximum_midtone_saturation_p95",
+        "minimum_midtone_saturation_p95_reduction",
+        "matrix_memory_color_penalty",
+        "neutral_memory_color_penalty",
+        "matrix_spatial_consistency_penalty",
+        "neutral_spatial_consistency_penalty",
+        "neutral_saturation_preservation_sample_count",
+        "neutral_saturation_preservation_p05_ratio",
+        "neutral_saturation_preservation_median_ratio",
+        "neutral_saturation_preservation_p95_ratio",
+        "reason"
+      ],
+      "properties": {
+        "evaluated": { "type": "boolean" },
+        "applied": { "type": "boolean" },
+        "matrix_candidate": { "$ref": "#/$defs/nullableString" },
+        "matrix_candidate_kind": { "$ref": "#/$defs/nullableString" },
+        "matrix_anchor_evidence_supported": { "$ref": "#/$defs/nullableBoolean" },
+        "neutral_estimate_supported": { "type": "boolean" },
+        "neutral_model_evidence_supported": { "type": "boolean" },
+        "matrix_pre_scale_preserved_ratio": { "$ref": "#/$defs/nullableNumber" },
+        "neutral_pre_scale_preserved_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "preserved_ratio_gain": { "$ref": "#/$defs/nullableNumber" },
+        "minimum_preserved_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "minimum_preserved_ratio_gain": { "type": "number", "minimum": 0, "maximum": 1 },
+        "matrix_midtone_saturation_p95": { "$ref": "#/$defs/nullableNumber" },
+        "neutral_midtone_saturation_p95": { "$ref": "#/$defs/nullableNumber" },
+        "midtone_saturation_p95_reduction": { "$ref": "#/$defs/nullableNumber" },
+        "maximum_midtone_saturation_p95": { "type": "number", "minimum": 0 },
+        "minimum_midtone_saturation_p95_reduction": { "type": "number", "minimum": 0 },
+        "matrix_memory_color_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "neutral_memory_color_penalty": { "type": "number", "minimum": 0 },
+        "matrix_spatial_consistency_penalty": { "$ref": "#/$defs/nullableNumber" },
+        "neutral_spatial_consistency_penalty": { "type": "number", "minimum": 0 },
+        "neutral_saturation_preservation_sample_count": { "type": "integer", "minimum": 0 },
+        "neutral_saturation_preservation_p05_ratio": { "$ref": "#/$defs/nullableNumber" },
+        "neutral_saturation_preservation_median_ratio": { "$ref": "#/$defs/nullableNumber" },
+        "neutral_saturation_preservation_p95_ratio": { "$ref": "#/$defs/nullableNumber" },
+        "reason": { "type": "string", "minLength": 1 }
       }
     },
     "neutralEstimateQuality": {
@@ -556,6 +2190,61 @@
       "additionalProperties": true,
       "properties": {
         "calibration": { "$ref": "#/$defs/calibrationMetrics" },
+        "color_evidence_evaluated": { "type": "boolean" },
+        "color_confidence_status": {
+          "enum": [
+            "trusted_selected_mapping",
+            "limited_selected_mapping",
+            "review_required_selected_mapping",
+            "limited_negative_reconstruction_evidence",
+            "review_required_negative_reconstruction"
+          ]
+        },
+        "selected_mapping_evidence_confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "selected_mapping_confidence_status": {
+          "enum": [
+            "trusted_selected_mapping",
+            "limited_selected_mapping",
+            "review_required_selected_mapping"
+          ]
+        },
+        "negative_reconstruction_evidence_evaluated": { "type": "boolean" },
+        "negative_reconstruction_evidence_confidence": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "negative_reconstruction_confidence_status": {
+          "enum": [
+            "not_applicable_positive_input",
+            "held_out_measured_response_and_runtime_coverage_supported",
+            "review_required_blind_ica_separation",
+            "review_required_missing_negative_response_evidence",
+            "review_required_measured_response_outside_runtime_curve_support",
+            "review_required_unmeasured_negative_response",
+            "review_required_insufficient_film_base_evidence"
+          ]
+        },
+        "negative_reconstruction_confidence_basis": { "type": "string" },
+        "confidence_before_negative_reconstruction_limit": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "confidence_limited_by_negative_reconstruction_evidence": {
+          "type": "boolean"
+        },
+        "color_confidence_before_base_limit": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "confidence_basis": { "type": "string" },
+        "confidence_definition": { "type": "string" },
         "input_mode": { "enum": ["negative", "positive"] },
         "render_input_mode": { "enum": ["auto", "ica", "direct-density"] },
         "render_intent": {
@@ -572,12 +2261,17 @@
         "mapping_strategy": {
           "enum": [
             "positive_rgb_passthrough",
+            "embedded_icc_to_linear_prophoto",
             "calibrated_profile",
-            "scanner_constrained_image_derived_matrix",
+             "calibrated_root_polynomial",
+             "calibrated_residual_lut_3d",
+             "scanner_constrained_image_derived_matrix",
             "image_derived_matrix",
             "gamut_safe_image_matrix_blend",
             "gamut_trusted_image_matrix_blend",
+            "gamut_stabilized_image_matrix_blend",
             "neutral_balance_fallback",
+            "neutral_balance_evidence_rescue",
             "neutral_balance_gamut_fallback",
             "neutral_balance_forced",
             "neutral_balance_weak_anchor_fallback"
@@ -609,11 +2303,15 @@
           "items": { "$ref": "#/$defs/candidateAcceptance" }
         },
         "calibration_acceptance": { "$ref": "#/$defs/calibrationAcceptance" },
+        "neutral_safety_rescue": { "$ref": "#/$defs/neutralSafetyRescue" },
         "selection_rejections": {
           "type": "array",
           "items": { "type": "string" }
         },
         "reference_patch_evaluation": { "$ref": "#/$defs/referencePatchEvaluation" },
+        "nonlinear_color_model": {
+          "$ref": "#/$defs/nonlinearColorModelRuntimeDiagnostics"
+        },
         "neutral_estimate_quality": { "$ref": "#/$defs/neutralEstimateQuality" },
         "neutral_sample_rejections": { "$ref": "#/$defs/neutralSampleRejections" },
         "dominant_anchor_quality": { "$ref": "#/$defs/dominantAnchorQuality" },
@@ -678,14 +2376,91 @@
         "gamut_clipping_map_artifact": { "$ref": "#/$defs/nullableString" },
         "scene_referred_prophoto_float_artifact": { "$ref": "#/$defs/nullableString" },
         "scene_referred_prophoto_float_artifact_diagnostics": {
-          "type": "object",
+          "type": ["object", "null"],
           "additionalProperties": true
         },
         "gamut_clipping_map_diagnostics": {
-          "type": "object",
+          "type": ["object", "null"],
           "additionalProperties": true
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "negative_reconstruction_confidence_status": {
+                "const": "not_applicable_positive_input"
+              }
+            },
+            "required": ["negative_reconstruction_confidence_status"]
+          },
+          "then": {
+            "properties": {
+              "negative_reconstruction_evidence_evaluated": { "const": false },
+              "negative_reconstruction_evidence_confidence": { "const": null }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "negative_reconstruction_confidence_status": {
+                "const": "held_out_measured_response_and_runtime_coverage_supported"
+              }
+            },
+            "required": ["negative_reconstruction_confidence_status"]
+          },
+          "then": {
+            "properties": {
+              "negative_reconstruction_evidence_evaluated": { "const": true },
+              "negative_reconstruction_evidence_confidence": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "maximum": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "negative_reconstruction_confidence_status": {
+                "enum": [
+                  "review_required_measured_response_outside_runtime_curve_support",
+                  "review_required_insufficient_film_base_evidence"
+                ]
+              }
+            },
+            "required": ["negative_reconstruction_confidence_status"]
+          },
+          "then": {
+            "properties": {
+              "negative_reconstruction_evidence_evaluated": { "const": true },
+              "negative_reconstruction_evidence_confidence": { "const": 0 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "negative_reconstruction_confidence_status": {
+                "enum": [
+                  "review_required_blind_ica_separation",
+                  "review_required_missing_negative_response_evidence",
+                  "review_required_unmeasured_negative_response"
+                ]
+              }
+            },
+            "required": ["negative_reconstruction_confidence_status"]
+          },
+          "then": {
+            "properties": {
+              "negative_reconstruction_evidence_evaluated": { "const": false },
+              "negative_reconstruction_evidence_confidence": { "const": 0 }
+            }
+          }
+        }
+      ]
     }
   }
 }

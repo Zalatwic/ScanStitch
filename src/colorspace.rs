@@ -3,9 +3,11 @@ use ndarray::parallel::prelude::*;
 use ndarray::{Array3, Axis};
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::color_calibration::{
-    CalibrationApplicationMode, CalibrationProfile, TargetFitDiagnostics, TargetPatch,
+    CalibrationApplicationMode, CalibrationProfile, ResidualLut3dColorModel,
+    RootPolynomialColorModel, TargetFitDiagnostics, TargetPatch,
 };
 use crate::constants::{
     BRADFORD_LMS_TO_XYZ, BRADFORD_XYZ_TO_LMS, D50_WHITE, PROPHOTO_TO_XYZ_D50, XYZ_D50_TO_PROPHOTO,
@@ -25,9 +27,12 @@ const DIRECT_RENDER_LOW_CLIP_RELATIVE_LIMIT: f64 = 0.50;
 const DIRECT_RENDER_LOW_CLIP_ABSOLUTE_MARGIN: f64 = 0.05;
 const DIRECT_RENDER_QUALITY_IMPROVEMENT_MARGIN: f64 = 0.20;
 const DIRECT_RENDER_TRUST_IMPROVEMENT_QUALITY_TOLERANCE: f64 = 0.25;
+const DIRECT_RENDER_PHYSICAL_PRIOR_QUALITY_TOLERANCE: f64 = 1.00;
 const DIRECT_RENDER_PRESERVED_GAMUT_REGRESSION_TOLERANCE: f64 = 0.005;
 const DIRECT_RENDER_TRUST_IMPROVEMENT_MIN_PRESERVED_GAMUT: f64 = 0.97;
 const DIRECT_RENDER_LOW_CLIP_REGRESSION_TOLERANCE: f64 = 0.01;
+const CATASTROPHIC_RENDER_MIN_PRESERVED_GAMUT: f64 = 0.90;
+const CATASTROPHIC_RENDER_MAX_POST_SCALE_CLIP_TOTAL: f64 = 0.10;
 const GAMUT_SAFE_BLEND_SEARCH_STEPS: usize = 8;
 const GAMUT_SAFE_BLEND_MAX_NEUTRAL_MIX: f64 = 0.98;
 const GAMUT_TRUSTED_BLEND_SEARCH_STEPS: usize = 10;
@@ -109,6 +114,9 @@ const TONE_CHROMA_CLEANUP_RATIO_WEIGHT: f64 = 0.25;
 const TONE_CHROMA_CLEANUP_CLIP_WEIGHT: f64 = 6.0;
 const TONE_QUALITY_REVIEW_PENALTY: f64 = 1.0;
 const MODEL_QUALITY_REVIEW_PENALTY: f64 = 0.35;
+const AUTO_NEUTRAL_RESCUE_MIN_PRESERVED_RATIO: f64 = 0.97;
+const AUTO_NEUTRAL_RESCUE_MIN_PRESERVED_GAIN: f64 = 0.10;
+const AUTO_NEUTRAL_RESCUE_MIN_MIDTONE_SATURATION_REDUCTION: f64 = 0.12;
 const MODEL_DIAGNOSTIC_MAX_SAMPLES: usize = 120_000;
 const DENSITY_MONOTONICITY_BINS: usize = 24;
 const DENSITY_MONOTONICITY_MIN_BIN_SAMPLES: usize = 16;
@@ -139,6 +147,13 @@ const REFERENCE_DELTA_E_RMS_PENALTY_WEIGHT: f64 = 0.020;
 const REFERENCE_DELTA_E_MAX_PENALTY_WEIGHT: f64 = 0.005;
 const REFERENCE_DELTA_E2000_RMS_PENALTY_WEIGHT: f64 = 0.020;
 const REFERENCE_DELTA_E2000_MAX_PENALTY_WEIGHT: f64 = 0.005;
+const NONLINEAR_MODEL_MAX_SAMPLES: usize = 120_000;
+const NONLINEAR_MODEL_HULL_EXPANSION: f64 = 1.10;
+const NONLINEAR_MODEL_MAX_NEGATIVE_INPUT_RATIO: f64 = 0.02;
+const NONLINEAR_MODEL_MAX_OUTSIDE_HULL_RATIO: f64 = 0.35;
+const NONLINEAR_MODEL_MAX_OUTSIDE_INPUT_DOMAIN_RATIO: f64 = 0.20;
+const NONLINEAR_MODEL_MIN_FULL_APPLICATION_RATIO: f64 = 0.65;
+const NONLINEAR_MODEL_MIN_SUPPORT_SAMPLES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[clap(rename_all = "kebab-case")]
@@ -585,6 +600,91 @@ pub struct CalibrationAcceptanceDiagnostics {
     pub forced_by_color_mode: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct NeutralSafetyRescueDiagnostics {
+    pub evaluated: bool,
+    pub applied: bool,
+    pub matrix_candidate: Option<String>,
+    pub matrix_candidate_kind: Option<String>,
+    pub matrix_anchor_evidence_supported: Option<bool>,
+    pub neutral_estimate_supported: bool,
+    pub neutral_model_evidence_supported: bool,
+    pub matrix_pre_scale_preserved_ratio: Option<f64>,
+    pub neutral_pre_scale_preserved_ratio: f64,
+    pub preserved_ratio_gain: Option<f64>,
+    pub minimum_preserved_ratio: f64,
+    pub minimum_preserved_ratio_gain: f64,
+    pub matrix_midtone_saturation_p95: Option<f64>,
+    pub neutral_midtone_saturation_p95: Option<f64>,
+    pub midtone_saturation_p95_reduction: Option<f64>,
+    pub maximum_midtone_saturation_p95: f64,
+    pub minimum_midtone_saturation_p95_reduction: f64,
+    pub matrix_memory_color_penalty: Option<f64>,
+    pub neutral_memory_color_penalty: f64,
+    pub matrix_spatial_consistency_penalty: Option<f64>,
+    pub neutral_spatial_consistency_penalty: f64,
+    pub neutral_saturation_preservation_sample_count: usize,
+    pub neutral_saturation_preservation_p05_ratio: Option<f64>,
+    pub neutral_saturation_preservation_median_ratio: Option<f64>,
+    pub neutral_saturation_preservation_p95_ratio: Option<f64>,
+    pub reason: String,
+}
+
+impl NeutralSafetyRescueDiagnostics {
+    pub fn not_evaluated(reason: impl Into<String>) -> Self {
+        Self {
+            evaluated: false,
+            applied: false,
+            matrix_candidate: None,
+            matrix_candidate_kind: None,
+            matrix_anchor_evidence_supported: None,
+            neutral_estimate_supported: false,
+            neutral_model_evidence_supported: false,
+            matrix_pre_scale_preserved_ratio: None,
+            neutral_pre_scale_preserved_ratio: 0.0,
+            preserved_ratio_gain: None,
+            minimum_preserved_ratio: AUTO_NEUTRAL_RESCUE_MIN_PRESERVED_RATIO,
+            minimum_preserved_ratio_gain: AUTO_NEUTRAL_RESCUE_MIN_PRESERVED_GAIN,
+            matrix_midtone_saturation_p95: None,
+            neutral_midtone_saturation_p95: None,
+            midtone_saturation_p95_reduction: None,
+            maximum_midtone_saturation_p95: RENDER_TONE_MIDTONE_SATURATION_TARGET,
+            minimum_midtone_saturation_p95_reduction:
+                AUTO_NEUTRAL_RESCUE_MIN_MIDTONE_SATURATION_REDUCTION,
+            matrix_memory_color_penalty: None,
+            neutral_memory_color_penalty: 0.0,
+            matrix_spatial_consistency_penalty: None,
+            neutral_spatial_consistency_penalty: 0.0,
+            neutral_saturation_preservation_sample_count: 0,
+            neutral_saturation_preservation_p05_ratio: None,
+            neutral_saturation_preservation_median_ratio: None,
+            neutral_saturation_preservation_p95_ratio: None,
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NonlinearColorModelRuntimeDiagnostics {
+    pub model_id: String,
+    pub model_type: &'static str,
+    pub basis: String,
+    pub degree: Option<u8>,
+    pub grid_size: Option<u8>,
+    pub baseline_kind: String,
+    pub held_out_delta_e00_rms: f64,
+    pub held_out_delta_e00_max: f64,
+    pub matrix_held_out_delta_e00_rms: f64,
+    pub baseline_held_out_delta_e00_rms: f64,
+    pub sampled_pixel_count: usize,
+    pub negative_input_ratio: f64,
+    pub outside_training_chromaticity_hull_ratio: f64,
+    pub outside_training_input_domain_ratio: f64,
+    pub full_model_application_ratio: f64,
+    pub support_status: String,
+    pub support_reason: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ColorspaceDiagnostics {
     pub source_white: [f64; 3],
@@ -635,6 +735,8 @@ pub struct ColorspaceDiagnostics {
     pub neutral_trim_applied: bool,
     pub neutral_trim_before_after: NeutralTrimDiagnostics,
     pub calibration_acceptance: CalibrationAcceptanceDiagnostics,
+    pub neutral_safety_rescue: NeutralSafetyRescueDiagnostics,
+    pub nonlinear_color_model: Option<NonlinearColorModelRuntimeDiagnostics>,
     pub pre_scale_preserved_ratio: f64,
     pub post_scale_preserved_ratio: f64,
     pub image_matrix_pre_scale_clipped_low_ratio: [f64; 3],
@@ -1335,6 +1437,7 @@ struct ColorMappingCandidate {
     source_label: &'static str,
     kind: CandidateKind,
     matrix: Matrix3<f64>,
+    nonlinear_model: Option<RuntimeNonlinearTransform>,
     stats: MappingStats,
     diagnostics: ColorspaceDiagnostics,
     neutral_balance_scale: [f64; 3],
@@ -1342,13 +1445,297 @@ struct ColorMappingCandidate {
     score: ColorMappingCandidateScore,
 }
 
+#[derive(Debug, Clone)]
+enum RuntimeNonlinearTransform {
+    RootPolynomial {
+        model: Arc<RootPolynomialColorModel>,
+        xyz_to_prophoto: Matrix3<f64>,
+    },
+    ResidualLut3d {
+        model: Arc<ResidualLut3dColorModel>,
+        baseline_matrix: [[f64; 3]; 3],
+        root_baseline: Option<Arc<RootPolynomialColorModel>>,
+        xyz_to_prophoto: Matrix3<f64>,
+    },
+}
+
+impl RuntimeNonlinearTransform {
+    fn map(&self, source: Vector3<f64>) -> Vector3<f64> {
+        let rgb = [source[0], source[1], source[2]];
+        match self {
+            Self::RootPolynomial {
+                model,
+                xyz_to_prophoto,
+            } => {
+                let xyz = crate::color_calibration::evaluate_root_polynomial_xyz(model, rgb);
+                xyz_to_prophoto * Vector3::new(xyz[0], xyz[1], xyz[2])
+            }
+            Self::ResidualLut3d {
+                model,
+                baseline_matrix,
+                root_baseline,
+                xyz_to_prophoto,
+            } => {
+                let xyz = crate::color_calibration::evaluate_residual_lut_3d_xyz(
+                    model,
+                    baseline_matrix,
+                    root_baseline.as_deref(),
+                    rgb,
+                );
+                xyz_to_prophoto * Vector3::new(xyz[0], xyz[1], xyz[2])
+            }
+        }
+    }
+}
+
+fn map_candidate_pixel(candidate: &ColorMappingCandidate, source: Vector3<f64>) -> Vector3<f64> {
+    candidate
+        .nonlinear_model
+        .as_ref()
+        .map_or_else(|| candidate.matrix * source, |model| model.map(source))
+}
+
+fn point_inside_expanded_chromaticity_hull(point: [f64; 2], hull: &[[f64; 2]]) -> bool {
+    if hull.len() < 3 {
+        return false;
+    }
+    let centroid = [
+        hull.iter().map(|vertex| vertex[0]).sum::<f64>() / hull.len() as f64,
+        hull.iter().map(|vertex| vertex[1]).sum::<f64>() / hull.len() as f64,
+    ];
+    (0..hull.len()).all(|index| {
+        let expand = |vertex: [f64; 2]| {
+            [
+                centroid[0] + (vertex[0] - centroid[0]) * NONLINEAR_MODEL_HULL_EXPANSION,
+                centroid[1] + (vertex[1] - centroid[1]) * NONLINEAR_MODEL_HULL_EXPANSION,
+            ]
+        };
+        let left = expand(hull[index]);
+        let right = expand(hull[(index + 1) % hull.len()]);
+        (right[0] - left[0]) * (point[1] - left[1]) - (right[1] - left[1]) * (point[0] - left[0])
+            >= -1e-9
+    })
+}
+
+fn nonlinear_model_runtime_diagnostics(
+    img: &Array3<f64>,
+    transform: &RuntimeNonlinearTransform,
+) -> NonlinearColorModelRuntimeDiagnostics {
+    let (hull, input_domain) = match transform {
+        RuntimeNonlinearTransform::RootPolynomial { model, .. } => {
+            (model.training_chromaticity_hull.as_slice(), None)
+        }
+        RuntimeNonlinearTransform::ResidualLut3d { model, .. } => (
+            model.training_chromaticity_hull.as_slice(),
+            Some((model.input_min, model.input_max)),
+        ),
+    };
+    let (h, w, _) = img.dim();
+    let total_pixels = h.saturating_mul(w);
+    let stride = if total_pixels <= NONLINEAR_MODEL_MAX_SAMPLES {
+        1
+    } else {
+        total_pixels.div_ceil(NONLINEAR_MODEL_MAX_SAMPLES)
+    };
+    let mut sampled = 0usize;
+    let mut negative = 0usize;
+    let mut outside = 0usize;
+    let mut outside_input_domain = 0usize;
+    let mut full_application = 0usize;
+    for y in 0..h {
+        for x in 0..w {
+            let index = y * w + x;
+            if index % stride != 0 {
+                continue;
+            }
+            let rgb = [img[[y, x, 0]], img[[y, x, 1]], img[[y, x, 2]]];
+            if rgb.iter().any(|value| !value.is_finite()) {
+                continue;
+            }
+            sampled += 1;
+            if rgb.iter().any(|value| *value < -1e-6) {
+                negative += 1;
+                outside += 1;
+                if input_domain.is_some() {
+                    outside_input_domain += 1;
+                }
+                continue;
+            }
+            let nonnegative: [f64; 3] = std::array::from_fn(|channel| rgb[channel].max(0.0));
+            let sum = nonnegative.iter().sum::<f64>();
+            if sum <= 1e-9 {
+                outside += 1;
+                continue;
+            }
+            let chromaticity = [nonnegative[0] / sum, nonnegative[1] / sum];
+            if !point_inside_expanded_chromaticity_hull(chromaticity, hull) {
+                outside += 1;
+            }
+            match transform {
+                RuntimeNonlinearTransform::RootPolynomial { .. } => full_application += 1,
+                RuntimeNonlinearTransform::ResidualLut3d { model, .. } => {
+                    let inside_input = input_domain.is_some_and(|(minimum, maximum)| {
+                        (0..3).all(|channel| {
+                            rgb[channel] >= minimum[channel] - 1e-12
+                                && rgb[channel] <= maximum[channel] + 1e-12
+                        })
+                    });
+                    if !inside_input {
+                        outside_input_domain += 1;
+                    }
+                    if crate::color_calibration::residual_lut_3d_has_full_support(model, rgb) {
+                        full_application += 1;
+                    }
+                }
+            }
+        }
+    }
+    let denominator = sampled.max(1) as f64;
+    let negative_input_ratio = negative as f64 / denominator;
+    let outside_training_chromaticity_hull_ratio = outside as f64 / denominator;
+    let outside_training_input_domain_ratio = outside_input_domain as f64 / denominator;
+    let full_model_application_ratio = full_application as f64 / denominator;
+    let support_ok = sampled >= NONLINEAR_MODEL_MIN_SUPPORT_SAMPLES
+        && negative_input_ratio <= NONLINEAR_MODEL_MAX_NEGATIVE_INPUT_RATIO
+        && outside_training_chromaticity_hull_ratio <= NONLINEAR_MODEL_MAX_OUTSIDE_HULL_RATIO
+        && outside_training_input_domain_ratio <= NONLINEAR_MODEL_MAX_OUTSIDE_INPUT_DOMAIN_RATIO
+        && full_model_application_ratio >= NONLINEAR_MODEL_MIN_FULL_APPLICATION_RATIO;
+    let support_reason = if sampled < NONLINEAR_MODEL_MIN_SUPPORT_SAMPLES {
+        format!(
+            "only {sampled} finite scene samples were available; at least {NONLINEAR_MODEL_MIN_SUPPORT_SAMPLES} are required"
+        )
+    } else if negative_input_ratio > NONLINEAR_MODEL_MAX_NEGATIVE_INPUT_RATIO {
+        format!(
+            "{:.1}% of sampled source pixels were negative, outside the non-negative target training domain (limit {:.1}%)",
+            negative_input_ratio * 100.0,
+            NONLINEAR_MODEL_MAX_NEGATIVE_INPUT_RATIO * 100.0
+        )
+    } else if outside_training_chromaticity_hull_ratio > NONLINEAR_MODEL_MAX_OUTSIDE_HULL_RATIO {
+        format!(
+            "{:.1}% of sampled source pixels were outside the expanded measured target chromaticity hull (limit {:.1}%)",
+            outside_training_chromaticity_hull_ratio * 100.0,
+            NONLINEAR_MODEL_MAX_OUTSIDE_HULL_RATIO * 100.0
+        )
+    } else if outside_training_input_domain_ratio > NONLINEAR_MODEL_MAX_OUTSIDE_INPUT_DOMAIN_RATIO {
+        format!(
+            "{:.1}% of sampled source pixels were outside the measured 3D LUT input domain (limit {:.1}%)",
+            outside_training_input_domain_ratio * 100.0,
+            NONLINEAR_MODEL_MAX_OUTSIDE_INPUT_DOMAIN_RATIO * 100.0
+        )
+    } else if full_model_application_ratio < NONLINEAR_MODEL_MIN_FULL_APPLICATION_RATIO {
+        format!(
+            "the full nonlinear model applied to {:.1}% of sampled source pixels, below the {:.1}% minimum",
+            full_model_application_ratio * 100.0,
+            NONLINEAR_MODEL_MIN_FULL_APPLICATION_RATIO * 100.0
+        )
+    } else {
+        format!(
+            "scene support is inside nonlinear-model limits: {:.1}% negative, {:.1}% outside the expanded measured chromaticity hull, {:.1}% outside the LUT input domain, and {:.1}% full-model application",
+            negative_input_ratio * 100.0,
+            outside_training_chromaticity_hull_ratio * 100.0,
+            outside_training_input_domain_ratio * 100.0,
+            full_model_application_ratio * 100.0
+        )
+    };
+    let (
+        model_id,
+        model_type,
+        basis,
+        degree,
+        grid_size,
+        baseline_kind,
+        held_out_delta_e00_rms,
+        held_out_delta_e00_max,
+        matrix_held_out_delta_e00_rms,
+        baseline_held_out_delta_e00_rms,
+    ) = match transform {
+        RuntimeNonlinearTransform::RootPolynomial { model, .. } => (
+            model.model_id.clone(),
+            "root_polynomial",
+            model.basis.clone(),
+            Some(model.degree),
+            None,
+            "matrix".to_string(),
+            model.validation.held_out_delta_e00_rms,
+            model.validation.held_out_delta_e00_max,
+            model.validation.matrix_held_out_delta_e00_rms,
+            model.validation.matrix_held_out_delta_e00_rms,
+        ),
+        RuntimeNonlinearTransform::ResidualLut3d {
+            model,
+            root_baseline,
+            ..
+        } => (
+            model.model_id.clone(),
+            "residual_lut_3d",
+            model.interpolation.clone(),
+            None,
+            Some(model.grid_size),
+            model.baseline_kind.clone(),
+            model.validation.held_out_delta_e00_rms,
+            model.validation.held_out_delta_e00_max,
+            root_baseline
+                .as_ref()
+                .map_or(model.validation.baseline_held_out_delta_e00_rms, |root| {
+                    root.validation.matrix_held_out_delta_e00_rms
+                }),
+            model.validation.baseline_held_out_delta_e00_rms,
+        ),
+    };
+    NonlinearColorModelRuntimeDiagnostics {
+        model_id,
+        model_type,
+        basis,
+        degree,
+        grid_size,
+        baseline_kind,
+        held_out_delta_e00_rms,
+        held_out_delta_e00_max,
+        matrix_held_out_delta_e00_rms,
+        baseline_held_out_delta_e00_rms,
+        sampled_pixel_count: sampled,
+        negative_input_ratio,
+        outside_training_chromaticity_hull_ratio,
+        outside_training_input_domain_ratio,
+        full_model_application_ratio,
+        support_status: if support_ok { "accepted" } else { "rejected" }.to_string(),
+        support_reason,
+    }
+}
+
+fn reject_candidate_for_nonlinear_support(
+    score: &mut ColorMappingCandidateScore,
+    diagnostics: &NonlinearColorModelRuntimeDiagnostics,
+) {
+    if diagnostics.support_status == "accepted" {
+        return;
+    }
+    score.rejected = true;
+    score.rejection_reason = Some(match score.rejection_reason.take() {
+        Some(existing) => format!(
+            "{existing}; nonlinear target-domain support rejected: {}",
+            diagnostics.support_reason
+        ),
+        None => format!(
+            "nonlinear target-domain support rejected: {}",
+            diagnostics.support_reason
+        ),
+    });
+}
+
 fn neutral_balance_delta(
     neutral_rgb: [f64; 3],
     combined: &Matrix3<f64>,
     exposure_scale: f64,
 ) -> [f64; 3] {
-    let mapped =
-        (combined * Vector3::new(neutral_rgb[0], neutral_rgb[1], neutral_rgb[2])) / exposure_scale;
+    neutral_balance_delta_with(neutral_rgb, exposure_scale, |source| combined * source)
+}
+
+fn neutral_balance_delta_with<F>(neutral_rgb: [f64; 3], exposure_scale: f64, map: F) -> [f64; 3]
+where
+    F: Fn(Vector3<f64>) -> Vector3<f64>,
+{
+    let mapped = map(Vector3::new(neutral_rgb[0], neutral_rgb[1], neutral_rgb[2])) / exposure_scale;
     let mean = ((mapped[0] + mapped[1] + mapped[2]) / 3.0).max(1e-9);
     std::array::from_fn(|c| mapped[c] / mean - 1.0)
 }
@@ -1358,6 +1745,13 @@ fn evaluate_mapping_stats(
     combined: &Matrix3<f64>,
     neutral_rgb: [f64; 3],
 ) -> MappingStats {
+    evaluate_mapping_stats_with(img, neutral_rgb, |source| combined * source)
+}
+
+fn evaluate_mapping_stats_with<F>(img: &Array3<f64>, neutral_rgb: [f64; 3], map: F) -> MappingStats
+where
+    F: Fn(Vector3<f64>) -> Vector3<f64>,
+{
     let (h, w, _c) = img.dim();
     let total_pixels = (h * w).max(1) as f64;
     let mut pre_scale_channel_min = [f64::INFINITY; 3];
@@ -1370,7 +1764,7 @@ fn evaluate_mapping_stats(
 
     for y in 0..h {
         for x in 0..w {
-            let mapped = combined * Vector3::new(img[[y, x, 0]], img[[y, x, 1]], img[[y, x, 2]]);
+            let mapped = map(Vector3::new(img[[y, x, 0]], img[[y, x, 1]], img[[y, x, 2]]));
             let mut any_clipped = false;
             for c in 0..3 {
                 let value = mapped[c];
@@ -1400,7 +1794,7 @@ fn evaluate_mapping_stats(
     let mut histograms = vec![vec![0u64; HISTOGRAM_BINS]; 3];
     for y in 0..h {
         for x in 0..w {
-            let mapped = combined * Vector3::new(img[[y, x, 0]], img[[y, x, 1]], img[[y, x, 2]]);
+            let mapped = map(Vector3::new(img[[y, x, 0]], img[[y, x, 1]], img[[y, x, 2]]));
             for c in 0..3 {
                 let value = mapped[c].max(0.0);
                 histograms[c][histogram_bin(value, histogram_max[c])] += 1;
@@ -1420,7 +1814,7 @@ fn evaluate_mapping_stats(
         .copied()
         .fold(1.0f64, f64::max)
         .max(1.0);
-    let neutral_balance_delta = neutral_balance_delta(neutral_rgb, combined, exposure_scale);
+    let neutral_balance_delta = neutral_balance_delta_with(neutral_rgb, exposure_scale, map);
     let pre_scale_channel_min = std::array::from_fn(|c| {
         if pre_scale_channel_min[c].is_finite() {
             pre_scale_channel_min[c]
@@ -1670,6 +2064,17 @@ fn candidate_render_sample(
     combined: &Matrix3<f64>,
     exposure_scale: f64,
 ) -> (Array3<f64>, usize) {
+    candidate_render_sample_with(img, exposure_scale, |source| combined * source)
+}
+
+fn candidate_render_sample_with<F>(
+    img: &Array3<f64>,
+    exposure_scale: f64,
+    map: F,
+) -> (Array3<f64>, usize)
+where
+    F: Fn(Vector3<f64>) -> Vector3<f64>,
+{
     let (h, w, _) = img.dim();
     let total_pixels = h.saturating_mul(w);
     let sample_stride = if total_pixels <= RENDER_TONE_MAX_SAMPLES {
@@ -1695,8 +2100,8 @@ fn candidate_render_sample(
             if pixel_index % sample_stride != 0 {
                 continue;
             }
-            let mapped = (combined * Vector3::new(img[[y, x, 0]], img[[y, x, 1]], img[[y, x, 2]]))
-                / exposure_scale;
+            let mapped =
+                map(Vector3::new(img[[y, x, 0]], img[[y, x, 1]], img[[y, x, 2]])) / exposure_scale;
             for c in 0..3 {
                 sample[[out_idx, 0, c]] = if mapped[c].is_finite() {
                     mapped[c]
@@ -1717,6 +2122,13 @@ fn evaluate_candidate_rendered_tone(
     exposure_scale: f64,
 ) -> RenderedToneCandidateDiagnostics {
     let (sample, sample_stride) = candidate_render_sample(img, combined, exposure_scale);
+    evaluate_rendered_tone_sample(sample, sample_stride)
+}
+
+fn evaluate_rendered_tone_sample(
+    sample: Array3<f64>,
+    sample_stride: usize,
+) -> RenderedToneCandidateDiagnostics {
     let pre_quality = tonemap::render_quality_diagnostics(&sample);
     let tone_fit = tonemap::fit_tone_params_with_diagnostics(&sample);
     let tone_apply = tonemap::apply_tonemap_with_params_and_color_protection_diagnostics(
@@ -1811,6 +2223,16 @@ fn evaluate_candidate_rendered_tone(
         rendered_tone_penalty,
         tone_chroma_cleanup_penalty,
     }
+}
+
+fn evaluate_nonlinear_candidate_rendered_tone(
+    img: &Array3<f64>,
+    model: &RuntimeNonlinearTransform,
+    exposure_scale: f64,
+) -> RenderedToneCandidateDiagnostics {
+    let (sample, sample_stride) =
+        candidate_render_sample_with(img, exposure_scale, |source| model.map(source));
+    evaluate_rendered_tone_sample(sample, sample_stride)
 }
 
 fn percentile_from_sorted_values(values: &[f64], percentile: f64) -> Option<f64> {
@@ -1945,6 +2367,17 @@ fn evaluate_candidate_model_quality(
     combined: &Matrix3<f64>,
     exposure_scale: f64,
 ) -> ColorModelCandidateDiagnostics {
+    evaluate_candidate_model_quality_with(img, exposure_scale, |source| combined * source)
+}
+
+fn evaluate_candidate_model_quality_with<F>(
+    img: &Array3<f64>,
+    exposure_scale: f64,
+    map: F,
+) -> ColorModelCandidateDiagnostics
+where
+    F: Fn(Vector3<f64>) -> Vector3<f64>,
+{
     let (h, w, _) = img.dim();
     let total_pixels = h.saturating_mul(w);
     let sample_stride = if total_pixels <= MODEL_DIAGNOSTIC_MAX_SAMPLES {
@@ -1984,8 +2417,7 @@ fn evaluate_candidate_model_quality(
                 if !input.iter().all(|value| value.is_finite()) {
                     continue;
                 }
-                let mapped =
-                    (combined * Vector3::new(input[0], input[1], input[2])) / exposure_scale;
+                let mapped = map(Vector3::new(input[0], input[1], input[2])) / exposure_scale;
                 let mapped_rgb = [mapped[0], mapped[1], mapped[2]];
                 if !mapped_rgb.iter().all(|value| value.is_finite()) {
                     continue;
@@ -2209,6 +2641,14 @@ fn evaluate_candidate_model_quality(
         memory_color_penalty,
         spatial_consistency_penalty,
     }
+}
+
+fn evaluate_nonlinear_candidate_model_quality(
+    img: &Array3<f64>,
+    model: &RuntimeNonlinearTransform,
+    exposure_scale: f64,
+) -> ColorModelCandidateDiagnostics {
+    evaluate_candidate_model_quality_with(img, exposure_scale, |source| model.map(source))
 }
 
 fn condition_score(condition_number: f64) -> f64 {
@@ -2625,6 +3065,35 @@ fn positive_rgb_passthrough_image(
 pub fn map_positive_scan_rgb_to_prophoto_d50_with_diagnostics(
     img: &Array3<f64>,
 ) -> ColorspaceMappingResult {
+    map_positive_scan_rgb_with_profile_state(img, false)
+}
+
+pub fn map_profiled_positive_scan_rgb_to_prophoto_d50_with_diagnostics(
+    img: &Array3<f64>,
+) -> ColorspaceMappingResult {
+    map_positive_scan_rgb_with_profile_state(img, true)
+}
+
+fn map_positive_scan_rgb_with_profile_state(
+    img: &Array3<f64>,
+    embedded_icc_applied: bool,
+) -> ColorspaceMappingResult {
+    let (mapping_strategy, selected_mapping_reason, selected_candidate, acceptance_reason) =
+        if embedded_icc_applied {
+            (
+                "embedded_icc_to_linear_prophoto",
+                "embedded ICC device-to-PCS transform and tone reproduction curves were applied before this identity ProPhoto working-space stage",
+                "profiled_positive_scan_rgb",
+                "positive RGB was transformed from its embedded ICC source space into linear ProPhoto RGB D50",
+            )
+        } else {
+            (
+                "positive_rgb_passthrough",
+                "already-positive RGB values were preserved provisionally, but no source profile identified their primaries or transfer function; the working-buffer interpretation requires color review",
+                "positive_scan_rgb_passthrough",
+                "positive RGB values preserved without inventing an image-derived transform; source color space remains unverified",
+            )
+        };
     let identity = Matrix3::<f64>::identity();
     let stats = evaluate_mapping_stats(img, &identity, [0.5; 3]);
     let support = positive_rgb_support_diagnostics(img);
@@ -2668,11 +3137,11 @@ pub fn map_positive_scan_rgb_to_prophoto_d50_with_diagnostics(
         weak_anchor_fallback_reason: None,
         gamut_fallback_used: false,
         gamut_fallback_reason: None,
-        mapping_strategy: "positive_rgb_passthrough",
-        selected_mapping_reason: "already-positive RGB preserved without image-derived negative-film colour reconstruction; unprofiled input RGB is interpreted as the linear ProPhoto working buffer".to_string(),
+        mapping_strategy,
+        selected_mapping_reason: selected_mapping_reason.to_string(),
         candidate_scores: Vec::new(),
         candidate_acceptance: Vec::new(),
-        selected_candidate: "positive_scan_rgb_passthrough".to_string(),
+        selected_candidate: selected_candidate.to_string(),
         selected_candidate_rank: Some(1),
         selected_candidate_score: None,
         selected_quality_score: None,
@@ -2692,8 +3161,16 @@ pub fn map_positive_scan_rgb_to_prophoto_d50_with_diagnostics(
         ),
         calibration_acceptance: CalibrationAcceptanceDiagnostics::not_applicable(
             ColorMode::Auto,
-            "positive RGB passthrough selected because no explicit calibration profile was configured",
+            if embedded_icc_applied {
+                "external scanner calibration is not required after the embedded ICC profile established the positive input source color space"
+            } else {
+                "positive RGB passthrough selected because no source calibration/profile was configured; colorimetric identity is unverified"
+            },
         ),
+        neutral_safety_rescue: NeutralSafetyRescueDiagnostics::not_evaluated(
+            "neutral safety rescue is not applicable to the positive-input color path",
+        ),
+        nonlinear_color_model: None,
         pre_scale_preserved_ratio: stats.pre_scale_preserved_ratio,
         post_scale_preserved_ratio,
         image_matrix_pre_scale_clipped_low_ratio: stats.pre_scale_clipped_low_ratio,
@@ -2709,8 +3186,8 @@ pub fn map_positive_scan_rgb_to_prophoto_d50_with_diagnostics(
     };
 
     let mut score = score_color_candidate(
-        "positive_scan_rgb_passthrough",
-        "positive_rgb_passthrough",
+        selected_candidate,
+        mapping_strategy,
         CandidateKind::PositiveRgb,
         &stats,
         &diagnostics,
@@ -2733,10 +3210,14 @@ pub fn map_positive_scan_rgb_to_prophoto_d50_with_diagnostics(
         candidate: score.candidate.to_string(),
         candidate_kind: CandidateKind::PositiveRgb.as_str().to_string(),
         mapping_strategy: score.mapping_strategy.to_string(),
-        source_label: "positive RGB passthrough".to_string(),
+        source_label: if embedded_icc_applied {
+            "embedded ICC profile transform"
+        } else {
+            "positive RGB passthrough"
+        }
+        .to_string(),
         status: "selected".to_string(),
-        reason: "positive RGB passthrough selected for already-positive unprofiled input"
-            .to_string(),
+        reason: acceptance_reason.to_string(),
         rank: Some(1),
         selected: true,
         eligible_in_color_mode: true,
@@ -2765,11 +3246,30 @@ fn lab_f(value: f64) -> f64 {
     }
 }
 
-fn xyz_d50_to_lab(xyz: [f64; 3]) -> [f64; 3] {
+pub fn xyz_d50_to_lab(xyz: [f64; 3]) -> [f64; 3] {
     let fx = lab_f(xyz[0] / D50_WHITE[0].max(1e-9));
     let fy = lab_f(xyz[1] / D50_WHITE[1].max(1e-9));
     let fz = lab_f(xyz[2] / D50_WHITE[2].max(1e-9));
     [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+}
+
+pub fn lab_to_xyz_d50(lab: [f64; 3]) -> [f64; 3] {
+    let fy = (lab[0] + 16.0) / 116.0;
+    let fx = fy + lab[1] / 500.0;
+    let fz = fy - lab[2] / 200.0;
+    const DELTA: f64 = 6.0 / 29.0;
+    let inverse_lab = |value: f64| {
+        if value > DELTA {
+            value.powi(3)
+        } else {
+            3.0 * DELTA * DELTA * (value - 4.0 / 29.0)
+        }
+    };
+    [
+        D50_WHITE[0] * inverse_lab(fx),
+        D50_WHITE[1] * inverse_lab(fy),
+        D50_WHITE[2] * inverse_lab(fz),
+    ]
 }
 
 fn reference_hue_family(reference_xyz: [f64; 3]) -> &'static str {
@@ -2819,7 +3319,7 @@ fn patch_delta_e2000(mapped_xyz: Vector3<f64>, reference_xyz: [f64; 3]) -> f64 {
     lab_delta_e2000(mapped_lab, reference_lab)
 }
 
-fn lab_delta_e2000(left: [f64; 3], right: [f64; 3]) -> f64 {
+pub fn lab_delta_e2000(left: [f64; 3], right: [f64; 3]) -> f64 {
     let (l1, a1, b1) = (left[0], left[1], left[2]);
     let (l2, a2, b2) = (right[0], right[1], right[2]);
     let c1 = (a1 * a1 + b1 * b1).sqrt();
@@ -2943,7 +3443,7 @@ fn candidate_patch_evaluation(
             patch.source_rgb[1],
             patch.source_rgb[2],
         );
-        let mapped_xyz = prophoto_to_xyz * (candidate.matrix * source);
+        let mapped_xyz = prophoto_to_xyz * map_candidate_pixel(candidate, source);
         let error = patch_error(mapped_xyz, patch.reference_xyz);
         let delta_e = patch_delta_e76(mapped_xyz, patch.reference_xyz);
         let delta_e2000 = patch_delta_e2000(mapped_xyz, patch.reference_xyz);
@@ -3035,8 +3535,8 @@ fn candidate_hue_family_regressions(
             patch.source_rgb[1],
             patch.source_rgb[2],
         );
-        let candidate_xyz = prophoto_to_xyz * (candidate.matrix * source);
-        let image_xyz = prophoto_to_xyz * (image_candidate.matrix * source);
+        let candidate_xyz = prophoto_to_xyz * map_candidate_pixel(candidate, source);
+        let image_xyz = prophoto_to_xyz * map_candidate_pixel(image_candidate, source);
         let candidate_error = patch_error(candidate_xyz, patch.reference_xyz);
         let image_error = patch_error(image_xyz, patch.reference_xyz);
         let candidate_delta_e = patch_delta_e76(candidate_xyz, patch.reference_xyz);
@@ -3415,6 +3915,22 @@ pub fn has_destructive_gamut_fallback(diagnostics: &ColorspaceDiagnostics) -> bo
             || total > MAX_LOW_GAMUT_CLIP_RATIO_TOTAL)
 }
 
+/// Returns true only when the mapping that would actually be rendered has lost enough gamut
+/// evidence that even a held-out-validated upstream negative response must not force selection.
+/// Image-matrix *candidate* clipping is deliberately not used here: a safe selected fallback can
+/// legitimately supersede a rejected image-derived matrix.
+pub fn has_catastrophic_render_mapping(diagnostics: &ColorspaceDiagnostics) -> bool {
+    let post_scale_clip_total = diagnostics
+        .post_scale_clipped_low_ratio
+        .iter()
+        .chain(diagnostics.post_scale_clipped_high_ratio.iter())
+        .sum::<f64>();
+    !diagnostics.post_scale_preserved_ratio.is_finite()
+        || diagnostics.post_scale_preserved_ratio < CATASTROPHIC_RENDER_MIN_PRESERVED_GAMUT
+        || !post_scale_clip_total.is_finite()
+        || post_scale_clip_total > CATASTROPHIC_RENDER_MAX_POST_SCALE_CLIP_TOTAL
+}
+
 fn candidate_risk_severity(risk: &str) -> usize {
     match risk {
         "safe" => 0,
@@ -3475,33 +3991,25 @@ pub fn direct_density_render_fallback_reason(
 
     let ica_quality = ica_diagnostics.selected_quality_score?;
     let direct_quality = direct_diagnostics.selected_quality_score?;
-    if candidate_risk_severity(&direct_diagnostics.candidate_risk)
-        > candidate_risk_severity(&ica_diagnostics.candidate_risk)
-    {
+    let ica_risk_severity = candidate_risk_severity(&ica_diagnostics.candidate_risk);
+    let direct_risk_severity = candidate_risk_severity(&direct_diagnostics.candidate_risk);
+    if direct_risk_severity > ica_risk_severity {
         return None;
     }
-    let direct_risk_improves = candidate_risk_severity(&direct_diagnostics.candidate_risk)
-        < candidate_risk_severity(&ica_diagnostics.candidate_risk);
+    let direct_risk_improves = direct_risk_severity < ica_risk_severity;
     let ica_tone_trust = tone_color_trust_state(ica_diagnostics);
     let direct_tone_trust = tone_color_trust_state(direct_diagnostics);
-    let direct_tone_trust_improves =
-        tone_color_trust_severity(direct_tone_trust) < tone_color_trust_severity(ica_tone_trust);
+    let ica_tone_trust_severity = tone_color_trust_severity(ica_tone_trust);
+    let direct_tone_trust_severity = tone_color_trust_severity(direct_tone_trust);
+    if direct_tone_trust_severity > ica_tone_trust_severity {
+        return None;
+    }
+    let direct_tone_trust_improves = direct_tone_trust_severity < ica_tone_trust_severity;
     let direct_review_state_improves = direct_risk_improves || direct_tone_trust_improves;
     let direct_quality_materially_stronger =
         direct_quality + DIRECT_RENDER_QUALITY_IMPROVEMENT_MARGIN < ica_quality;
     let direct_quality_close_enough_for_trust_improvement =
         direct_quality <= ica_quality + DIRECT_RENDER_TRUST_IMPROVEMENT_QUALITY_TOLERANCE;
-    if !(direct_quality_materially_stronger
-        || direct_review_state_improves && direct_quality_close_enough_for_trust_improvement)
-    {
-        return None;
-    }
-    if direct_neutral_delta > ica_neutral_delta + NEUTRAL_REGRESSION_TOLERANCE
-        && !direct_risk_improves
-        && !direct_tone_trust_improves
-    {
-        return None;
-    }
     if direct_total_low > ica_total_low + DIRECT_RENDER_LOW_CLIP_REGRESSION_TOLERANCE {
         return None;
     }
@@ -3514,14 +4022,49 @@ pub fn direct_density_render_fallback_reason(
         return None;
     }
 
+    let evidence_based_selection = direct_quality_materially_stronger
+        || direct_review_state_improves && direct_quality_close_enough_for_trust_improvement;
+    if evidence_based_selection {
+        if direct_neutral_delta > ica_neutral_delta + NEUTRAL_REGRESSION_TOLERANCE
+            && !direct_risk_improves
+            && !direct_tone_trust_improves
+        {
+            return None;
+        }
+
+        return Some(format!(
+            "direct density transmittance produced a materially stronger colorspace candidate than ICA-separated transmittance (quality score {:.6} -> {:.6}) without increasing render-input risk (`{}` -> `{}`), image-matrix low clipping (total {:.1}% -> {:.1}%), or color review state (`{}` -> `{}`)",
+            ica_quality,
+            direct_quality,
+            ica_diagnostics.candidate_risk,
+            direct_diagnostics.candidate_risk,
+            ica_total_low * 100.0,
+            direct_total_low * 100.0,
+            ica_tone_trust,
+            direct_tone_trust
+        ));
+    }
+
+    let physical_prior_is_safe = direct_quality
+        <= ica_quality + DIRECT_RENDER_PHYSICAL_PRIOR_QUALITY_TOLERANCE
+        && direct_neutral_delta <= ica_neutral_delta + NEUTRAL_REGRESSION_TOLERANCE
+        && !preserved_gamut_regressed
+        && direct_diagnostics.post_scale_preserved_ratio
+            >= DIRECT_RENDER_TRUST_IMPROVEMENT_MIN_PRESERVED_GAMUT;
+    if !physical_prior_is_safe {
+        return None;
+    }
+
     Some(format!(
-        "direct density transmittance produced a materially stronger colorspace candidate than ICA-separated transmittance (quality score {:.6} -> {:.6}) without increasing render-input risk (`{}` -> `{}`), image-matrix low clipping (total {:.1}% -> {:.1}%), or color review state (`{}` -> `{}`)",
+        "direct density transmittance was selected as the physically grounded negative-response reconstruction: it preserves scanner-density evidence while blind ICA is underconstrained, and remained within the conservative safety envelope (quality score {:.6} -> {:.6}, risk `{}` -> `{}`, image-matrix low clipping total {:.1}% -> {:.1}%, preserved gamut {:.1}% -> {:.1}%, color review state `{}` -> `{}`)",
         ica_quality,
         direct_quality,
         ica_diagnostics.candidate_risk,
         direct_diagnostics.candidate_risk,
         ica_total_low * 100.0,
         direct_total_low * 100.0,
+        ica_diagnostics.post_scale_preserved_ratio * 100.0,
+        direct_diagnostics.post_scale_preserved_ratio * 100.0,
         ica_tone_trust,
         direct_tone_trust
     ))
@@ -3799,6 +4342,230 @@ struct CandidateSelection {
     selected_index: usize,
     selection_rejections: Vec<String>,
     calibration_acceptance: CalibrationAcceptanceDiagnostics,
+    neutral_safety_rescue: NeutralSafetyRescueDiagnostics,
+}
+
+fn neutral_safety_rescue_diagnostics(
+    matrix_candidate: Option<&ColorMappingCandidate>,
+    neutral_candidate: &ColorMappingCandidate,
+    color_mode: ColorMode,
+) -> NeutralSafetyRescueDiagnostics {
+    let neutral_model = neutral_candidate.score.color_model_quality.as_ref();
+    let neutral_tone = neutral_candidate.score.rendered_tone_quality.as_ref();
+    let neutral_memory_supported = neutral_model.is_some_and(|model| {
+        [
+            &model.memory_color.skin,
+            &model.memory_color.foliage,
+            &model.memory_color.sky,
+        ]
+        .iter()
+        .any(|family| family.sample_count >= MEMORY_COLOR_MIN_FAMILY_SAMPLES)
+    });
+    let neutral_model_evidence_supported = neutral_model.is_some_and(|model| {
+        model.saturation_preservation_sample_count >= SATURATION_PRESERVATION_MIN_SAMPLES
+            && model.spatial_consistency.populated_tile_count >= SPATIAL_CONSISTENCY_MIN_TILES
+    }) && neutral_memory_supported;
+    let matrix_tone = matrix_candidate.and_then(|candidate| {
+        candidate
+            .score
+            .rendered_tone_quality
+            .as_ref()
+            .map(|tone| tone.midtone_saturation_p95)
+    });
+    let neutral_tone_p95 = neutral_tone.map(|tone| tone.midtone_saturation_p95);
+    let matrix_preserved =
+        matrix_candidate.map(|candidate| candidate.stats.pre_scale_preserved_ratio);
+    let preserved_gain =
+        matrix_preserved.map(|matrix| neutral_candidate.stats.pre_scale_preserved_ratio - matrix);
+    let saturation_reduction = matrix_tone
+        .zip(neutral_tone_p95)
+        .map(|(matrix, neutral)| matrix - neutral);
+    let matrix_anchor_supported = matrix_candidate.map(|candidate| {
+        candidate.diagnostics.dominant_anchor_quality.accepted
+            && !candidate
+                .score
+                .dominant_anchor_unstable_channels
+                .iter()
+                .any(|unstable| *unstable)
+    });
+    let matrix_memory_penalty =
+        matrix_candidate.map(|candidate| candidate.score.quality_components.memory_color_penalty);
+    let neutral_memory_penalty = neutral_candidate
+        .score
+        .quality_components
+        .memory_color_penalty;
+    let matrix_spatial_penalty = matrix_candidate.map(|candidate| {
+        candidate
+            .score
+            .quality_components
+            .spatial_consistency_penalty
+    });
+    let neutral_spatial_penalty = neutral_candidate
+        .score
+        .quality_components
+        .spatial_consistency_penalty;
+    let mut diagnostics = NeutralSafetyRescueDiagnostics {
+        evaluated: false,
+        applied: false,
+        matrix_candidate: matrix_candidate.map(|candidate| candidate.candidate.to_string()),
+        matrix_candidate_kind: matrix_candidate
+            .map(|candidate| candidate.kind.as_str().to_string()),
+        matrix_anchor_evidence_supported: matrix_anchor_supported,
+        neutral_estimate_supported: neutral_candidate
+            .diagnostics
+            .neutral_estimate_quality
+            .accepted,
+        neutral_model_evidence_supported,
+        matrix_pre_scale_preserved_ratio: matrix_preserved,
+        neutral_pre_scale_preserved_ratio: neutral_candidate.stats.pre_scale_preserved_ratio,
+        preserved_ratio_gain: preserved_gain,
+        minimum_preserved_ratio: AUTO_NEUTRAL_RESCUE_MIN_PRESERVED_RATIO,
+        minimum_preserved_ratio_gain: AUTO_NEUTRAL_RESCUE_MIN_PRESERVED_GAIN,
+        matrix_midtone_saturation_p95: matrix_tone,
+        neutral_midtone_saturation_p95: neutral_tone_p95,
+        midtone_saturation_p95_reduction: saturation_reduction,
+        maximum_midtone_saturation_p95: RENDER_TONE_MIDTONE_SATURATION_TARGET,
+        minimum_midtone_saturation_p95_reduction:
+            AUTO_NEUTRAL_RESCUE_MIN_MIDTONE_SATURATION_REDUCTION,
+        matrix_memory_color_penalty: matrix_memory_penalty,
+        neutral_memory_color_penalty: neutral_memory_penalty,
+        matrix_spatial_consistency_penalty: matrix_spatial_penalty,
+        neutral_spatial_consistency_penalty: neutral_spatial_penalty,
+        neutral_saturation_preservation_sample_count: neutral_model
+            .map(|model| model.saturation_preservation_sample_count)
+            .unwrap_or(0),
+        neutral_saturation_preservation_p05_ratio: neutral_model
+            .and_then(|model| model.saturation_preservation_p05_ratio),
+        neutral_saturation_preservation_median_ratio: neutral_model
+            .and_then(|model| model.saturation_preservation_median_ratio),
+        neutral_saturation_preservation_p95_ratio: neutral_model
+            .and_then(|model| model.saturation_preservation_p95_ratio),
+        reason: String::new(),
+    };
+
+    if color_mode != ColorMode::Auto {
+        diagnostics.reason = format!(
+            "neutral safety rescue is auto-only; --color-mode {} preserves the requested candidate class",
+            color_mode.as_str()
+        );
+        return diagnostics;
+    }
+    let Some(matrix_candidate) = matrix_candidate else {
+        diagnostics.reason =
+            "neutral safety rescue was not needed because no matrix candidate survived the ordinary safety gate"
+                .to_string();
+        return diagnostics;
+    };
+    diagnostics.evaluated = true;
+
+    let mut blockers = Vec::<String>::new();
+    if matrix_candidate.kind != CandidateKind::ImageDerived {
+        blockers.push(format!(
+            "selected matrix kind `{}` is protected from an uncalibrated neutral rescue",
+            matrix_candidate.kind.as_str()
+        ));
+    }
+    if matrix_anchor_supported == Some(true) {
+        blockers.push("matrix dominant-anchor evidence is supported and stable".to_string());
+    }
+    if !diagnostics.neutral_estimate_supported {
+        blockers.push("neutral estimate is not supported".to_string());
+    }
+    if !neutral_model_evidence_supported {
+        blockers.push(
+            "neutral candidate lacks supported memory-colour, spatial-neutral, or chroma-retention samples"
+                .to_string(),
+        );
+    }
+    if neutral_candidate.stats.pre_scale_preserved_ratio < AUTO_NEUTRAL_RESCUE_MIN_PRESERVED_RATIO {
+        blockers.push(format!(
+            "neutral preserved-gamut ratio {:.6} is below {:.6}",
+            neutral_candidate.stats.pre_scale_preserved_ratio,
+            AUTO_NEUTRAL_RESCUE_MIN_PRESERVED_RATIO
+        ));
+    }
+    if preserved_gain.is_none_or(|gain| gain < AUTO_NEUTRAL_RESCUE_MIN_PRESERVED_GAIN) {
+        blockers.push(format!(
+            "preserved-gamut gain {:.6} is below {:.6}",
+            preserved_gain.unwrap_or(0.0),
+            AUTO_NEUTRAL_RESCUE_MIN_PRESERVED_GAIN
+        ));
+    }
+    if matrix_tone.is_none_or(|value| value <= RENDER_TONE_MIDTONE_SATURATION_TARGET) {
+        blockers.push(format!(
+            "matrix midtone saturation p95 {:.6} does not exceed {:.6}",
+            matrix_tone.unwrap_or(0.0),
+            RENDER_TONE_MIDTONE_SATURATION_TARGET
+        ));
+    }
+    if neutral_tone_p95.is_none_or(|value| value > RENDER_TONE_MIDTONE_SATURATION_TARGET) {
+        blockers.push(format!(
+            "neutral midtone saturation p95 {:.6} exceeds {:.6}",
+            neutral_tone_p95.unwrap_or(f64::INFINITY),
+            RENDER_TONE_MIDTONE_SATURATION_TARGET
+        ));
+    }
+    if saturation_reduction
+        .is_none_or(|reduction| reduction < AUTO_NEUTRAL_RESCUE_MIN_MIDTONE_SATURATION_REDUCTION)
+    {
+        blockers.push(format!(
+            "midtone saturation p95 reduction {:.6} is below {:.6}",
+            saturation_reduction.unwrap_or(0.0),
+            AUTO_NEUTRAL_RESCUE_MIN_MIDTONE_SATURATION_REDUCTION
+        ));
+    }
+
+    let neutral_chroma_retained = neutral_model.is_some_and(|model| {
+        model.saturation_preservation_sample_count >= SATURATION_PRESERVATION_MIN_SAMPLES
+            && model
+                .saturation_preservation_p05_ratio
+                .is_some_and(|ratio| ratio >= SATURATION_PRESERVATION_LOW_P05_TARGET)
+            && model
+                .saturation_preservation_median_ratio
+                .is_some_and(|ratio| ratio >= SATURATION_PRESERVATION_LOW_TARGET)
+            && model
+                .saturation_preservation_p95_ratio
+                .is_some_and(|ratio| ratio <= SATURATION_PRESERVATION_HIGH_TARGET)
+    });
+    if !neutral_chroma_retained {
+        blockers.push("neutral candidate did not retain supported scene chroma".to_string());
+    }
+
+    let memory_no_worse =
+        matrix_memory_penalty.is_some_and(|matrix| neutral_memory_penalty <= matrix + 1e-9);
+    let spatial_no_worse =
+        matrix_spatial_penalty.is_some_and(|matrix| neutral_spatial_penalty <= matrix + 1e-9);
+    let plausibility_improved = matrix_memory_penalty
+        .is_some_and(|matrix| neutral_memory_penalty + 1e-9 < matrix)
+        || matrix_spatial_penalty.is_some_and(|matrix| neutral_spatial_penalty + 1e-9 < matrix);
+    if !memory_no_worse {
+        blockers.push("neutral memory-colour plausibility regressed".to_string());
+    }
+    if !spatial_no_worse {
+        blockers.push("neutral spatial-neutral consistency regressed".to_string());
+    }
+    if !plausibility_improved {
+        blockers.push("neutral perceptual plausibility did not measurably improve".to_string());
+    }
+
+    diagnostics.applied = blockers.is_empty();
+    diagnostics.reason = if diagnostics.applied {
+        format!(
+            "auto neutral safety rescue replaced unsupported image-derived candidate `{}`: preserved gamut {:.6} -> {:.6}, midtone saturation p95 {:.6} -> {:.6}, memory-colour penalty {:.6} -> {:.6}, spatial-neutral penalty {:.6} -> {:.6}; the neutral result remains fallback-only and review-required",
+            matrix_candidate.candidate,
+            matrix_candidate.stats.pre_scale_preserved_ratio,
+            neutral_candidate.stats.pre_scale_preserved_ratio,
+            matrix_tone.unwrap_or(0.0),
+            neutral_tone_p95.unwrap_or(0.0),
+            matrix_memory_penalty.unwrap_or(0.0),
+            neutral_memory_penalty,
+            matrix_spatial_penalty.unwrap_or(0.0),
+            neutral_spatial_penalty,
+        )
+    } else {
+        format!("neutral safety rescue not applied: {}", blockers.join("; "))
+    };
+    diagnostics
 }
 
 fn calibration_candidate_kind(kind: CandidateKind) -> bool {
@@ -4073,6 +4840,11 @@ fn select_color_candidate(
                         image_rejected,
                     ),
                     calibration_acceptance,
+                    neutral_safety_rescue: neutral_safety_rescue_diagnostics(
+                        None,
+                        &candidates[neutral_index],
+                        color_mode,
+                    ),
                 });
             }
             matrix
@@ -4136,7 +4908,18 @@ fn select_color_candidate(
             .then_with(|| left.candidate.cmp(right.candidate))
     });
 
-    let selected_index = eligible[0];
+    let matrix_selected_index = eligible[0];
+    let matrix_candidate = candidates[matrix_selected_index]
+        .kind
+        .is_matrix()
+        .then_some(&candidates[matrix_selected_index]);
+    let neutral_safety_rescue =
+        neutral_safety_rescue_diagnostics(matrix_candidate, &candidates[neutral_index], color_mode);
+    let selected_index = if neutral_safety_rescue.applied {
+        neutral_index
+    } else {
+        matrix_selected_index
+    };
     let calibration_acceptance = calibration_acceptance_for_selection(
         candidates,
         color_mode,
@@ -4146,16 +4929,24 @@ fn select_color_candidate(
         image_candidate,
         image_rejected,
     );
+    let mut selection_rejections = selection_rejections_for_candidates(
+        candidates,
+        preferred_calibration,
+        image_quality,
+        image_candidate,
+        image_rejected,
+    );
+    if neutral_safety_rescue.applied {
+        selection_rejections.push(format!(
+            "{} superseded by neutral safety rescue: {}",
+            candidates[matrix_selected_index].candidate, neutral_safety_rescue.reason
+        ));
+    }
     Ok(CandidateSelection {
         selected_index,
-        selection_rejections: selection_rejections_for_candidates(
-            candidates,
-            preferred_calibration,
-            image_quality,
-            image_candidate,
-            image_rejected,
-        ),
+        selection_rejections,
         calibration_acceptance,
+        neutral_safety_rescue,
     })
 }
 
@@ -4291,6 +5082,7 @@ fn candidate_acceptance_for_selection(
     color_mode: ColorMode,
     selected_index: usize,
     ranks: &[Option<usize>],
+    neutral_safety_rescue: &NeutralSafetyRescueDiagnostics,
 ) -> Vec<ColorMappingCandidateAcceptanceDiagnostics> {
     let image_quality = candidates
         .iter()
@@ -4317,7 +5109,12 @@ fn candidate_acceptance_for_selection(
                 .then_some(candidate.score.quality_score < image_quality);
             let within_negative_gamut_limits =
                 candidate.kind.is_matrix().then_some(!candidate.score.rejected);
-            let (status, reason) = if selected {
+            let (status, reason) = if selected && neutral_safety_rescue.applied {
+                (
+                    "selected_evidence_rescue",
+                    neutral_safety_rescue.reason.clone(),
+                )
+            } else if selected {
                 (
                     "selected",
                     format!(
@@ -4364,7 +5161,17 @@ fn candidate_acceptance_for_selection(
                     AutoCalibrationRejectionKind::Quality => "rejected_quality",
                 };
                 (status, reason)
-            } else if candidate.kind == CandidateKind::NeutralFallback && color_mode == ColorMode::Auto {
+            } else if neutral_safety_rescue.applied
+                && neutral_safety_rescue.matrix_candidate.as_deref()
+                    == Some(candidate.candidate)
+            {
+                (
+                    "rejected_evidence_rescue",
+                    neutral_safety_rescue.reason.clone(),
+                )
+            } else if candidate.kind == CandidateKind::NeutralFallback
+                && color_mode == ColorMode::Auto
+            {
                 (
                     "available_fallback",
                     "neutral-balance fallback remained available but a safe matrix candidate was selected"
@@ -4421,6 +5228,12 @@ fn legacy_image_candidate(
 }
 
 fn candidate_risk_for_diagnostics(diagnostics: &ColorspaceDiagnostics) -> String {
+    if diagnostics.mapping_strategy == "positive_rgb_passthrough" {
+        return "review_unprofiled_input".to_string();
+    }
+    if diagnostics.mapping_strategy == "embedded_icc_to_linear_prophoto" {
+        return "safe".to_string();
+    }
     if diagnostics
         .reference_patch_evaluation
         .as_ref()
@@ -4512,6 +5325,7 @@ fn candidate_risk_for_diagnostics(diagnostics: &ColorspaceDiagnostics) -> String
 pub fn tone_color_trust_state(diagnostics: &ColorspaceDiagnostics) -> &'static str {
     let selected_quality = diagnostics.selected_quality_score.unwrap_or(0.0);
     if diagnostics.candidate_risk.starts_with("review_")
+        || diagnostics.candidate_risk == "fallback_only"
         || selected_quality > COLOR_CANDIDATE_REVIEW_QUALITY_SCORE
     {
         "review_required"
@@ -4545,6 +5359,21 @@ fn render_candidate_thumbnail_panel(
     thumb_h: usize,
     thumb_w: usize,
 ) -> Array3<f64> {
+    render_candidate_thumbnail_panel_with(img, exposure_scale, thumb_h, thumb_w, |source| {
+        matrix * source
+    })
+}
+
+fn render_candidate_thumbnail_panel_with<F>(
+    img: &Array3<f64>,
+    exposure_scale: f64,
+    thumb_h: usize,
+    thumb_w: usize,
+    map: F,
+) -> Array3<f64>
+where
+    F: Fn(Vector3<f64>) -> Vector3<f64>,
+{
     let (h, w, _) = img.dim();
     let mut panel = Array3::<f64>::zeros((thumb_h, thumb_w, 3));
     for ty in 0..thumb_h {
@@ -4556,13 +5385,25 @@ fn render_candidate_thumbnail_panel(
                 .floor()
                 .min((w.saturating_sub(1)) as f64) as usize;
             let pixel = Vector3::new(img[[y, x, 0]], img[[y, x, 1]], img[[y, x, 2]]);
-            let mapped = (matrix * pixel) / exposure_scale.max(1e-6);
+            let mapped = map(pixel) / exposure_scale.max(1e-6);
             for c in 0..3 {
                 panel[[ty, tx, c]] = mapped[c].clamp(0.0, 1.0);
             }
         }
     }
     panel
+}
+
+fn render_candidate_thumbnail_candidate(
+    img: &Array3<f64>,
+    candidate: &ColorMappingCandidate,
+    exposure_scale: f64,
+    thumb_h: usize,
+    thumb_w: usize,
+) -> Array3<f64> {
+    render_candidate_thumbnail_panel_with(img, exposure_scale, thumb_h, thumb_w, |source| {
+        map_candidate_pixel(candidate, source)
+    })
 }
 
 fn build_candidate_comparison_thumbnail(
@@ -4595,18 +5436,29 @@ fn build_candidate_comparison_thumbnail(
     for (panel_idx, candidate_index) in comparison_indices.into_iter().enumerate() {
         let x_offset = panel_idx * (thumb_w + separator);
         let panel = if panel_idx == 0 {
-            render_candidate_thumbnail_panel(
-                img,
-                selected_matrix,
-                selected_exposure_scale,
-                thumb_h,
-                thumb_w,
-            )
+            let selected = &candidates[selected_index];
+            if selected.nonlinear_model.is_some() {
+                render_candidate_thumbnail_candidate(
+                    img,
+                    selected,
+                    selected_exposure_scale,
+                    thumb_h,
+                    thumb_w,
+                )
+            } else {
+                render_candidate_thumbnail_panel(
+                    img,
+                    selected_matrix,
+                    selected_exposure_scale,
+                    thumb_h,
+                    thumb_w,
+                )
+            }
         } else if let Some(candidate_index) = candidate_index {
             let candidate = &candidates[candidate_index];
-            render_candidate_thumbnail_panel(
+            render_candidate_thumbnail_candidate(
                 img,
-                &candidate.matrix,
+                candidate,
                 candidate.stats.exposure_scale,
                 thumb_h,
                 thumb_w,
@@ -4749,6 +5601,10 @@ fn estimate_work_to_xyz_with_prior_matrix(
             ColorMode::Auto,
             "calibration selection not evaluated before candidate selection",
         ),
+        neutral_safety_rescue: NeutralSafetyRescueDiagnostics::not_evaluated(
+            "neutral safety rescue not evaluated before candidate selection",
+        ),
+        nonlinear_color_model: None,
         pre_scale_preserved_ratio: 1.0,
         post_scale_preserved_ratio: 1.0,
         image_matrix_pre_scale_clipped_low_ratio: [0.0; 3],
@@ -4869,6 +5725,7 @@ pub fn map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
         source_label: "image-derived",
         kind: CandidateKind::ImageDerived,
         matrix: image_matrix,
+        nonlinear_model: None,
         stats: image_stats.clone(),
         diagnostics: image_diagnostics.clone(),
         neutral_balance_scale: [1.0; 3],
@@ -4915,6 +5772,7 @@ pub fn map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
             source_label: "gamut-safe image-derived blend",
             kind: CandidateKind::ImageDerived,
             matrix: blend_matrix,
+            nonlinear_model: None,
             stats: blend_stats.clone(),
             diagnostics: blend_diagnostics.clone(),
             neutral_balance_scale: [1.0; 3],
@@ -4968,6 +5826,7 @@ pub fn map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
                 source_label: "gamut-trusted image-derived blend",
                 kind: CandidateKind::ImageDerived,
                 matrix: blend_matrix,
+                nonlinear_model: None,
                 stats: blend_stats.clone(),
                 diagnostics: blend_diagnostics.clone(),
                 neutral_balance_scale: [1.0; 3],
@@ -5025,6 +5884,7 @@ pub fn map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
                     source_label: "gamut-stabilized image-derived blend",
                     kind: CandidateKind::ImageDerived,
                     matrix: stable_matrix,
+                    nonlinear_model: None,
                     stats: stable_stats.clone(),
                     diagnostics: stable_diagnostics.clone(),
                     neutral_balance_scale: [1.0; 3],
@@ -5065,6 +5925,7 @@ pub fn map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
             source_label: "scanner-constrained image-derived",
             kind: CandidateKind::ScannerPrior,
             matrix: scanner_matrix,
+            nonlinear_model: None,
             stats: scanner_stats.clone(),
             diagnostics: scanner_diagnostics.clone(),
             neutral_balance_scale: [1.0; 3],
@@ -5118,6 +5979,7 @@ pub fn map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
             source_label: "calibrated profile",
             kind: CandidateKind::CalibratedDirect,
             matrix: calibrated_matrix,
+            nonlinear_model: None,
             stats: calibrated_stats.clone(),
             diagnostics: calibrated_diagnostics.clone(),
             neutral_balance_scale: [1.0; 3],
@@ -5136,6 +5998,141 @@ pub fn map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
                 Some(&calibrated_model_quality),
             ),
         });
+
+        if let Some(model) = profile.color_model.as_ref() {
+            let post_xyz = profile
+                .color_model_post_xyz
+                .as_ref()
+                .map(const_to_matrix3)
+                .unwrap_or_else(Matrix3::identity);
+            let runtime_model = RuntimeNonlinearTransform::RootPolynomial {
+                model: Arc::new(model.clone()),
+                xyz_to_prophoto: xyz_to_pro * cat * post_xyz,
+            };
+            let nonlinear_stats =
+                evaluate_mapping_stats_with(img, neutral_rgb, |source| runtime_model.map(source));
+            let nonlinear_rendered_tone = evaluate_nonlinear_candidate_rendered_tone(
+                img,
+                &runtime_model,
+                nonlinear_stats.exposure_scale,
+            );
+            let nonlinear_model_quality = evaluate_nonlinear_candidate_model_quality(
+                img,
+                &runtime_model,
+                nonlinear_stats.exposure_scale,
+            );
+            let support = nonlinear_model_runtime_diagnostics(img, &runtime_model);
+            let mut nonlinear_diagnostics = calibrated_diagnostics.clone();
+            nonlinear_diagnostics.condition_number = model.validation.design_condition_number;
+            nonlinear_diagnostics.regularization_lambda = model.validation.regularization_lambda;
+            nonlinear_diagnostics.mapping_strategy = "calibrated_root_polynomial";
+            nonlinear_diagnostics.selected_mapping_reason = format!(
+                "held-out-qualified degree-{} root-polynomial model `{}` was evaluated against its matrix fallback with scene-domain, gamut, tone, and perceptual diagnostics",
+                model.degree, model.model_id
+            );
+            nonlinear_diagnostics.nonlinear_color_model = Some(support.clone());
+            let mut nonlinear_score = score_color_candidate(
+                "calibrated_root_polynomial",
+                "calibrated_root_polynomial",
+                CandidateKind::CalibratedDirect,
+                &nonlinear_stats,
+                &nonlinear_diagnostics,
+                [false; 3],
+                &neutral_estimate.quality,
+                Some(profile.confidence),
+                Some(&model.fit),
+                Some(&nonlinear_rendered_tone),
+                Some(&nonlinear_model_quality),
+            );
+            reject_candidate_for_nonlinear_support(&mut nonlinear_score, &support);
+            candidates.push(ColorMappingCandidate {
+                candidate: "calibrated_root_polynomial",
+                mapping_strategy: "calibrated_root_polynomial",
+                source_label: "held-out calibrated root-polynomial profile",
+                kind: CandidateKind::CalibratedDirect,
+                matrix: calibrated_matrix,
+                nonlinear_model: Some(runtime_model),
+                stats: nonlinear_stats,
+                diagnostics: nonlinear_diagnostics.clone(),
+                neutral_balance_scale: [1.0; 3],
+                selected_mapping_reason: nonlinear_diagnostics.selected_mapping_reason.clone(),
+                score: nonlinear_score,
+            });
+        }
+
+        if let Some(model) = profile.lut_3d_model.as_ref() {
+            let post_xyz = profile
+                .color_model_post_xyz
+                .as_ref()
+                .map(const_to_matrix3)
+                .unwrap_or_else(Matrix3::identity);
+            let baseline_matrix = *profile
+                .scanner_prior_work_to_xyz
+                .as_ref()
+                .unwrap_or(&profile.work_to_xyz);
+            let root_baseline = (model.baseline_kind == "root_polynomial")
+                .then(|| profile.color_model.clone().map(Arc::new))
+                .flatten();
+            let runtime_model = RuntimeNonlinearTransform::ResidualLut3d {
+                model: Arc::new(model.clone()),
+                baseline_matrix,
+                root_baseline,
+                xyz_to_prophoto: xyz_to_pro * cat * post_xyz,
+            };
+            let nonlinear_stats =
+                evaluate_mapping_stats_with(img, neutral_rgb, |source| runtime_model.map(source));
+            let nonlinear_rendered_tone = evaluate_nonlinear_candidate_rendered_tone(
+                img,
+                &runtime_model,
+                nonlinear_stats.exposure_scale,
+            );
+            let nonlinear_model_quality = evaluate_nonlinear_candidate_model_quality(
+                img,
+                &runtime_model,
+                nonlinear_stats.exposure_scale,
+            );
+            let support = nonlinear_model_runtime_diagnostics(img, &runtime_model);
+            let mut nonlinear_diagnostics = calibrated_diagnostics.clone();
+            nonlinear_diagnostics.condition_number = model.validation.regularized_condition_number;
+            nonlinear_diagnostics.regularization_lambda = model.validation.regularization_lambda;
+            nonlinear_diagnostics.mapping_strategy = "calibrated_residual_lut_3d";
+            nonlinear_diagnostics.selected_mapping_reason = format!(
+                "held-out-qualified {}x{}x{} smooth residual LUT `{}` over its {} baseline was evaluated against the simpler calibrated candidates with scene-domain, gamut, tone, and perceptual diagnostics",
+                model.grid_size,
+                model.grid_size,
+                model.grid_size,
+                model.model_id,
+                model.baseline_kind
+            );
+            nonlinear_diagnostics.nonlinear_color_model = Some(support.clone());
+            let mut nonlinear_score = score_color_candidate(
+                "calibrated_residual_lut_3d",
+                "calibrated_residual_lut_3d",
+                CandidateKind::CalibratedDirect,
+                &nonlinear_stats,
+                &nonlinear_diagnostics,
+                [false; 3],
+                &neutral_estimate.quality,
+                Some(profile.confidence),
+                Some(&model.fit),
+                Some(&nonlinear_rendered_tone),
+                Some(&nonlinear_model_quality),
+            );
+            reject_candidate_for_nonlinear_support(&mut nonlinear_score, &support);
+            candidates.push(ColorMappingCandidate {
+                candidate: "calibrated_residual_lut_3d",
+                mapping_strategy: "calibrated_residual_lut_3d",
+                source_label: "held-out calibrated smooth residual 3D LUT profile",
+                kind: CandidateKind::CalibratedDirect,
+                matrix: calibrated_matrix,
+                nonlinear_model: Some(runtime_model),
+                stats: nonlinear_stats,
+                diagnostics: nonlinear_diagnostics.clone(),
+                neutral_balance_scale: [1.0; 3],
+                selected_mapping_reason: nonlinear_diagnostics.selected_mapping_reason.clone(),
+                score: nonlinear_score,
+            });
+        }
     }
 
     let neutral_stats = evaluate_mapping_stats(img, &neutral_matrix, neutral_rgb);
@@ -5156,6 +6153,7 @@ pub fn map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
         source_label: "neutral-balance fallback",
         kind: CandidateKind::NeutralFallback,
         matrix: neutral_matrix,
+        nonlinear_model: None,
         stats: neutral_stats.clone(),
         diagnostics: neutral_diagnostics.clone(),
         neutral_balance_scale,
@@ -5208,7 +6206,14 @@ pub fn map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
         && matrix_candidate_count > 0
         && matrix_candidate_count == rejected_matrix_count;
 
-    let (combined, neutral_trim_diagnostics) = if selected_candidate.kind.is_matrix() {
+    let (combined, neutral_trim_diagnostics) = if selected_candidate.nonlinear_model.is_some() {
+        (
+            selected_candidate.matrix,
+            NeutralTrimDiagnostics::skipped(
+                "neutral trim skipped: the selected nonlinear calibration is preserved exactly as held-out validated; creative/technical white balance remains a separate reported stage",
+            ),
+        )
+    } else if selected_candidate.kind.is_matrix() {
         evaluate_neutral_trim(
             img,
             &neutral_estimate,
@@ -5256,7 +6261,11 @@ pub fn map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
                 let y = row_start + local_y;
                 for x in 0..w {
                     let pixel = Vector3::new(img[[y, x, 0]], img[[y, x, 1]], img[[y, x, 2]]);
-                    let mapped = (combined * pixel) / exposure_scale;
+                    let mapped = selected_candidate
+                        .nonlinear_model
+                        .as_ref()
+                        .map_or_else(|| combined * pixel, |model| model.map(pixel))
+                        / exposure_scale;
                     let mut any_clipped = false;
                     for c in 0..3 {
                         if mapped[c] > 1.0 + GAMUT_CLIP_EPSILON {
@@ -5287,8 +6296,13 @@ pub fn map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
     let ranks = candidate_ranks(&candidates);
     let selected_runner_up_quality_delta =
         selected_runner_up_quality_delta(&candidates, selected_index, color_mode);
-    let candidate_acceptance =
-        candidate_acceptance_for_selection(&candidates, color_mode, selected_index, &ranks);
+    let candidate_acceptance = candidate_acceptance_for_selection(
+        &candidates,
+        color_mode,
+        selected_index,
+        &ranks,
+        &selection.neutral_safety_rescue,
+    );
     let candidate_scores = candidates
         .iter()
         .enumerate()
@@ -5302,6 +6316,16 @@ pub fn map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
         })
         .collect::<Vec<_>>();
     let mut diagnostics = selected_candidate.diagnostics.clone();
+    diagnostics.nonlinear_color_model = selected_candidate
+        .diagnostics
+        .nonlinear_color_model
+        .clone()
+        .or_else(|| {
+            candidates
+                .iter()
+                .rev()
+                .find_map(|candidate| candidate.diagnostics.nonlinear_color_model.clone())
+        });
     let total_pixels = (h * w).max(1) as f64;
     diagnostics.pre_scale_channel_max = chosen_stats.pre_scale_channel_max;
     diagnostics.pre_scale_channel_high_percentile = chosen_stats.pre_scale_channel_high_percentile;
@@ -5330,6 +6354,8 @@ pub fn map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
     };
     diagnostics.mapping_strategy = if selected_neutral_due_to_gamut {
         "neutral_balance_gamut_fallback"
+    } else if selection.neutral_safety_rescue.applied {
+        "neutral_balance_evidence_rescue"
     } else if color_mode == ColorMode::Neutral {
         "neutral_balance_forced"
     } else {
@@ -5340,6 +6366,8 @@ pub fn map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
             .gamut_fallback_reason
             .clone()
             .unwrap_or_default()
+    } else if selection.neutral_safety_rescue.applied {
+        selection.neutral_safety_rescue.reason.clone()
     } else if color_mode != ColorMode::Auto {
         format!(
             "--color-mode {} selected {}",
@@ -5358,6 +6386,7 @@ pub fn map_to_prophoto_d50_with_color_mode_and_calibration_diagnostics(
     diagnostics.technical_safety_score = Some(selected_candidate.score.technical_safety_score);
     diagnostics.color_fidelity_score = Some(selected_candidate.score.color_fidelity_score);
     diagnostics.selected_runner_up_quality_delta = selected_runner_up_quality_delta;
+    diagnostics.neutral_safety_rescue = selection.neutral_safety_rescue.clone();
     diagnostics.selection_rejections = selection.selection_rejections;
     diagnostics.neutral_sample_rejections = neutral_estimate.rejections.clone();
     diagnostics.reference_patch_evaluation = reference_patch_evaluation;
@@ -5720,6 +6749,7 @@ mod tests {
             patch_count: 24,
             target_residual_rms: 0.05,
             target_residual_max: 0.10,
+            validation: None,
             per_hue_residuals: Vec::new(),
             worst_patches: Vec::new(),
         };

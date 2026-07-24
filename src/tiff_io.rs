@@ -1,10 +1,17 @@
+use std::borrow::Cow;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use crate::atomic_file::AtomicFile;
 use crate::constants::{D50_WHITE, MAX_14BIT, MAX_16BIT, PROPHOTO_TO_XYZ_D50};
-use image::{DynamicImage, Rgb, RgbImage};
+use crate::input_color::{EmbeddedIccProfile, IccProfileDiagnostics};
+use image::codecs::png::PngDecoder;
+use image::metadata::Orientation;
+use image::{DynamicImage, ImageDecoder, RgbImage};
 use ndarray::Array3;
+use sha2::{Digest, Sha256};
+use tiff::decoder::ifd::Value as TiffValue;
 use tiff::decoder::{Decoder, DecodingResult, Limits};
 use tiff::tags::Tag;
 use tiff::ColorType;
@@ -12,16 +19,77 @@ use tiff::ColorType;
 pub const PROPHOTO_LINEAR_ICC_DESCRIPTION: &str = "ScanStitch linear ProPhoto RGB D50";
 pub const PROPHOTO_SCENE_REFERRED_FLOAT_DESCRIPTION: &str =
     "ScanStitch scene-referred linear ProPhoto RGB D50 32-bit float";
+pub const SRGB_ICC_DESCRIPTION: &str = "sRGB IEC61966-2.1";
+pub const SRGB_REVIEW_GAMUT_MAPPING_SPACE: &str =
+    "CIELAB_D50_constant_lightness_and_hue_to_sRGB_D65";
 pub const ICC_PROFILE_TAG: u16 = 34_675;
+pub const TIFF_STREAM_TARGET_BYTES: usize = 1_000_000;
+pub const PNG_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+/// Creation timestamp of ScanStitch's immutable output-profile definitions.
+///
+/// ICC header timestamps describe the profile, not the rendered artifact. Keeping
+/// this fixed makes otherwise identical output files byte-reproducible; artifact
+/// creation time remains available from the report and filesystem metadata.
+pub const CANONICAL_ICC_CREATION_DATE_TIME: [u16; 6] = [2026, 5, 8, 0, 0, 0];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TiffIccProfileInspection {
+    pub width: u32,
+    pub height: u32,
+    pub color_type: String,
+    pub sample_format: Option<Vec<u16>>,
     pub image_description: Option<String>,
     pub icc_profile_embedded: bool,
     pub icc_profile_size_bytes: Option<usize>,
     pub icc_profile_valid: bool,
     pub icc_profile_description: Option<String>,
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PngSrgbProfileInspection {
+    pub width: u32,
+    pub height: u32,
+    pub color_type: String,
+    pub icc_profile_embedded: bool,
+    pub icc_profile_size_bytes: Option<usize>,
+    pub icc_profile_valid: bool,
+    pub icc_profile_description: Option<String>,
+    pub icc_profile_matches_standard_srgb: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SrgbGamutMappingResult {
+    pub linear_srgb: [f64; 3],
+    pub mapped: bool,
+    pub chroma_scale: f64,
+    pub input_finite: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SrgbReviewDiagnostics {
+    pub width: usize,
+    pub height: usize,
+    pub pixel_count: usize,
+    pub nonfinite_input_pixel_count: usize,
+    pub gamut_mapped_pixel_count: usize,
+    pub gamut_mapped_ratio: f64,
+    pub mapped_mean_chroma_scale: f64,
+    pub mapped_min_chroma_scale: f64,
+    pub post_map_out_of_gamut_pixel_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactWriteBufferDiagnostics {
+    pub strategy: &'static str,
+    pub full_frame_conversion_buffers: bool,
+    pub tiff_strip_target_bytes: usize,
+    pub primary_tiff_conversion_buffer_bytes: usize,
+    pub master_tiff_conversion_buffer_bytes: Option<usize>,
+    pub review_png_row_buffer_bytes: Option<usize>,
+    pub review_png_stream_chunk_bytes: Option<usize>,
+    pub peak_declared_buffer_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,12 +131,85 @@ pub struct TiffLoadDiagnostics {
     pub source_channel_count: usize,
     pub source_has_alpha: bool,
     pub working_range: WorkingRangeDiagnostics,
+    pub decoded_pixel_sha256: String,
+    pub orientation: OrientationDiagnostics,
+    pub orientation_correction: OrientationCorrectionDiagnostics,
+    pub effective_orientation_tag: Option<u16>,
+    pub source_icc_profile: Option<IccProfileDiagnostics>,
     pub dng_metadata: Option<DngMetadata>,
+    pub dng_level_normalization: Option<DngLevelNormalizationDiagnostics>,
 }
 
 pub struct LoadedTiff {
     pub image: Array3<u16>,
     pub diagnostics: TiffLoadDiagnostics,
+    pub embedded_icc_profile: Option<EmbeddedIccProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrientationDiagnostics {
+    pub tag_value: Option<u16>,
+    pub transform: String,
+    pub applied: bool,
+    pub source_width: usize,
+    pub source_height: usize,
+    pub output_width: usize,
+    pub output_height: usize,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrientationCorrectionDiagnostics {
+    pub requested: String,
+    pub transform: String,
+    pub applied: bool,
+    pub input_width: usize,
+    pub input_height: usize,
+    pub output_width: usize,
+    pub output_height: usize,
+    pub effective_tag_value: Option<u16>,
+    pub effective_transform: String,
+    pub source_orientation_materialized_decoded_pixel_sha256: String,
+    pub corrected_decoded_pixel_sha256: String,
+    pub reason: String,
+}
+
+/// Hashes the normalized, orientation-materialized decoded RGB samples together
+/// with their dimensions and working precision. The digest is stable across
+/// container metadata changes but changes when decoding, range normalization,
+/// orientation, dimensions, channel count, or sample values change.
+pub fn sha256_decoded_pixels(image: &Array3<u16>, working_bit_depth: u8) -> String {
+    let (height, width, channels) = image.dim();
+    let mut hasher = Sha256::new();
+    hasher.update((width as u64).to_le_bytes());
+    hasher.update((height as u64).to_le_bytes());
+    hasher.update((channels as u64).to_le_bytes());
+    hasher.update([working_bit_depth]);
+
+    const SAMPLE_CHUNK: usize = 32 * 1024;
+    let mut bytes = Vec::with_capacity(SAMPLE_CHUNK * 2);
+    for sample in image {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+        if bytes.len() == bytes.capacity() {
+            hasher.update(&bytes);
+            bytes.clear();
+        }
+    }
+    if !bytes.is_empty() {
+        hasher.update(&bytes);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DngLevelNormalizationDiagnostics {
+    pub status: String,
+    pub black_level: [f64; 3],
+    pub white_level: [f64; 3],
+    pub source_code_max: u16,
+    pub clipped_below_black: [u64; 3],
+    pub clipped_above_white: [u64; 3],
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -84,6 +225,7 @@ pub struct DngMetadata {
     pub as_shot_neutral: Option<Vec<f64>>,
     pub black_level: Option<Vec<f64>>,
     pub white_level: Option<Vec<f64>>,
+    pub orientation: Option<u16>,
     pub parse_warnings: Vec<String>,
 }
 
@@ -100,6 +242,7 @@ impl DngMetadata {
             || self.as_shot_neutral.is_some()
             || self.black_level.is_some()
             || self.white_level.is_some()
+            || self.orientation.is_some()
             || !self.parse_warnings.is_empty()
     }
 }
@@ -136,6 +279,7 @@ struct ClassicIfd {
 
 #[derive(Debug, Clone)]
 struct DngLinearRawCandidate {
+    ifd_offset: u64,
     width: usize,
     height: usize,
     color_type: String,
@@ -169,6 +313,7 @@ const TIFF_TAG_COMPRESSION: u16 = 259;
 const TIFF_TAG_PHOTOMETRIC_INTERPRETATION: u16 = 262;
 const TIFF_TAG_MAKE: u16 = 271;
 const TIFF_TAG_MODEL: u16 = 272;
+const TIFF_TAG_ORIENTATION: u16 = 274;
 const TIFF_TAG_STRIP_OFFSETS: u16 = 273;
 const TIFF_TAG_SAMPLES_PER_PIXEL: u16 = 277;
 const TIFF_TAG_ROWS_PER_STRIP: u16 = 278;
@@ -299,6 +444,373 @@ pub fn normalize_to_working_bit_depth(
     )
 }
 
+fn canonical_dng_channel_levels(values: Option<&[f64]>, default: f64) -> Option<[f64; 3]> {
+    let Some(values) = values else {
+        return Some([default; 3]);
+    };
+    if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    if values.len() == 1 {
+        return Some([values[0]; 3]);
+    }
+    if values.len().is_multiple_of(3) {
+        let samples_per_channel = values.len() / 3;
+        return Some(std::array::from_fn(|channel| {
+            values.iter().skip(channel).step_by(3).sum::<f64>() / samples_per_channel as f64
+        }));
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    Some([mean; 3])
+}
+
+fn normalize_dng_black_white_levels(
+    image: &Array3<u16>,
+    source_bits_per_sample: u8,
+    metadata: Option<&DngMetadata>,
+) -> (Array3<u16>, DngLevelNormalizationDiagnostics) {
+    let source_code_max = source_bit_depth_max(source_bits_per_sample).min(u16::MAX as u32) as u16;
+    let black_values = metadata.and_then(|metadata| metadata.black_level.as_deref());
+    let white_values = metadata.and_then(|metadata| metadata.white_level.as_deref());
+    let metadata_present = black_values.is_some() || white_values.is_some();
+    let Some(black_level) = canonical_dng_channel_levels(black_values, 0.0) else {
+        return (
+            image.clone(),
+            DngLevelNormalizationDiagnostics {
+                status: "invalid_metadata".to_string(),
+                black_level: [0.0; 3],
+                white_level: [source_code_max as f64; 3],
+                source_code_max,
+                clipped_below_black: [0; 3],
+                clipped_above_white: [0; 3],
+                reason: "DNG BlackLevel contains no usable finite samples; raw code values were preserved"
+                    .to_string(),
+            },
+        );
+    };
+    let Some(white_level) = canonical_dng_channel_levels(white_values, source_code_max as f64)
+    else {
+        return (
+            image.clone(),
+            DngLevelNormalizationDiagnostics {
+                status: "invalid_metadata".to_string(),
+                black_level,
+                white_level: [source_code_max as f64; 3],
+                source_code_max,
+                clipped_below_black: [0; 3],
+                clipped_above_white: [0; 3],
+                reason: "DNG WhiteLevel contains no usable finite samples; raw code values were preserved"
+                    .to_string(),
+            },
+        );
+    };
+    if (0..3).any(|channel| white_level[channel] <= black_level[channel]) {
+        return (
+            image.clone(),
+            DngLevelNormalizationDiagnostics {
+                status: "invalid_metadata".to_string(),
+                black_level,
+                white_level,
+                source_code_max,
+                clipped_below_black: [0; 3],
+                clipped_above_white: [0; 3],
+                reason: "DNG WhiteLevel must exceed BlackLevel in every RGB channel; raw code values were preserved"
+                    .to_string(),
+            },
+        );
+    }
+    if !metadata_present {
+        return (
+            image.clone(),
+            DngLevelNormalizationDiagnostics {
+                status: "not_present".to_string(),
+                black_level,
+                white_level,
+                source_code_max,
+                clipped_below_black: [0; 3],
+                clipped_above_white: [0; 3],
+                reason: "DNG BlackLevel and WhiteLevel were absent; default full code range was preserved"
+                    .to_string(),
+            },
+        );
+    }
+
+    let mut clipped_below_black = [0u64; 3];
+    let mut clipped_above_white = [0u64; 3];
+    let mut normalized = Array3::<u16>::zeros(image.dim());
+    let (height, width, _) = image.dim();
+    for y in 0..height {
+        for x in 0..width {
+            for channel in 0..3 {
+                let sample = image[[y, x, channel]] as f64;
+                if sample < black_level[channel] {
+                    clipped_below_black[channel] += 1;
+                }
+                if sample > white_level[channel] {
+                    clipped_above_white[channel] += 1;
+                }
+                let scaled = ((sample - black_level[channel])
+                    / (white_level[channel] - black_level[channel]))
+                    .clamp(0.0, 1.0)
+                    * source_code_max as f64;
+                normalized[[y, x, channel]] = scaled.round() as u16;
+            }
+        }
+    }
+    (
+        normalized,
+        DngLevelNormalizationDiagnostics {
+            status: "applied".to_string(),
+            black_level,
+            white_level,
+            source_code_max,
+            clipped_below_black,
+            clipped_above_white,
+            reason: "DNG code values were black-subtracted and normalized by per-channel WhiteLevel before downstream processing"
+                .to_string(),
+        },
+    )
+}
+
+fn orientation_name(orientation: Orientation) -> &'static str {
+    match orientation {
+        Orientation::NoTransforms => "identity",
+        Orientation::Rotate90 => "rotate_90_clockwise",
+        Orientation::Rotate180 => "rotate_180",
+        Orientation::Rotate270 => "rotate_270_clockwise",
+        Orientation::FlipHorizontal => "flip_horizontal",
+        Orientation::FlipVertical => "flip_vertical",
+        Orientation::Rotate90FlipH => "rotate_90_clockwise_then_flip_horizontal",
+        Orientation::Rotate270FlipH => "rotate_270_clockwise_then_flip_horizontal",
+    }
+}
+
+pub fn orientation_transform_name(tag_value: Option<u16>) -> &'static str {
+    match tag_value {
+        Some(2) => "flip_horizontal",
+        Some(3) => "rotate_180",
+        Some(4) => "flip_vertical",
+        Some(5) => "rotate_90_clockwise_then_flip_horizontal",
+        Some(6) => "rotate_90_clockwise",
+        Some(7) => "rotate_270_clockwise_then_flip_horizontal",
+        Some(8) => "rotate_270_clockwise",
+        _ => "identity",
+    }
+}
+
+fn orientation_linear_transform(tag_value: u16) -> [[i8; 2]; 2] {
+    match tag_value {
+        2 => [[-1, 0], [0, 1]],
+        3 => [[-1, 0], [0, -1]],
+        4 => [[1, 0], [0, -1]],
+        5 => [[0, 1], [1, 0]],
+        6 => [[0, -1], [1, 0]],
+        7 => [[0, -1], [-1, 0]],
+        8 => [[0, 1], [-1, 0]],
+        _ => [[1, 0], [0, 1]],
+    }
+}
+
+fn multiply_orientation_transforms(left: [[i8; 2]; 2], right: [[i8; 2]; 2]) -> [[i8; 2]; 2] {
+    [
+        [
+            left[0][0] * right[0][0] + left[0][1] * right[1][0],
+            left[0][0] * right[0][1] + left[0][1] * right[1][1],
+        ],
+        [
+            left[1][0] * right[0][0] + left[1][1] * right[1][0],
+            left[1][0] * right[0][1] + left[1][1] * right[1][1],
+        ],
+    ]
+}
+
+/// Compose a metadata orientation with a correction applied to the already-oriented pixels.
+/// The result is the equivalent original-scanner-to-final-output EXIF transform.
+pub fn compose_orientation_tags(
+    source_tag_value: Option<u16>,
+    correction_tag_value: u16,
+) -> Option<u16> {
+    if correction_tag_value == 1 {
+        return source_tag_value;
+    }
+    let source = source_tag_value
+        .filter(|value| (1..=8).contains(value))
+        .unwrap_or(1);
+    let correction = correction_tag_value.clamp(1, 8);
+    let composed = multiply_orientation_transforms(
+        orientation_linear_transform(correction),
+        orientation_linear_transform(source),
+    );
+    (1..=8).find(|tag| orientation_linear_transform(*tag) == composed)
+}
+
+fn no_orientation_correction_diagnostics(
+    orientation: &OrientationDiagnostics,
+    decoded_pixel_sha256: &str,
+) -> OrientationCorrectionDiagnostics {
+    OrientationCorrectionDiagnostics {
+        requested: "none".to_string(),
+        transform: "identity".to_string(),
+        applied: false,
+        input_width: orientation.output_width,
+        input_height: orientation.output_height,
+        output_width: orientation.output_width,
+        output_height: orientation.output_height,
+        effective_tag_value: orientation.tag_value,
+        effective_transform: orientation.transform.clone(),
+        source_orientation_materialized_decoded_pixel_sha256: decoded_pixel_sha256.to_string(),
+        corrected_decoded_pixel_sha256: decoded_pixel_sha256.to_string(),
+        reason: "no metadata-relative semantic-orientation correction was requested".to_string(),
+    }
+}
+
+/// Apply an explicit orthogonal correction after source orientation metadata and update the exact
+/// decoded-pixel binding plus the effective original-scanner coordinate transform.
+pub fn apply_orientation_correction_u16(
+    loaded: &mut LoadedTiff,
+    correction_tag_value: u16,
+    requested: &str,
+    working_bit_depth: u8,
+) -> Result<(), String> {
+    if !(1..=8).contains(&correction_tag_value) {
+        return Err(format!(
+            "orientation correction tag {correction_tag_value} is outside EXIF range 1-8"
+        ));
+    }
+    let source_hash = loaded.diagnostics.decoded_pixel_sha256.clone();
+    let input_width = loaded.diagnostics.width;
+    let input_height = loaded.diagnostics.height;
+    let source_tag = loaded.diagnostics.orientation.tag_value;
+    let source = std::mem::replace(&mut loaded.image, Array3::zeros((0, 0, 3)));
+    let (corrected, correction) = apply_orientation_u16(source, Some(correction_tag_value));
+    let corrected_hash = sha256_decoded_pixels(&corrected, working_bit_depth);
+    let effective_tag_value = compose_orientation_tags(source_tag, correction_tag_value);
+    let effective_transform = if correction_tag_value == 1 {
+        loaded.diagnostics.orientation.transform.clone()
+    } else {
+        orientation_transform_name(effective_tag_value).to_string()
+    };
+    loaded.image = corrected;
+    loaded.diagnostics.width = correction.output_width;
+    loaded.diagnostics.height = correction.output_height;
+    loaded.diagnostics.decoded_pixel_sha256 = corrected_hash.clone();
+    loaded.diagnostics.effective_orientation_tag = effective_tag_value;
+    loaded.diagnostics.orientation_correction = OrientationCorrectionDiagnostics {
+        requested: requested.to_string(),
+        transform: correction.transform,
+        applied: correction.applied,
+        input_width,
+        input_height,
+        output_width: correction.output_width,
+        output_height: correction.output_height,
+        effective_tag_value,
+        effective_transform,
+        source_orientation_materialized_decoded_pixel_sha256: source_hash,
+        corrected_decoded_pixel_sha256: corrected_hash,
+        reason: if correction.applied {
+            "explicit semantic-orientation correction was applied after EXIF/DNG orientation and before scanner linearization, border detection, deskew, and stitching".to_string()
+        } else {
+            "explicit semantic-orientation correction was identity after EXIF/DNG orientation"
+                .to_string()
+        },
+    };
+    Ok(())
+}
+
+fn apply_orientation_u16(
+    image: Array3<u16>,
+    tag_value: Option<u16>,
+) -> (Array3<u16>, OrientationDiagnostics) {
+    let (source_height, source_width, channels) = image.dim();
+    let orientation = tag_value
+        .and_then(|value| u8::try_from(value).ok())
+        .and_then(Orientation::from_exif);
+    let Some(orientation) = orientation else {
+        let reason = if tag_value.is_some() {
+            "TIFF Orientation tag was outside the supported EXIF range 1-8; pixels were left unchanged"
+        } else {
+            "TIFF Orientation tag was absent; pixels were assumed to be top-left oriented"
+        };
+        return (
+            image,
+            OrientationDiagnostics {
+                tag_value,
+                transform: "identity".to_string(),
+                applied: false,
+                source_width,
+                source_height,
+                output_width: source_width,
+                output_height: source_height,
+                reason: reason.to_string(),
+            },
+        );
+    };
+    if orientation == Orientation::NoTransforms {
+        return (
+            image,
+            OrientationDiagnostics {
+                tag_value,
+                transform: orientation_name(orientation).to_string(),
+                applied: false,
+                source_width,
+                source_height,
+                output_width: source_width,
+                output_height: source_height,
+                reason: "TIFF Orientation tag already describes top-left pixel order".to_string(),
+            },
+        );
+    }
+
+    let swaps_dimensions = matches!(
+        orientation,
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    );
+    let (output_height, output_width) = if swaps_dimensions {
+        (source_width, source_height)
+    } else {
+        (source_height, source_width)
+    };
+    let mut output = Array3::<u16>::zeros((output_height, output_width, channels));
+    for output_y in 0..output_height {
+        for output_x in 0..output_width {
+            let (source_y, source_x) = match orientation {
+                Orientation::NoTransforms => (output_y, output_x),
+                Orientation::FlipHorizontal => (output_y, source_width - 1 - output_x),
+                Orientation::Rotate180 => {
+                    (source_height - 1 - output_y, source_width - 1 - output_x)
+                }
+                Orientation::FlipVertical => (source_height - 1 - output_y, output_x),
+                Orientation::Rotate90FlipH => (output_x, output_y),
+                Orientation::Rotate90 => (source_height - 1 - output_x, output_y),
+                Orientation::Rotate270FlipH => {
+                    (source_height - 1 - output_x, source_width - 1 - output_y)
+                }
+                Orientation::Rotate270 => (output_x, source_width - 1 - output_y),
+            };
+            for channel in 0..channels {
+                output[[output_y, output_x, channel]] = image[[source_y, source_x, channel]];
+            }
+        }
+    }
+    (
+        output,
+        OrientationDiagnostics {
+            tag_value,
+            transform: orientation_name(orientation).to_string(),
+            applied: true,
+            source_width,
+            source_height,
+            output_width,
+            output_height,
+            reason: "TIFF Orientation metadata was applied before border detection and stitching"
+                .to_string(),
+        },
+    )
+}
+
 fn decode_layout(
     color_type: ColorType,
 ) -> Result<(u8, usize, bool, String), Box<dyn std::error::Error>> {
@@ -313,6 +825,41 @@ fn decoder_for_scanner_tiff(
     file: File,
 ) -> Result<Decoder<BufReader<File>>, Box<dyn std::error::Error>> {
     Ok(Decoder::new(BufReader::new(file))?.with_limits(Limits::unlimited()))
+}
+
+fn tiff_value_into_bytes(value: TiffValue) -> Result<Vec<u8>, String> {
+    fn append(value: TiffValue, output: &mut Vec<u8>) -> Result<(), String> {
+        match value {
+            TiffValue::Byte(value) => output.push(value),
+            TiffValue::Short(value) => output.push(
+                u8::try_from(value)
+                    .map_err(|_| format!("TIFF tag contains non-byte SHORT value {value}"))?,
+            ),
+            TiffValue::Unsigned(value) => output.push(
+                u8::try_from(value)
+                    .map_err(|_| format!("TIFF tag contains non-byte LONG value {value}"))?,
+            ),
+            TiffValue::UnsignedBig(value) => output.push(
+                u8::try_from(value)
+                    .map_err(|_| format!("TIFF tag contains non-byte LONG8 value {value}"))?,
+            ),
+            TiffValue::List(values) => {
+                for value in values {
+                    append(value, output)?;
+                }
+            }
+            other => {
+                return Err(format!(
+                    "TIFF tag has unsupported value representation {other:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    let mut output = Vec::new();
+    append(value, &mut output)?;
+    Ok(output)
 }
 
 fn interleaved_u8_to_rgb_array(
@@ -398,6 +945,16 @@ pub fn load_tiff_u16(
     let color_type = decoder.colortype()?;
     let (source_bits_per_sample, source_channel_count, source_has_alpha, color_label) =
         decode_layout(color_type)?;
+    let orientation_tag = decoder
+        .get_tag_u32(Tag::Orientation)
+        .ok()
+        .and_then(|value| u16::try_from(value).ok());
+    let embedded_icc_profile = decoder
+        .get_tag(Tag::Unknown(ICC_PROFILE_TAG))
+        .ok()
+        .and_then(|value| tiff_value_into_bytes(value).ok())
+        .filter(|bytes| !bytes.is_empty())
+        .map(EmbeddedIccProfile::from_bytes);
 
     let source = match decoder.read_image()? {
         DecodingResult::U8(raw) => {
@@ -414,21 +971,35 @@ pub fn load_tiff_u16(
         }
     };
 
-    let (image, working_range) =
+    let (working_image, working_range) =
         normalize_to_working_bit_depth(&source, source_bits_per_sample, target_bit_depth);
+    let (image, orientation) = apply_orientation_u16(working_image, orientation_tag);
+    let decoded_pixel_sha256 = sha256_decoded_pixels(&image, target_bit_depth);
+    let source_icc_profile = embedded_icc_profile
+        .as_ref()
+        .map(|profile| profile.diagnostics.clone());
 
+    let orientation_correction =
+        no_orientation_correction_diagnostics(&orientation, &decoded_pixel_sha256);
     Ok(LoadedTiff {
         image,
         diagnostics: TiffLoadDiagnostics {
-            width: width as usize,
-            height: height as usize,
+            width: orientation.output_width,
+            height: orientation.output_height,
             color_type: color_label,
             source_bits_per_sample,
             source_channel_count,
             source_has_alpha,
             working_range,
+            decoded_pixel_sha256,
+            effective_orientation_tag: orientation.tag_value,
+            orientation,
+            orientation_correction,
+            source_icc_profile,
             dng_metadata: None,
+            dng_level_normalization: None,
         },
+        embedded_icc_profile,
     })
 }
 
@@ -439,24 +1010,53 @@ fn load_dng_linear_raw_u16(
     let mut file = File::open(path)?;
     let (byte_order, first_ifd_offset) = read_classic_tiff_header(&mut file)?;
     let first_ifd = read_classic_ifd(&mut file, byte_order, first_ifd_offset)?;
-    let dng_metadata = parse_dng_metadata(&mut file, byte_order, &first_ifd);
+    let primary_metadata = parse_dng_metadata(&mut file, byte_order, &first_ifd);
     let candidate = select_dng_linear_raw_candidate(&mut file, byte_order, first_ifd_offset)?;
+    let candidate_metadata = if candidate.ifd_offset == first_ifd_offset {
+        None
+    } else {
+        let candidate_ifd = read_classic_ifd(&mut file, byte_order, candidate.ifd_offset)?;
+        parse_dng_metadata(&mut file, byte_order, &candidate_ifd)
+    };
+    let dng_metadata = merge_dng_metadata(primary_metadata, candidate_metadata);
     let source = read_dng_linear_raw_pixels(&mut file, byte_order, &candidate)?;
-    let (image, working_range) =
-        normalize_to_working_bit_depth(&source, candidate.source_bits_per_sample, target_bit_depth);
+    let (level_normalized, dng_level_normalization) = normalize_dng_black_white_levels(
+        &source,
+        candidate.source_bits_per_sample,
+        dng_metadata.as_ref(),
+    );
+    let (working_image, working_range) = normalize_to_working_bit_depth(
+        &level_normalized,
+        candidate.source_bits_per_sample,
+        target_bit_depth,
+    );
+    let orientation_tag = dng_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.orientation);
+    let (image, orientation) = apply_orientation_u16(working_image, orientation_tag);
+    let decoded_pixel_sha256 = sha256_decoded_pixels(&image, target_bit_depth);
 
+    let orientation_correction =
+        no_orientation_correction_diagnostics(&orientation, &decoded_pixel_sha256);
     Ok(LoadedTiff {
         image,
         diagnostics: TiffLoadDiagnostics {
-            width: candidate.width,
-            height: candidate.height,
+            width: orientation.output_width,
+            height: orientation.output_height,
             color_type: candidate.color_type,
             source_bits_per_sample: candidate.source_bits_per_sample,
             source_channel_count: candidate.source_channel_count,
             source_has_alpha: candidate.source_has_alpha,
             working_range,
+            decoded_pixel_sha256,
+            effective_orientation_tag: orientation.tag_value,
+            orientation,
+            orientation_correction,
+            source_icc_profile: None,
             dng_metadata,
+            dng_level_normalization: Some(dng_level_normalization),
         },
+        embedded_icc_profile: None,
     })
 }
 
@@ -609,6 +1209,20 @@ fn parse_dng_metadata(
         "Software",
         ifd_ascii_string_opt(file, byte_order, first_ifd, TIFF_TAG_SOFTWARE),
     );
+    let orientation_value = optional_metadata(
+        &mut warnings,
+        "Orientation",
+        ifd_value_u64(file, byte_order, first_ifd, TIFF_TAG_ORIENTATION),
+    );
+    let orientation = orientation_value.and_then(|value| match u16::try_from(value) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            warnings.push(format!(
+                "Orientation: value {value} does not fit the TIFF SHORT domain"
+            ));
+            None
+        }
+    });
     let unique_camera_model = optional_metadata(
         &mut warnings,
         "UniqueCameraModel",
@@ -662,9 +1276,42 @@ fn parse_dng_metadata(
         as_shot_neutral,
         black_level,
         white_level,
+        orientation,
         parse_warnings: warnings,
     };
     metadata.has_reportable_metadata().then_some(metadata)
+}
+
+fn merge_dng_metadata(
+    primary: Option<DngMetadata>,
+    selected_ifd: Option<DngMetadata>,
+) -> Option<DngMetadata> {
+    let mut merged = primary.unwrap_or_default();
+    if let Some(selected) = selected_ifd {
+        merged.make = selected.make.or(merged.make);
+        merged.model = selected.model.or(merged.model);
+        merged.software = selected.software.or(merged.software);
+        merged.unique_camera_model = selected.unique_camera_model.or(merged.unique_camera_model);
+        merged.calibration_illuminant1 = selected
+            .calibration_illuminant1
+            .or(merged.calibration_illuminant1);
+        merged.calibration_illuminant2 = selected
+            .calibration_illuminant2
+            .or(merged.calibration_illuminant2);
+        merged.color_matrix1 = selected.color_matrix1.or(merged.color_matrix1);
+        merged.color_matrix2 = selected.color_matrix2.or(merged.color_matrix2);
+        merged.as_shot_neutral = selected.as_shot_neutral.or(merged.as_shot_neutral);
+        merged.black_level = selected.black_level.or(merged.black_level);
+        merged.white_level = selected.white_level.or(merged.white_level);
+        merged.orientation = selected.orientation.or(merged.orientation);
+        merged.parse_warnings.extend(
+            selected
+                .parse_warnings
+                .into_iter()
+                .map(|warning| format!("selected image IFD: {warning}")),
+        );
+    }
+    merged.has_reportable_metadata().then_some(merged)
 }
 
 fn select_dng_linear_raw_candidate(
@@ -691,7 +1338,7 @@ fn select_dng_linear_raw_candidate(
     let mut candidates = Vec::new();
     for offset in offsets {
         let ifd = read_classic_ifd(file, byte_order, offset)?;
-        if let Some(candidate) = dng_candidate_from_ifd(file, byte_order, &ifd)? {
+        if let Some(candidate) = dng_candidate_from_ifd(file, byte_order, offset, &ifd)? {
             candidates.push(candidate);
         }
     }
@@ -708,6 +1355,7 @@ fn select_dng_linear_raw_candidate(
 fn dng_candidate_from_ifd(
     file: &mut File,
     byte_order: TiffByteOrder,
+    ifd_offset: u64,
     ifd: &ClassicIfd,
 ) -> Result<Option<DngLinearRawCandidate>, Box<dyn std::error::Error>> {
     let width = required_ifd_value_u64(file, byte_order, ifd, TIFF_TAG_IMAGE_WIDTH)? as usize;
@@ -762,6 +1410,7 @@ fn dng_candidate_from_ifd(
     let _new_subfile_type = ifd_value_u64(file, byte_order, ifd, TIFF_TAG_NEW_SUBFILE_TYPE)?;
 
     Ok(Some(DngLinearRawCandidate {
+        ifd_offset,
         width,
         height,
         color_type,
@@ -1054,23 +1703,85 @@ fn ifd_entry_bytes(
     Ok(bytes)
 }
 
+fn rgb_row_bytes(width: u32, bytes_per_sample: usize) -> usize {
+    (width as usize)
+        .saturating_mul(3)
+        .saturating_mul(bytes_per_sample)
+}
+
+fn checked_rgb_dimensions(shape: &[usize]) -> Result<(u32, u32), Box<dyn std::error::Error>> {
+    if shape.len() != 3 || shape[2] != 3 {
+        return Err(format!("expected an HxWx3 RGB array, got shape {shape:?}").into());
+    }
+    if shape[0] == 0 || shape[1] == 0 {
+        return Err(format!("cannot encode an empty RGB image with shape {shape:?}").into());
+    }
+    let height = u32::try_from(shape[0])
+        .map_err(|_| format!("image height {} exceeds the TIFF/PNG u32 limit", shape[0]))?;
+    let width = u32::try_from(shape[1])
+        .map_err(|_| format!("image width {} exceeds the TIFF/PNG u32 limit", shape[1]))?;
+    Ok((width, height))
+}
+
+fn tiff_rows_per_strip(width: u32, bytes_per_sample: usize) -> u32 {
+    let row_bytes = rgb_row_bytes(width, bytes_per_sample).max(1);
+    TIFF_STREAM_TARGET_BYTES
+        .saturating_add(row_bytes - 1)
+        .checked_div(row_bytes)
+        .unwrap_or(1)
+        .max(1)
+        .min(u32::MAX as usize) as u32
+}
+
+fn tiff_conversion_buffer_bytes(width: u32, height: u32, bytes_per_sample: usize) -> usize {
+    rgb_row_bytes(width, bytes_per_sample).saturating_mul(
+        (height as usize).min(tiff_rows_per_strip(width, bytes_per_sample) as usize),
+    )
+}
+
+pub fn artifact_write_buffer_diagnostics(
+    width: u32,
+    height: u32,
+    write_master: bool,
+    write_review_png: bool,
+) -> ArtifactWriteBufferDiagnostics {
+    let primary_tiff_conversion_buffer_bytes =
+        tiff_conversion_buffer_bytes(width, height, std::mem::size_of::<u16>());
+    let master_tiff_conversion_buffer_bytes = write_master
+        .then(|| tiff_conversion_buffer_bytes(width, height, std::mem::size_of::<f32>()));
+    let review_png_row_buffer_bytes =
+        write_review_png.then(|| rgb_row_bytes(width, std::mem::size_of::<u8>()));
+    let review_png_stream_chunk_bytes = write_review_png.then_some(PNG_STREAM_CHUNK_BYTES);
+    let peak_declared_buffer_bytes = primary_tiff_conversion_buffer_bytes
+        .max(master_tiff_conversion_buffer_bytes.unwrap_or(0))
+        .max(
+            review_png_row_buffer_bytes
+                .unwrap_or(0)
+                .saturating_add(review_png_stream_chunk_bytes.unwrap_or(0)),
+        );
+    ArtifactWriteBufferDiagnostics {
+        strategy: "sequential_bounded_tiff_strips_and_png_rows",
+        full_frame_conversion_buffers: false,
+        tiff_strip_target_bytes: TIFF_STREAM_TARGET_BYTES,
+        primary_tiff_conversion_buffer_bytes,
+        master_tiff_conversion_buffer_bytes,
+        review_png_row_buffer_bytes,
+        review_png_stream_chunk_bytes,
+        peak_declared_buffer_bytes,
+    }
+}
+
 /// Save an Array3<u16> (height, width, 3) as a 16-bit TIFF.
 pub fn save_tiff_u16(arr: &Array3<u16>, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let shape = arr.shape();
-    let height = shape[0] as u32;
-    let width = shape[1] as u32;
-
-    // Build contiguous pixel buffer
-    let mut buf = Vec::with_capacity((height * width * 3) as usize);
-    for y in 0..shape[0] {
+    let (width, height) = checked_rgb_dimensions(shape)?;
+    write_rgb16_tiff_rows(width, height, path, None, None, |y, row| {
         for x in 0..shape[1] {
-            buf.push(arr[[y, x, 0]]);
-            buf.push(arr[[y, x, 1]]);
-            buf.push(arr[[y, x, 2]]);
+            row.push(arr[[y, x, 0]]);
+            row.push(arr[[y, x, 1]]);
+            row.push(arr[[y, x, 2]]);
         }
-    }
-
-    write_rgb16_tiff(&buf, width, height, path, None, None)
+    })
 }
 
 /// Save an Array3<f64> (height, width, 3) as a 16-bit TIFF.
@@ -1097,67 +1808,247 @@ pub fn save_tiff_f32_linear_prophoto_scene_referred(
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let shape = arr.shape();
-    let height = shape[0] as u32;
-    let width = shape[1] as u32;
-
-    let mut buf = Vec::with_capacity((height * width * 3) as usize);
-    for y in 0..shape[0] {
-        for x in 0..shape[1] {
-            for c in 0..3 {
-                let value = arr[[y, x, c]];
-                if value.is_finite() {
-                    buf.push(value as f32);
-                } else {
-                    buf.push(0.0);
-                }
-            }
-        }
-    }
+    let (width, height) = checked_rgb_dimensions(shape)?;
 
     let icc_profile = prophoto_linear_icc_profile();
-    write_rgb32_float_tiff(
-        &buf,
+    write_rgb32_float_tiff_rows(
         width,
         height,
         path,
         Some(PROPHOTO_SCENE_REFERRED_FLOAT_DESCRIPTION),
         Some(&icc_profile),
+        |y, row| {
+            for x in 0..shape[1] {
+                for c in 0..3 {
+                    let value = arr[[y, x, c]];
+                    row.push(if value.is_finite() { value as f32 } else { 0.0 });
+                }
+            }
+        },
     )
 }
 
 pub fn save_srgb_png_from_linear_prophoto(
     arr: &Array3<f64>,
     path: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<SrgbReviewDiagnostics, Box<dyn std::error::Error>> {
     let shape = arr.shape();
-    let height = shape[0] as u32;
-    let width = shape[1] as u32;
-    let mut img = RgbImage::new(width, height);
+    let (width, height) = checked_rgb_dimensions(shape)?;
+    let mut nonfinite_input_pixel_count = 0usize;
+    let mut gamut_mapped_pixel_count = 0usize;
+    let mut mapped_chroma_scale_sum = 0.0f64;
+    let mut mapped_min_chroma_scale = 1.0f64;
+    let mut post_map_out_of_gamut_pixel_count = 0usize;
 
-    for y in 0..shape[0] {
-        for x in 0..shape[1] {
-            let rgb = [
-                arr[[y, x, 0]].clamp(0.0, 1.0),
-                arr[[y, x, 1]].clamp(0.0, 1.0),
-                arr[[y, x, 2]].clamp(0.0, 1.0),
-            ];
-            let xyz_d50 = mul3x3_vec(PROPHOTO_TO_XYZ_D50, rgb);
-            let xyz_d65 = mul3x3_vec(D50_TO_D65_BRADFORD, xyz_d50);
-            let linear_srgb = mul3x3_vec(XYZ_D65_TO_SRGB, xyz_d65);
-            img.put_pixel(
-                x as u32,
-                y as u32,
-                Rgb([
-                    encode_srgb_u8(linear_srgb[0]),
-                    encode_srgb_u8(linear_srgb[1]),
-                    encode_srgb_u8(linear_srgb[2]),
-                ]),
-            );
+    let mut staged = AtomicFile::new(path)?;
+    {
+        let mut buffered = BufWriter::new(staged.file_mut());
+        let mut info = png::Info::with_size(width, height);
+        info.icc_profile = Some(Cow::Owned(srgb_icc_profile()?));
+        let mut encoder = png::Encoder::with_info(&mut buffered, info)?;
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::High);
+        encoder.set_filter(png::Filter::Adaptive);
+        let mut writer = encoder.write_header()?;
+        {
+            let mut stream = writer.stream_writer_with_size(PNG_STREAM_CHUNK_BYTES)?;
+            let mut row = Vec::with_capacity(rgb_row_bytes(width, std::mem::size_of::<u8>()));
+            for y in 0..shape[0] {
+                row.clear();
+                for x in 0..shape[1] {
+                    let mapping = perceptual_srgb_from_linear_prophoto([
+                        arr[[y, x, 0]],
+                        arr[[y, x, 1]],
+                        arr[[y, x, 2]],
+                    ]);
+                    if !mapping.input_finite {
+                        nonfinite_input_pixel_count += 1;
+                    }
+                    if mapping.mapped {
+                        gamut_mapped_pixel_count += 1;
+                        mapped_chroma_scale_sum += mapping.chroma_scale;
+                        mapped_min_chroma_scale = mapped_min_chroma_scale.min(mapping.chroma_scale);
+                    }
+                    if !linear_srgb_is_in_gamut(&mapping.linear_srgb) {
+                        post_map_out_of_gamut_pixel_count += 1;
+                    }
+                    row.push(encode_srgb_u8(mapping.linear_srgb[0]));
+                    row.push(encode_srgb_u8(mapping.linear_srgb[1]));
+                    row.push(encode_srgb_u8(mapping.linear_srgb[2]));
+                }
+                stream.write_all(&row)?;
+            }
+            stream.finish()?;
+        }
+        writer.finish()?;
+        buffered.flush()?;
+    }
+    staged.commit()?;
+    let pixel_count = shape[0].saturating_mul(shape[1]);
+    Ok(SrgbReviewDiagnostics {
+        width: shape[1],
+        height: shape[0],
+        pixel_count,
+        nonfinite_input_pixel_count,
+        gamut_mapped_pixel_count,
+        gamut_mapped_ratio: if pixel_count == 0 {
+            0.0
+        } else {
+            gamut_mapped_pixel_count as f64 / pixel_count as f64
+        },
+        mapped_mean_chroma_scale: if gamut_mapped_pixel_count == 0 {
+            1.0
+        } else {
+            mapped_chroma_scale_sum / gamut_mapped_pixel_count as f64
+        },
+        mapped_min_chroma_scale: if gamut_mapped_pixel_count == 0 {
+            1.0
+        } else {
+            mapped_min_chroma_scale
+        },
+        post_map_out_of_gamut_pixel_count,
+    })
+}
+
+pub fn perceptual_srgb_from_linear_prophoto(rgb: [f64; 3]) -> SrgbGamutMappingResult {
+    if rgb.iter().any(|value| !value.is_finite()) {
+        return SrgbGamutMappingResult {
+            linear_srgb: [0.0; 3],
+            mapped: true,
+            chroma_scale: 0.0,
+            input_finite: false,
+        };
+    }
+
+    let xyz_d50 = mul3x3_vec(PROPHOTO_TO_XYZ_D50, rgb);
+    let direct = xyz_d50_to_linear_srgb(xyz_d50);
+    if linear_srgb_is_in_gamut(&direct) {
+        return SrgbGamutMappingResult {
+            linear_srgb: direct,
+            mapped: false,
+            chroma_scale: 1.0,
+            input_finite: true,
+        };
+    }
+
+    let lab = crate::colorspace::xyz_d50_to_lab(xyz_d50);
+    if lab.iter().all(|value| value.is_finite()) {
+        let lightness = lab[0].clamp(0.0, 100.0);
+        let chroma = lab[1].hypot(lab[2]);
+        let candidate_for_scale = |scale: f64| {
+            let candidate_lab = if chroma > 1e-12 {
+                [lightness, lab[1] * scale, lab[2] * scale]
+            } else {
+                [lightness, 0.0, 0.0]
+            };
+            xyz_d50_to_linear_srgb(crate::colorspace::lab_to_xyz_d50(candidate_lab))
+        };
+        let neutral = candidate_for_scale(0.0);
+        if linear_srgb_is_in_gamut_with_tolerance(&neutral) {
+            if chroma <= 1e-12 {
+                return SrgbGamutMappingResult {
+                    linear_srgb: clamp_linear_srgb(neutral),
+                    mapped: true,
+                    chroma_scale: 1.0,
+                    input_finite: true,
+                };
+            }
+            let mut low = 0.0f64;
+            let mut high = 1.0f64;
+            for _ in 0..24 {
+                let mid = (low + high) * 0.5;
+                if linear_srgb_is_in_gamut_with_tolerance(&candidate_for_scale(mid)) {
+                    low = mid;
+                } else {
+                    high = mid;
+                }
+            }
+            let chroma_scale = (low * 0.999_999).clamp(0.0, 1.0);
+            return SrgbGamutMappingResult {
+                linear_srgb: clamp_linear_srgb(candidate_for_scale(chroma_scale)),
+                mapped: true,
+                chroma_scale,
+                input_finite: true,
+            };
         }
     }
 
-    img.save(path)?;
-    Ok(())
+    SrgbGamutMappingResult {
+        linear_srgb: [0.0; 3],
+        mapped: true,
+        chroma_scale: 0.0,
+        input_finite: true,
+    }
+}
+
+pub fn srgb_icc_profile() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut profile = moxcms::ColorProfile::new_srgb().encode()?;
+    if profile.get(36..40) != Some(b"acsp") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "generated sRGB ICC profile has no valid 128-byte ICC header",
+        )
+        .into());
+    }
+    let encoded_date = profile.get_mut(24..36).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "generated sRGB ICC profile is too short for its creation timestamp",
+        )
+    })?;
+    for (destination, value) in encoded_date
+        .chunks_exact_mut(2)
+        .zip(CANONICAL_ICC_CREATION_DATE_TIME)
+    {
+        destination.copy_from_slice(&value.to_be_bytes());
+    }
+    Ok(profile)
+}
+
+pub fn inspect_srgb_png(
+    path: &Path,
+) -> Result<PngSrgbProfileInspection, Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let mut decoder = PngDecoder::new(BufReader::new(file))?;
+    let (width, height) = decoder.dimensions();
+    let color_type = format!("{:?}", decoder.color_type());
+    let icc_profile = decoder.icc_profile()?;
+    let Some(icc_profile) = icc_profile else {
+        return Ok(PngSrgbProfileInspection {
+            width,
+            height,
+            color_type,
+            icc_profile_embedded: false,
+            icc_profile_size_bytes: None,
+            icc_profile_valid: false,
+            icc_profile_description: None,
+            icc_profile_matches_standard_srgb: false,
+            reason: Some("missing embedded sRGB ICC profile".to_string()),
+        });
+    };
+    let validation_reason = icc_profile_validation_reason(&icc_profile);
+    let icc_profile_valid = validation_reason.is_none();
+    let icc_profile_description = icc_profile_description(&icc_profile);
+    let expected_profile = srgb_icc_profile()?;
+    let icc_profile_matches_standard_srgb = icc_profile_valid
+        && icc_profiles_match_ignoring_creation_time(&icc_profile, &expected_profile);
+    let reason = validation_reason.or_else(|| {
+        (!icc_profile_matches_standard_srgb).then(|| {
+            "embedded ICC profile does not match the standard ScanStitch sRGB profile".to_string()
+        })
+    });
+    Ok(PngSrgbProfileInspection {
+        width,
+        height,
+        color_type,
+        icc_profile_embedded: true,
+        icc_profile_size_bytes: Some(icc_profile.len()),
+        icc_profile_valid,
+        icc_profile_description,
+        icc_profile_matches_standard_srgb,
+        reason,
+    })
 }
 
 const D50_TO_D65_BRADFORD: [[f64; 3]; 3] = [
@@ -1171,6 +2062,25 @@ const XYZ_D65_TO_SRGB: [[f64; 3]; 3] = [
     [-0.9692660, 1.8760108, 0.0415560],
     [0.0556434, -0.2040259, 1.0572252],
 ];
+
+fn xyz_d50_to_linear_srgb(xyz_d50: [f64; 3]) -> [f64; 3] {
+    let xyz_d65 = mul3x3_vec(D50_TO_D65_BRADFORD, xyz_d50);
+    mul3x3_vec(XYZ_D65_TO_SRGB, xyz_d65)
+}
+
+fn linear_srgb_is_in_gamut(rgb: &[f64; 3]) -> bool {
+    rgb.iter()
+        .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+}
+
+fn linear_srgb_is_in_gamut_with_tolerance(rgb: &[f64; 3]) -> bool {
+    rgb.iter()
+        .all(|value| value.is_finite() && *value >= -1e-10 && *value <= 1.0 + 1e-10)
+}
+
+fn clamp_linear_srgb(rgb: [f64; 3]) -> [f64; 3] {
+    rgb.map(|value| value.clamp(0.0, 1.0))
+}
 
 fn mul3x3_vec(matrix: [[f64; 3]; 3], value: [f64; 3]) -> [f64; 3] {
     [
@@ -1197,20 +2107,22 @@ fn save_tiff_f64_with_profile(
     icc_profile: Option<&[u8]>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let shape = arr.shape();
-    let height = shape[0] as u32;
-    let width = shape[1] as u32;
-
-    let mut buf = Vec::with_capacity((height * width * 3) as usize);
-    for y in 0..shape[0] {
-        for x in 0..shape[1] {
-            for c in 0..3 {
-                let v = arr[[y, x, c]].clamp(0.0, 1.0);
-                buf.push((v * 65535.0).round() as u16);
+    let (width, height) = checked_rgb_dimensions(shape)?;
+    write_rgb16_tiff_rows(
+        width,
+        height,
+        path,
+        image_description,
+        icc_profile,
+        |y, row| {
+            for x in 0..shape[1] {
+                for c in 0..3 {
+                    let value = arr[[y, x, c]].clamp(0.0, 1.0);
+                    row.push((value * 65535.0).round() as u16);
+                }
             }
-        }
-    }
-
-    write_rgb16_tiff(&buf, width, height, path, image_description, icc_profile)
+        },
+    )
 }
 
 pub fn inspect_tiff_icc_profile(
@@ -1218,9 +2130,16 @@ pub fn inspect_tiff_icc_profile(
 ) -> Result<TiffIccProfileInspection, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let mut decoder = decoder_for_scanner_tiff(file)?;
+    let (width, height) = decoder.dimensions()?;
+    let color_type = format!("{:?}", decoder.colortype()?);
+    let sample_format = decoder.get_tag_u16_vec(Tag::SampleFormat).ok();
     let image_description = decoder.get_tag_ascii_string(Tag::ImageDescription).ok();
     let Ok(icc_value) = decoder.get_tag(Tag::Unknown(ICC_PROFILE_TAG)) else {
         return Ok(TiffIccProfileInspection {
+            width,
+            height,
+            color_type,
+            sample_format,
             image_description,
             icc_profile_embedded: false,
             icc_profile_size_bytes: None,
@@ -1229,10 +2148,14 @@ pub fn inspect_tiff_icc_profile(
             reason: Some(format!("missing ICC profile TIFF tag {ICC_PROFILE_TAG}")),
         });
     };
-    let icc_values = match icc_value.into_u32_vec() {
+    let icc = match tiff_value_into_bytes(icc_value) {
         Ok(values) => values,
         Err(err) => {
             return Ok(TiffIccProfileInspection {
+                width,
+                height,
+                color_type,
+                sample_format,
                 image_description,
                 icc_profile_embedded: true,
                 icc_profile_size_bytes: None,
@@ -1242,24 +2165,14 @@ pub fn inspect_tiff_icc_profile(
             });
         }
     };
-    let mut icc = Vec::with_capacity(icc_values.len());
-    for value in icc_values {
-        let Ok(byte) = u8::try_from(value) else {
-            return Ok(TiffIccProfileInspection {
-                image_description,
-                icc_profile_embedded: true,
-                icc_profile_size_bytes: Some(icc.len()),
-                icc_profile_valid: false,
-                icc_profile_description: None,
-                reason: Some(format!("ICC profile tag contains non-byte value {value}")),
-            });
-        };
-        icc.push(byte);
-    }
     let reason = icc_profile_validation_reason(&icc);
     let icc_profile_valid = reason.is_none();
     let icc_profile_description = icc_profile_description(&icc);
     Ok(TiffIccProfileInspection {
+        width,
+        height,
+        color_type,
+        sample_format,
         image_description,
         icc_profile_embedded: true,
         icc_profile_size_bytes: Some(icc.len()),
@@ -1269,53 +2182,134 @@ pub fn inspect_tiff_icc_profile(
     })
 }
 
-fn write_rgb16_tiff(
-    buf: &[u16],
+fn write_rgb16_tiff_rows<F>(
     width: u32,
     height: u32,
     path: &Path,
     image_description: Option<&str>,
     icc_profile: Option<&[u8]>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let file = std::fs::File::create(path)?;
-    let mut encoder = tiff::encoder::TiffEncoder::new(std::io::BufWriter::new(file))?;
-    let mut image = encoder.new_image::<tiff::encoder::colortype::RGB16>(width, height)?;
-    if let Some(description) = image_description {
-        image
-            .encoder()
-            .write_tag(Tag::ImageDescription, description)?;
+    mut append_row: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnMut(usize, &mut Vec<u16>),
+{
+    let mut staged = AtomicFile::new(path)?;
+    {
+        let mut buffered = BufWriter::new(staged.file_mut());
+        {
+            let mut encoder = tiff::encoder::TiffEncoder::new(&mut buffered)?;
+            let mut image = encoder.new_image::<tiff::encoder::colortype::RGB16>(width, height)?;
+            image.rows_per_strip(tiff_rows_per_strip(width, std::mem::size_of::<u16>()))?;
+            if let Some(description) = image_description {
+                image
+                    .encoder()
+                    .write_tag(Tag::ImageDescription, description)?;
+            }
+            if let Some(profile) = icc_profile {
+                image
+                    .encoder()
+                    .write_tag(Tag::Unknown(ICC_PROFILE_TAG), profile)?;
+            }
+            let row_samples = (width as usize)
+                .checked_mul(3)
+                .ok_or("RGB16 TIFF row sample count overflow")?;
+            let mut next_y = 0usize;
+            let mut strip = Vec::with_capacity(
+                usize::try_from(image.next_strip_sample_count())
+                    .map_err(|_| "RGB16 TIFF strip sample count exceeds usize")?,
+            );
+            while image.next_strip_sample_count() > 0 {
+                let sample_count = usize::try_from(image.next_strip_sample_count())
+                    .map_err(|_| "RGB16 TIFF strip sample count exceeds usize")?;
+                let rows = sample_count
+                    .checked_div(row_samples)
+                    .ok_or("RGB16 TIFF row sample count is zero")?;
+                strip.clear();
+                for y in next_y..next_y.saturating_add(rows) {
+                    append_row(y, &mut strip);
+                }
+                if strip.len() != sample_count {
+                    return Err(format!(
+                        "RGB16 TIFF row encoder produced {} samples for a {}-sample strip",
+                        strip.len(),
+                        sample_count
+                    )
+                    .into());
+                }
+                image.write_strip(&strip)?;
+                next_y = next_y.saturating_add(rows);
+            }
+            image.finish()?;
+        }
+        buffered.flush()?;
     }
-    if let Some(profile) = icc_profile {
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(ICC_PROFILE_TAG), profile)?;
-    }
-    image.write_data(buf)?;
+    staged.commit()?;
     Ok(())
 }
 
-fn write_rgb32_float_tiff(
-    buf: &[f32],
+fn write_rgb32_float_tiff_rows<F>(
     width: u32,
     height: u32,
     path: &Path,
     image_description: Option<&str>,
     icc_profile: Option<&[u8]>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let file = std::fs::File::create(path)?;
-    let mut encoder = tiff::encoder::TiffEncoder::new(std::io::BufWriter::new(file))?;
-    let mut image = encoder.new_image::<tiff::encoder::colortype::RGB32Float>(width, height)?;
-    if let Some(description) = image_description {
-        image
-            .encoder()
-            .write_tag(Tag::ImageDescription, description)?;
+    mut append_row: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnMut(usize, &mut Vec<f32>),
+{
+    let mut staged = AtomicFile::new(path)?;
+    {
+        let mut buffered = BufWriter::new(staged.file_mut());
+        {
+            let mut encoder = tiff::encoder::TiffEncoder::new(&mut buffered)?;
+            let mut image =
+                encoder.new_image::<tiff::encoder::colortype::RGB32Float>(width, height)?;
+            image.rows_per_strip(tiff_rows_per_strip(width, std::mem::size_of::<f32>()))?;
+            if let Some(description) = image_description {
+                image
+                    .encoder()
+                    .write_tag(Tag::ImageDescription, description)?;
+            }
+            if let Some(profile) = icc_profile {
+                image
+                    .encoder()
+                    .write_tag(Tag::Unknown(ICC_PROFILE_TAG), profile)?;
+            }
+            let row_samples = (width as usize)
+                .checked_mul(3)
+                .ok_or("RGB32 TIFF row sample count overflow")?;
+            let mut next_y = 0usize;
+            let mut strip = Vec::with_capacity(
+                usize::try_from(image.next_strip_sample_count())
+                    .map_err(|_| "RGB32 TIFF strip sample count exceeds usize")?,
+            );
+            while image.next_strip_sample_count() > 0 {
+                let sample_count = usize::try_from(image.next_strip_sample_count())
+                    .map_err(|_| "RGB32 TIFF strip sample count exceeds usize")?;
+                let rows = sample_count
+                    .checked_div(row_samples)
+                    .ok_or("RGB32 TIFF row sample count is zero")?;
+                strip.clear();
+                for y in next_y..next_y.saturating_add(rows) {
+                    append_row(y, &mut strip);
+                }
+                if strip.len() != sample_count {
+                    return Err(format!(
+                        "RGB32 TIFF row encoder produced {} samples for a {}-sample strip",
+                        strip.len(),
+                        sample_count
+                    )
+                    .into());
+                }
+                image.write_strip(&strip)?;
+                next_y = next_y.saturating_add(rows);
+            }
+            image.finish()?;
+        }
+        buffered.flush()?;
     }
-    if let Some(profile) = icc_profile {
-        image
-            .encoder()
-            .write_tag(Tag::Unknown(ICC_PROFILE_TAG), profile)?;
-    }
-    image.write_data(buf)?;
+    staged.commit()?;
     Ok(())
 }
 
@@ -1370,7 +2364,7 @@ fn build_icc_profile(tags: &[([u8; 4], Vec<u8>)]) -> Vec<u8> {
     profile.extend_from_slice(b"mntr");
     profile.extend_from_slice(b"RGB ");
     profile.extend_from_slice(b"XYZ ");
-    for value in [2026u16, 5, 8, 0, 0, 0] {
+    for value in CANONICAL_ICC_CREATION_DATE_TIME {
         push_u16_be(&mut profile, value);
     }
     profile.extend_from_slice(b"acsp");
@@ -1484,19 +2478,68 @@ fn icc_profile_description(profile: &[u8]) -> Option<String> {
             return None;
         }
         let tag = &profile[tag_offset..tag_end];
-        if &tag[0..4] != b"desc" {
-            return None;
+        if &tag[0..4] == b"desc" {
+            let text_len = read_u32_be(tag, 8)? as usize;
+            let text_start = 12usize;
+            let text_end = text_start.checked_add(text_len)?.min(tag.len());
+            let mut text = &tag[text_start..text_end];
+            while text.last() == Some(&0) {
+                text = &text[..text.len() - 1];
+            }
+            return String::from_utf8(text.to_vec()).ok();
         }
-        let text_len = read_u32_be(tag, 8)? as usize;
-        let text_start = 12usize;
-        let text_end = text_start.checked_add(text_len)?.min(tag.len());
-        let mut text = &tag[text_start..text_end];
-        while text.last() == Some(&0) {
-            text = &text[..text.len() - 1];
+        if &tag[0..4] == b"mluc" {
+            return icc_mluc_first_description(tag);
         }
-        return String::from_utf8(text.to_vec()).ok();
+        return None;
     }
     None
+}
+
+fn icc_mluc_first_description(tag: &[u8]) -> Option<String> {
+    let record_count = read_u32_be(tag, 8)? as usize;
+    let record_size = read_u32_be(tag, 12)? as usize;
+    if record_count == 0 || record_size < 12 {
+        return None;
+    }
+    let records_end = 16usize.checked_add(record_count.checked_mul(record_size)?)?;
+    if records_end > tag.len() {
+        return None;
+    }
+
+    let mut fallback = None;
+    for index in 0..record_count {
+        let record = 16 + index * record_size;
+        let text_len = read_u32_be(tag, record + 4)? as usize;
+        let text_offset = read_u32_be(tag, record + 8)? as usize;
+        let text_end = text_offset.checked_add(text_len)?;
+        if text_end > tag.len() || !text_len.is_multiple_of(2) {
+            continue;
+        }
+        let units = tag[text_offset..text_end]
+            .chunks_exact(2)
+            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        let Ok(text) = String::from_utf16(&units) else {
+            continue;
+        };
+        let language = tag.get(record..record + 2);
+        let country = tag.get(record + 2..record + 4);
+        if language == Some(b"en") && country == Some(b"US") {
+            return Some(text);
+        }
+        fallback.get_or_insert(text);
+    }
+    fallback
+}
+
+fn icc_profiles_match_ignoring_creation_time(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .enumerate()
+            .all(|(index, (a, b))| (24..36).contains(&index) || a == b)
 }
 
 fn read_u32_be(bytes: &[u8], offset: usize) -> Option<u32> {
@@ -1535,4 +2578,29 @@ pub fn array_to_dynamic_image_8bit(arr: &Array3<u16>) -> DynamicImage {
         }
     }
     DynamicImage::ImageRgb8(img)
+}
+
+#[cfg(test)]
+mod atomic_writer_tests {
+    use super::*;
+
+    #[test]
+    fn failed_tiff_strip_encode_preserves_existing_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("output.tiff");
+        let original = Array3::<u16>::from_shape_fn((2, 2, 3), |(y, x, c)| {
+            (y * 1000 + x * 100 + c * 10) as u16
+        });
+        save_tiff_u16(&original, &destination).unwrap();
+        let original_bytes = std::fs::read(&destination).unwrap();
+
+        let error = write_rgb16_tiff_rows(2, 2, &destination, None, None, |_y, row| {
+            row.push(1);
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("row encoder produced"));
+        assert_eq!(std::fs::read(&destination).unwrap(), original_bytes);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
 }

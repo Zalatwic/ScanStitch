@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "profile_id": "synthetic-prophoto-d50-example",
   "source_space": {
     "name": "synthetic linear scanner RGB",
@@ -27,11 +27,22 @@
     [0.288, 0.7119, 0.0001],
     [0.0, 0.0, 0.8251]
   ],
+  "target_patch_signal_domain": "normalized_scanner_signal",
   "fit": {
     "method": "least_squares_rgb_to_xyz",
     "patch_count": 24,
     "target_residual_rms": 0.006,
     "target_residual_max": 0.018,
+    "validation": {
+      "evaluation_set": "held_out",
+      "training_patch_count": 24,
+      "held_out_patch_count": 24,
+      "training_residual_rms": 0.004,
+      "training_residual_max": 0.012,
+      "identity_baseline_residual_rms": 0.12,
+      "identity_baseline_residual_max": 0.25,
+      "held_out_identity_improvement_fraction": 0.95
+    },
     "per_hue_residuals": [
       {
         "hue_family": "red",

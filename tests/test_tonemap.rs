@@ -1,5 +1,26 @@
 use ndarray::Array3;
 
+fn full_grain_reduction() -> scanstitch::tonemap::GrainReductionSettings {
+    scanstitch::tonemap::GrainReductionSettings {
+        enabled: true,
+        strength: 1.0,
+        scale: 1.0,
+    }
+}
+
+fn apply_with_full_grain_reduction(
+    img: &Array3<f64>,
+    params: &scanstitch::tonemap::ToneCurveParams,
+) -> scanstitch::tonemap::TonemapApplyResult {
+    scanstitch::tonemap::apply_tonemap_with_params_color_protection_style_and_grain_diagnostics(
+        img,
+        params,
+        &scanstitch::tonemap::ToneColorProtection::default(),
+        scanstitch::tonemap::RenderStyle::ModernClean,
+        full_grain_reduction(),
+    )
+}
+
 #[test]
 fn test_sigmoid_has_toe_and_shoulder() {
     let params = scanstitch::tonemap::ToneCurveParams::default();
@@ -110,9 +131,9 @@ fn test_tonemap_reports_local_luminance_detail_pass() {
 #[test]
 fn test_tonemap_adaptive_vibrance_enriches_trusted_midtones_without_luma_shift() {
     let img = Array3::<f64>::from_shape_fn((25, 25, 3), |(_, _, c)| match c {
-        0 => 0.42,
-        1 => 0.34,
-        _ => 0.28,
+        0 => 0.20,
+        1 => 0.36,
+        _ => 0.52,
     });
     let params = scanstitch::tonemap::ToneCurveParams {
         domain: scanstitch::tonemap::ToneFitDomain::LinearLuminance,
@@ -121,56 +142,66 @@ fn test_tonemap_adaptive_vibrance_enriches_trusted_midtones_without_luma_shift()
         toe_lift: 0.0,
         shoulder_max: 1.0,
     };
-    let review_protection = scanstitch::tonemap::ToneColorProtection {
-        policy: scanstitch::tonemap::ToneColorProtectionPolicy::DisabledColorCandidateReview,
-        highlight_neutral_chroma_enabled: false,
-        midtone_neutral_chroma_enabled: false,
-        shadow_chroma_enabled: false,
-        reason: "synthetic review color".to_string(),
-    };
-
-    let trusted = scanstitch::tonemap::apply_tonemap_with_params_and_diagnostics(&img, &params);
-    let review = scanstitch::tonemap::apply_tonemap_with_params_and_color_protection_diagnostics(
-        &img,
-        &params,
-        &review_protection,
-    );
+    let trusted =
+        scanstitch::tonemap::apply_tonemap_with_params_color_protection_and_style_diagnostics(
+            &img,
+            &params,
+            &scanstitch::tonemap::ToneColorProtection::default(),
+            scanstitch::tonemap::RenderStyle::ModernClean,
+        );
+    let natural =
+        scanstitch::tonemap::apply_tonemap_with_params_color_protection_and_style_diagnostics(
+            &img,
+            &params,
+            &scanstitch::tonemap::ToneColorProtection::default(),
+            scanstitch::tonemap::RenderStyle::NaturalNeutral,
+        );
 
     let trusted_rgb = [
         trusted.image[[12, 12, 0]],
         trusted.image[[12, 12, 1]],
         trusted.image[[12, 12, 2]],
     ];
-    let review_rgb = [
-        review.image[[12, 12, 0]],
-        review.image[[12, 12, 1]],
-        review.image[[12, 12, 2]],
+    let natural_rgb = [
+        natural.image[[12, 12, 0]],
+        natural.image[[12, 12, 1]],
+        natural.image[[12, 12, 2]],
     ];
     let trusted_lum = 0.2880 * trusted_rgb[0] + 0.7119 * trusted_rgb[1] + 0.0001 * trusted_rgb[2];
-    let review_lum = 0.2880 * review_rgb[0] + 0.7119 * review_rgb[1] + 0.0001 * review_rgb[2];
+    let natural_lum = 0.2880 * natural_rgb[0] + 0.7119 * natural_rgb[1] + 0.0001 * natural_rgb[2];
     let trusted_sat = trusted_rgb
         .iter()
         .copied()
         .fold(f64::NEG_INFINITY, f64::max)
         - trusted_rgb.iter().copied().fold(f64::INFINITY, f64::min);
-    let review_sat = review_rgb.iter().copied().fold(f64::NEG_INFINITY, f64::max)
-        - review_rgb.iter().copied().fold(f64::INFINITY, f64::min);
+    let natural_sat = natural_rgb
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max)
+        - natural_rgb.iter().copied().fold(f64::INFINITY, f64::min);
 
     assert!(trusted.diagnostics.adaptive_vibrance_enabled);
     assert!(trusted.diagnostics.adaptive_vibrance_applied_ratio > 0.0);
     assert!(trusted.diagnostics.adaptive_vibrance_texture_limited_ratio < 0.05);
-    assert!(!review.diagnostics.adaptive_vibrance_enabled);
     assert!(
-        trusted_sat > review_sat,
-        "trusted vibrance should increase midtone saturation: trusted={}, review={}",
+        trusted
+            .diagnostics
+            .adaptive_vibrance_skin_memory_protection
+            .protected_pixel_ratio
+            < 0.01
+    );
+    assert!(!natural.diagnostics.adaptive_vibrance_enabled);
+    assert!(
+        trusted_sat > natural_sat,
+        "modern-clean vibrance should increase a cool midtone relative to natural-neutral: modern={}, natural={}",
         trusted_sat,
-        review_sat
+        natural_sat
     );
     assert!(
-        (trusted_lum - review_lum).abs() < 2e-6,
-        "adaptive vibrance should preserve weighted luminance within final denoise precision: trusted={}, review={}",
+        (trusted_lum - natural_lum).abs() < 2e-6,
+        "adaptive vibrance should preserve weighted luminance within final denoise precision: modern={}, natural={}",
         trusted_lum,
-        review_lum
+        natural_lum
     );
     assert!(trusted
         .image
@@ -232,7 +263,7 @@ fn test_tonemap_reduces_flat_area_chroma_noise_with_diagnostics() {
     };
 
     let before = scanstitch::tonemap::render_grain_diagnostics(&img);
-    let result = scanstitch::tonemap::apply_tonemap_with_params_and_diagnostics(&img, &params);
+    let result = apply_with_full_grain_reduction(&img, &params);
     let after = scanstitch::tonemap::render_grain_diagnostics(&result.image);
 
     assert!(
@@ -246,7 +277,14 @@ fn test_tonemap_reduces_flat_area_chroma_noise_with_diagnostics() {
         before
     );
     assert!(result.diagnostics.noise_reduction_enabled);
-    assert!(result.diagnostics.noise_reduction_applied_ratio > 0.80);
+    assert!(
+        result.diagnostics.noise_reduction_applied_ratio > 0.70,
+        "flat interior should remain broadly selected while the small fixture's unmeasurable boundary stays protected: applied={:?}, excluded={:?}",
+        result.diagnostics.noise_reduction_applied_ratio,
+        result
+            .diagnostics
+            .noise_reduction_structure_excluded_ratio
+    );
     assert!(result.diagnostics.noise_reduction_mean_abs_chroma_delta > 0.0);
     assert!(result.diagnostics.noise_reduction_mean_abs_luma_delta >= 0.0);
     assert!(
@@ -262,6 +300,132 @@ fn test_tonemap_reduces_flat_area_chroma_noise_with_diagnostics() {
         after
     );
     assert!(result.image.iter().all(|value| (0.0..=1.0).contains(value)));
+}
+
+#[test]
+fn test_grain_reduction_is_off_by_default_and_independent_of_render_style() {
+    let mut img = Array3::<f64>::from_elem((31, 31, 3), 0.38);
+    for y in 0..31 {
+        for x in 0..31 {
+            let sign = if (x + y) % 2 == 0 { 1.0 } else { -1.0 };
+            img[[y, x, 0]] += 0.06 * sign;
+            img[[y, x, 2]] -= 0.06 * sign;
+        }
+    }
+    let params = scanstitch::tonemap::ToneCurveParams {
+        domain: scanstitch::tonemap::ToneFitDomain::LinearLuminance,
+        midpoint: 0.4,
+        slope: 2.2,
+        toe_lift: 0.0,
+        shoulder_max: 1.0,
+    };
+    let protection = scanstitch::tonemap::ToneColorProtection::default();
+
+    let modern_default =
+        scanstitch::tonemap::apply_tonemap_with_params_color_protection_and_style_diagnostics(
+            &img,
+            &params,
+            &protection,
+            scanstitch::tonemap::RenderStyle::ModernClean,
+        );
+    assert!(!modern_default.diagnostics.noise_reduction_enabled);
+    assert!(!modern_default.diagnostics.noise_reduction_requested_enabled);
+    assert_eq!(
+        modern_default
+            .diagnostics
+            .noise_reduction_flat_chroma_p95_reduction_ratio,
+        0.0
+    );
+
+    let faithful_with_grain =
+        scanstitch::tonemap::apply_tonemap_with_params_color_protection_style_and_grain_diagnostics(
+            &img,
+            &params,
+            &protection,
+            scanstitch::tonemap::RenderStyle::FilmFaithful,
+            full_grain_reduction(),
+        );
+    assert!(faithful_with_grain.diagnostics.noise_reduction_enabled);
+    assert!(
+        faithful_with_grain
+            .diagnostics
+            .noise_reduction_requested_enabled
+    );
+    assert!(
+        faithful_with_grain
+            .diagnostics
+            .noise_reduction_flat_chroma_p95_reduction_ratio
+            > 0.0
+    );
+}
+
+#[test]
+fn test_grain_strength_and_scale_are_effective_and_reported() {
+    let mut img = Array3::<f64>::from_elem((41, 41, 3), 0.40);
+    for y in 0..41 {
+        for x in 0..41 {
+            let sign = if (x + y) % 2 == 0 { 1.0 } else { -1.0 };
+            img[[y, x, 0]] += 0.075 * sign;
+            img[[y, x, 2]] -= 0.075 * sign;
+        }
+    }
+    let params = scanstitch::tonemap::ToneCurveParams {
+        domain: scanstitch::tonemap::ToneFitDomain::LinearLuminance,
+        midpoint: 0.4,
+        slope: 2.2,
+        toe_lift: 0.0,
+        shoulder_max: 1.0,
+    };
+    let protection = scanstitch::tonemap::ToneColorProtection::default();
+    let render = |strength: f64, scale: f64| {
+        scanstitch::tonemap::apply_tonemap_with_params_color_protection_style_and_grain_diagnostics(
+            &img,
+            &params,
+            &protection,
+            scanstitch::tonemap::RenderStyle::FilmFaithful,
+            scanstitch::tonemap::GrainReductionSettings {
+                enabled: true,
+                strength,
+                scale,
+            },
+        )
+    };
+
+    let low = render(0.25, 0.5);
+    let high_strength = render(1.0, 0.5);
+    let wide = render(1.0, 2.0);
+    assert_eq!(low.diagnostics.noise_reduction_requested_strength, 0.25);
+    assert_eq!(
+        high_strength.diagnostics.noise_reduction_requested_strength,
+        1.0
+    );
+    assert_eq!(low.diagnostics.noise_reduction_requested_scale, 0.5);
+    assert_eq!(wide.diagnostics.noise_reduction_requested_scale, 2.0);
+    assert_eq!(low.diagnostics.noise_reduction_radius, 1);
+    assert_eq!(wide.diagnostics.noise_reduction_radius, 4);
+    assert!(
+        high_strength
+            .diagnostics
+            .noise_reduction_post_grain
+            .flat_chroma_residual_p95
+            < low
+                .diagnostics
+                .noise_reduction_post_grain
+                .flat_chroma_residual_p95,
+        "high={:?}, low={:?}",
+        high_strength.diagnostics.noise_reduction_post_grain,
+        low.diagnostics.noise_reduction_post_grain
+    );
+    assert!(
+        high_strength
+            .diagnostics
+            .noise_reduction_mean_abs_chroma_delta
+            > low.diagnostics.noise_reduction_mean_abs_chroma_delta
+    );
+    assert_ne!(
+        high_strength.image, wide.image,
+        "scale must alter the spatial denoise result, not only its reported radius"
+    );
 }
 
 #[test]
@@ -285,7 +449,7 @@ fn test_tonemap_denoises_flat_chroma_when_luma_grain_is_present() {
     };
 
     let before = scanstitch::tonemap::render_grain_diagnostics(&img);
-    let result = scanstitch::tonemap::apply_tonemap_with_params_and_diagnostics(&img, &params);
+    let result = apply_with_full_grain_reduction(&img, &params);
     let after = scanstitch::tonemap::render_grain_diagnostics(&result.image);
 
     assert!(
@@ -369,7 +533,7 @@ fn test_tonemap_noise_reduction_limits_textured_and_saturated_detail() {
     };
 
     let before = scanstitch::tonemap::render_grain_diagnostics(&img);
-    let result = scanstitch::tonemap::apply_tonemap_with_params_and_diagnostics(&img, &params);
+    let result = apply_with_full_grain_reduction(&img, &params);
     let after = scanstitch::tonemap::render_grain_diagnostics(&result.image);
 
     assert!(result.diagnostics.noise_reduction_enabled);
@@ -395,6 +559,183 @@ fn test_tonemap_noise_reduction_limits_textured_and_saturated_detail() {
     assert!(
         after.chroma_to_luma_p95_ratio < before.chroma_to_luma_p95_ratio,
         "chroma residual ratio should still improve despite detail limiting"
+    );
+}
+
+#[test]
+fn test_grain_reduction_exactly_excludes_multiscale_structure() {
+    let size = 65usize;
+    let mut img = Array3::<f64>::zeros((size, size, 3));
+    for y in 0..size {
+        for x in 0..size {
+            let level: f64 = if x < size / 2 { 0.18 } else { 0.72 };
+            let grain: f64 = if (x + y) % 2 == 0 { 0.025 } else { -0.025 };
+            img[[y, x, 0]] = (level + grain).clamp(0.0, 1.0);
+            img[[y, x, 1]] = level;
+            img[[y, x, 2]] = (level - grain).clamp(0.0, 1.0);
+        }
+    }
+    let params = scanstitch::tonemap::ToneCurveParams {
+        domain: scanstitch::tonemap::ToneFitDomain::LinearLuminance,
+        midpoint: 0.40,
+        slope: 2.2,
+        toe_lift: 0.0,
+        shoulder_max: 1.0,
+    };
+    let protection = scanstitch::tonemap::ToneColorProtection::default();
+    let render = |grain| {
+        scanstitch::tonemap::apply_tonemap_with_params_color_protection_style_and_grain_diagnostics(
+            &img,
+            &params,
+            &protection,
+            scanstitch::tonemap::RenderStyle::ModernClean,
+            grain,
+        )
+    };
+    let off = render(scanstitch::tonemap::GrainReductionSettings::default());
+    let on = render(full_grain_reduction());
+
+    let mut unchanged = 0usize;
+    for y in 0..size {
+        for x in 0..size {
+            if (0..3).all(|channel| off.image[[y, x, channel]] == on.image[[y, x, channel]]) {
+                unchanged += 1;
+            }
+        }
+    }
+    let unchanged_ratio = unchanged as f64 / (size * size) as f64;
+    assert!(
+        on.diagnostics.noise_reduction_structure_excluded_ratio > 0.05,
+        "coherent step structure should create a material exact-exclusion population: {:?}",
+        on.diagnostics.noise_reduction_structure_excluded_ratio
+    );
+    assert!(
+        on.diagnostics.noise_reduction_applied_ratio < 0.95,
+        "structured fixture must not receive a near-universal denoise mask: {:?}",
+        on.diagnostics.noise_reduction_applied_ratio
+    );
+    assert!(
+        unchanged_ratio + 1e-12
+            >= on.diagnostics.noise_reduction_structure_excluded_ratio,
+        "every reported structure-excluded pixel must remain bit-identical: unchanged={unchanged_ratio:?}, excluded={:?}",
+        on.diagnostics.noise_reduction_structure_excluded_ratio
+    );
+    for y in 0..size {
+        for x in 0..size {
+            if y < 2 || y + 2 >= size || x < 2 || x + 2 >= size {
+                for channel in 0..3 {
+                    assert_eq!(
+                        off.image[[y, x, channel]],
+                        on.image[[y, x, channel]],
+                        "a pixel without a complete radius-2 window must be an exact no-op at ({y}, {x}, {channel})"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        off.image
+            .iter()
+            .zip(on.image.iter())
+            .any(|(off_channel, on_channel)| off_channel != on_channel),
+        "flat noisy areas should still exercise the optional denoise pass"
+    );
+}
+
+#[test]
+fn test_grain_reduction_does_not_desaturate_uniform_color() {
+    let img =
+        Array3::<f64>::from_shape_fn((31, 31, 3), |(_, _, channel)| [0.70, 0.20, 0.12][channel]);
+    let params = scanstitch::tonemap::ToneCurveParams {
+        domain: scanstitch::tonemap::ToneFitDomain::LinearLuminance,
+        midpoint: 0.40,
+        slope: 2.2,
+        toe_lift: 0.0,
+        shoulder_max: 1.0,
+    };
+    let protection = scanstitch::tonemap::ToneColorProtection::default();
+    let render = |grain| {
+        scanstitch::tonemap::apply_tonemap_with_params_color_protection_style_and_grain_diagnostics(
+            &img,
+            &params,
+            &protection,
+            scanstitch::tonemap::RenderStyle::ModernClean,
+            grain,
+        )
+    };
+    let off = render(scanstitch::tonemap::GrainReductionSettings::default());
+    let on = render(full_grain_reduction());
+    let max_delta = off
+        .image
+        .iter()
+        .zip(on.image.iter())
+        .map(|(off_channel, on_channel)| (off_channel - on_channel).abs())
+        .fold(0.0f64, f64::max);
+
+    assert!(
+        max_delta < 1e-6,
+        "denoise may suppress local high-frequency chroma but must not scale a uniform color base: {max_delta:?}"
+    );
+    assert!(
+        on.diagnostics.noise_reduction_saturation_limited_ratio > 0.90,
+        "the saturated non-shadow fixture should exercise the real saturation mask"
+    );
+}
+
+#[test]
+fn test_grain_reduction_preserves_coherent_luminance_and_isoluminant_chroma_edges() {
+    let size = 129usize;
+    let mut img = Array3::<f64>::zeros((size, size, 3));
+    let isoluminant_left = [0.70, 0.20, 0.20];
+    let target_luminance =
+        0.2880 * isoluminant_left[0] + 0.7119 * isoluminant_left[1] + 0.0001 * isoluminant_left[2];
+    let isoluminant_right = [
+        0.20,
+        (target_luminance - 0.2880 * 0.20 - 0.0001 * 0.70) / 0.7119,
+        0.70,
+    ];
+    for y in 0..size {
+        for x in 0..size {
+            let rgb = if y < size / 2 {
+                if x < size / 2 {
+                    isoluminant_left
+                } else {
+                    isoluminant_right
+                }
+            } else {
+                let level = if x < size / 2 { 0.18 } else { 0.72 };
+                [level, level, level]
+            };
+            for c in 0..3 {
+                img[[y, x, c]] = rgb[c];
+            }
+        }
+    }
+    let params = scanstitch::tonemap::ToneCurveParams {
+        domain: scanstitch::tonemap::ToneFitDomain::LinearLuminance,
+        midpoint: 0.40,
+        slope: 2.2,
+        toe_lift: 0.0,
+        shoulder_max: 1.0,
+    };
+
+    let result = apply_with_full_grain_reduction(&img, &params);
+    let detail = &result.diagnostics.noise_reduction_detail_retention;
+
+    assert!(detail.evaluated, "{detail:?}");
+    assert!(detail.decision_supported, "{detail:?}");
+    assert!(detail.luminance_decision_supported, "{detail:?}");
+    assert!(detail.chroma_decision_supported, "{detail:?}");
+    assert!(detail.luminance_probe_count >= detail.minimum_probe_count);
+    assert!(detail.chroma_probe_count >= detail.minimum_probe_count);
+    assert!(!detail.review_required, "{detail:?}");
+    assert!(
+        detail.luminance_p10_retention >= detail.p10_retention_threshold,
+        "{detail:?}"
+    );
+    assert!(
+        detail.chroma_p10_retention >= detail.p10_retention_threshold,
+        "{detail:?}"
     );
 }
 
@@ -1675,11 +2016,14 @@ fn test_tonemap_allows_chroma_denoise_in_saturated_shadows() {
     };
 
     let before = scanstitch::tonemap::render_grain_diagnostics(&img);
-    let result = scanstitch::tonemap::apply_tonemap_with_params_and_color_protection_diagnostics(
-        &img,
-        &params,
-        &protection,
-    );
+    let result =
+        scanstitch::tonemap::apply_tonemap_with_params_color_protection_style_and_grain_diagnostics(
+            &img,
+            &params,
+            &protection,
+            scanstitch::tonemap::RenderStyle::ModernClean,
+            full_grain_reduction(),
+        );
     let after = scanstitch::tonemap::render_grain_diagnostics(&result.image);
     let quality = scanstitch::tonemap::render_quality_diagnostics(&result.image);
 
